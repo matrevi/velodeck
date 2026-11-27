@@ -14,11 +14,20 @@ files:
   - build-config.json
   - package.json
 
+extraResources:
+  - from: native/bin
+    to: native
+  - from: native/win-input-helper.ps1
+    to: native/win-input-helper.ps1
+
 mac:
   category: public.app-category.utilities
   icon: assets/icon.icns
   darkModeSupport: true
   identity: null
+  extendInfo:
+    NSScreenCaptureUsageDescription: "VeloDeck 需要屏幕录制权限以将本机画面实时共享给您的远控设备。"
+    NSAccessibilityUsageDescription: "VeloDeck 需要辅助功能权限以响应远控端的鼠标移动、点击与键盘输入。"
   target:
     - target: dmg
       arch:

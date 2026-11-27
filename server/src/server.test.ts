@@ -18,6 +18,7 @@ import {
   type ControlCmdMessage,
   type ControllerAuthedMessage,
   type DeviceStatusMessage,
+  type DisplayInfo,
   type ErrorMessage,
   type PongMessage,
   type RtcAnswerMessage,
@@ -32,7 +33,7 @@ import {
 import { AsyncSemaphore, verifyPassword } from "./auth.js";
 import { DEFAULT_STUN_URLS, loadConfig, type ServerConfig } from "./config.js";
 import { createVeloDeckServer, type VeloDeckServer } from "./httpServer.js";
-import { VeloDeckStore } from "./store.js";
+import { cloneDeviceSummary, VeloDeckStore } from "./store.js";
 import { buildIceServers } from "./turn.js";
 
 class TestWsClient {
@@ -3491,9 +3492,11 @@ test("Built-in Electron origin (app://velodeck) is natively trusted for HTTP COR
   assert.equal(optRes.headers.get("access-control-allow-origin"), "app://velodeck");
   assert.match(optRes.headers.get("access-control-allow-methods") ?? "", /POST/);
 
-  // 3. WebSocket /ws upgrade with Origin: app://velodeck is accepted
+  // 3. WebSocket /ws upgrade with Origin: app://velodeck and app://velodeck-host is accepted
   const electronWs = await TestWsClient.connect(wsUrl, { Origin: "app://velodeck" });
   await electronWs.close();
+  const electronHostWs = await TestWsClient.connect(wsUrl, { Origin: "app://velodeck-host" });
+  await electronHostWs.close();
 
   // 4. Untrusted custom scheme Origin: app://evil.example is rejected for HTTP CORS and WS upgrade
   const evilInfoRes = await fetch(`${baseUrl}/api/info`, {
@@ -3526,4 +3529,373 @@ test("Built-in Electron origin (app://velodeck) is natively trusted for HTTP COR
     });
   });
   assert.equal(evilWsStatus, 403);
+});
+
+test("Desktop host registration, multi-monitor telemetry updates, deep-cloned displays, and Android backward compatibility", async (t) => {
+  const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "velodeck-desktop-host-test-"));
+  const { server, baseUrl, wsUrl } = await startServer({ dataDir });
+  t.after(async () => {
+    await server.close();
+    await fsp.rm(dataDir, { recursive: true, force: true });
+  });
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "desktop_owner", password: "desktop-password-123" }),
+  });
+  assert.equal(regRes.status, 201);
+  const { token } = (await regRes.json()) as { token: string };
+
+  const ctrlWatch = await TestWsClient.connect(wsUrl);
+  const desktopAgent = await TestWsClient.connect(wsUrl);
+  const androidAgent = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([ctrlWatch.close(), desktopAgent.close(), androidAgent.close()]);
+  });
+
+  // Account controller connects before devices register to observe live device.status broadcasts
+  ctrlWatch.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-desktop-watch",
+  });
+  const watchAuthed = await ctrlWatch.nextJson<ControllerAuthedMessage>();
+  assert.equal(watchAuthed.type, "controller.authed");
+  assert.equal(watchAuthed.devices.length, 0);
+
+  const displays: DisplayInfo[] = [
+    { id: "disp-builtin-1", name: "Built-in Retina Display", width: 3024, height: 1964, primary: true },
+    { id: "disp-ext-2", name: "Studio Display", width: 5120, height: 2880, primary: false },
+  ];
+
+  // 1. Desktop agent registers with deviceType, osPlatform, displays (2 monitors), activeDisplayId
+  desktopAgent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-macbook-01",
+      deviceSecret: "desktop-secret-01",
+      authToken: token,
+      controlPassword: "desktop-unattended-99",
+      name: "MacBook Pro 14",
+      model: "Mac15,6",
+      androidVersion: "macOS 15.2",
+      screenWidth: 3024,
+      screenHeight: 1964,
+      rotation: 0,
+      battery: 100,
+      charging: true,
+      deviceType: "desktop",
+      osPlatform: "darwin",
+      displays,
+      activeDisplayId: "disp-builtin-1",
+    }),
+  );
+
+  const [deskReg, deskStatus] = await Promise.all([
+    desktopAgent.nextJson<AgentRegisteredMessage>(),
+    ctrlWatch.nextJson<DeviceStatusMessage>(),
+  ]);
+
+  assert.equal(deskReg.type, "agent.registered");
+  assert.equal(deskReg.deviceId, "desk-macbook-01");
+  assert.match(deskReg.controlCode ?? "", /^\d{9}$/);
+
+  assert.equal(deskStatus.type, "device.status");
+  assert.equal(deskStatus.device.deviceId, "desk-macbook-01");
+  assert.equal(deskStatus.device.deviceType, "desktop");
+  assert.equal(deskStatus.device.osPlatform, "darwin");
+  assert.equal(deskStatus.device.activeDisplayId, "disp-builtin-1");
+  assert.deepEqual(deskStatus.device.displays, displays);
+
+  // 2. Existing Android agent registration (omitting deviceType/osPlatform/displays/activeDisplayId) works unchanged
+  androidAgent.sendJson(
+    makeAgentRegister({
+      deviceId: "dev-android-legacy",
+      deviceSecret: "android-secret-01",
+      authToken: token,
+      controlPassword: "android-unattended-99",
+    }),
+  );
+  const [androidReg, androidStatus] = await Promise.all([
+    androidAgent.nextJson<AgentRegisteredMessage>(),
+    ctrlWatch.nextJson<DeviceStatusMessage>(),
+  ]);
+  assert.equal(androidReg.type, "agent.registered");
+  assert.match(androidReg.controlCode ?? "", /^\d{9}$/);
+  assert.equal(androidStatus.type, "device.status");
+  assert.equal(androidStatus.device.deviceId, "dev-android-legacy");
+  assert.equal(androidStatus.device.deviceType, undefined);
+  assert.equal(androidStatus.device.osPlatform, undefined);
+  assert.equal(androidStatus.device.displays, undefined);
+  assert.equal(androidStatus.device.activeDisplayId, undefined);
+  assert.equal(Object.hasOwn(androidStatus.device, "deviceType"), false);
+  assert.equal(Object.hasOwn(androidStatus.device, "displays"), false);
+
+  // 3. Newly connected account controller & control-code controller both receive exact desktop fields in controller.authed
+  const ctrlAccount = await TestWsClient.connect(wsUrl);
+  const ctrlCode = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([ctrlAccount.close(), ctrlCode.close()]);
+  });
+
+  ctrlAccount.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-desktop-acct",
+  });
+  const acctAuthed = await ctrlAccount.nextJson<ControllerAuthedMessage>();
+  assert.equal(acctAuthed.devices.length, 2);
+  const acctDesktop = acctAuthed.devices.find((d) => d.deviceId === "desk-macbook-01");
+  const acctAndroid = acctAuthed.devices.find((d) => d.deviceId === "dev-android-legacy");
+  assert.ok(acctDesktop);
+  assert.equal(acctDesktop.deviceType, "desktop");
+  assert.equal(acctDesktop.osPlatform, "darwin");
+  assert.equal(acctDesktop.activeDisplayId, "disp-builtin-1");
+  assert.deepEqual(acctDesktop.displays, displays);
+  assert.ok(acctAndroid);
+  assert.equal(acctAndroid.deviceType, undefined);
+  assert.equal(acctAndroid.displays, undefined);
+
+  ctrlCode.sendJson({
+    type: "controller.auth",
+    controlCode: deskReg.controlCode,
+    controlPassword: "desktop-unattended-99",
+    clientId: "ctrl-desktop-code",
+  });
+  const codeAuthed = await ctrlCode.nextJson<ControllerAuthedMessage>();
+  assert.equal(codeAuthed.devices.length, 1);
+  assert.equal(codeAuthed.devices[0]?.deviceType, "desktop");
+  assert.equal(codeAuthed.devices[0]?.osPlatform, "darwin");
+  assert.equal(codeAuthed.devices[0]?.activeDisplayId, "disp-builtin-1");
+  assert.deepEqual(codeAuthed.devices[0]?.displays, displays);
+
+  // 4. Desktop agent telemetry switches active monitor -> updates activeDisplayId + screenWidth/screenHeight live
+  desktopAgent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "desk-macbook-01",
+    activeDisplayId: "disp-ext-2",
+    screenWidth: 5120,
+    screenHeight: 2880,
+  });
+
+  const [watchSwitch, codeSwitch] = await Promise.all([
+    ctrlWatch.nextJson<DeviceStatusMessage>(),
+    ctrlCode.nextJson<DeviceStatusMessage>(),
+  ]);
+  for (const status of [watchSwitch, codeSwitch]) {
+    assert.equal(status.type, "device.status");
+    assert.equal(status.device.deviceId, "desk-macbook-01");
+    assert.equal(status.device.deviceType, "desktop");
+    assert.equal(status.device.osPlatform, "darwin");
+    assert.equal(status.device.activeDisplayId, "disp-ext-2");
+    assert.equal(status.device.screenWidth, 5120);
+    assert.equal(status.device.screenHeight, 2880);
+    assert.deepEqual(status.device.displays, displays);
+  }
+
+  // 5. Desktop telemetry sanitizes displays list (clamps dimensions, caps at 8, strips control chars)
+  const manyDisplays = Array.from({ length: 10 }, (_, idx) => ({
+    id: `mon-${idx + 1}`,
+    name: `Monitor \x07#${idx + 1}`,
+    width: idx === 0 ? 99_999 : 1920,
+    height: idx === 0 ? 0.4 : 1080,
+    primary: idx === 0,
+  }));
+  desktopAgent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "desk-macbook-01",
+    displays: manyDisplays,
+  });
+  const sanitizedStatus = await ctrlWatch.nextJson<DeviceStatusMessage>();
+  assert.equal(sanitizedStatus.device.displays?.length, 8);
+  assert.deepEqual(sanitizedStatus.device.displays?.[0], {
+    id: "mon-1",
+    name: "Monitor #1",
+    width: 16_384,
+    height: 1,
+    primary: true,
+  });
+
+  // 6. cloneDeviceSummary deep-clones displays array and display items
+  const cloned = cloneDeviceSummary(sanitizedStatus.device);
+  assert.notEqual(cloned.displays, sanitizedStatus.device.displays);
+  assert.notEqual(cloned.displays?.[0], sanitizedStatus.device.displays?.[0]);
+  cloned.displays![0]!.name = "Mutated";
+  cloned.displays!.push({ id: "extra", name: "Extra", width: 800, height: 600 });
+  assert.equal(sanitizedStatus.device.displays?.[0]?.name, "Monitor #1");
+  assert.equal(sanitizedStatus.device.displays?.length, 8);
+
+  // 7. Persisted store reloads desktop metadata cleanly from disk
+  await server.hub.store.flush();
+  const reloadedStore = new VeloDeckStore(dataDir);
+  const persistedDesktop = reloadedStore.getDevice("desk-macbook-01");
+  assert.ok(persistedDesktop);
+  assert.equal(persistedDesktop.summary.deviceType, "desktop");
+  assert.equal(persistedDesktop.summary.osPlatform, "darwin");
+  assert.equal(persistedDesktop.summary.activeDisplayId, "disp-builtin-1");
+  assert.deepEqual(persistedDesktop.summary.displays, displays);
+});
+
+test("Desktop control commands (mouse_move, mouse_down, mouse_up, mouse_wheel, key_event, select_display) validate and forward cleanly", async (t) => {
+  const { server, wsUrl } = await startServer();
+  t.after(() => server.close());
+
+  const agent = await TestWsClient.connect(wsUrl);
+  const ctrl = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent.close(), ctrl.close()]);
+  });
+
+  agent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-win11-01",
+      deviceSecret: "win11-secret-01",
+      controlPassword: "win11-password-123",
+      deviceType: "desktop",
+      osPlatform: "win32",
+      screenWidth: 2560,
+      screenHeight: 1440,
+      displays: [
+        { id: "win-disp-1", name: "Primary", width: 2560, height: 1440, primary: true },
+        { id: "win-disp-2", name: "Secondary", width: 1920, height: 1080, primary: false },
+      ],
+      activeDisplayId: "win-disp-1",
+    }),
+  );
+  const reg = await agent.nextJson<AgentRegisteredMessage>();
+  assert.ok(reg.controlCode);
+
+  ctrl.sendJson({
+    type: "controller.auth",
+    controlCode: reg.controlCode,
+    controlPassword: "win11-password-123",
+    clientId: "ctrl-win11-01",
+  });
+  await ctrl.nextJson<ControllerAuthedMessage>();
+
+  // Sessionless desktop command must be rejected with SESSION_NOT_FOUND
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "desk-win11-01",
+    seq: 1,
+    command: { action: "mouse_move", x: 100, y: 200 },
+  } satisfies ControlCmdMessage);
+  const sessionlessErr = await ctrl.nextJson<ErrorMessage>();
+  assert.equal(sessionlessErr.type, "error");
+  assert.equal(sessionlessErr.code, "SESSION_NOT_FOUND");
+
+  // Establish active session
+  ctrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-desktop-01",
+    deviceId: "desk-win11-01",
+    preferredTransport: "webrtc",
+    quality: QUALITY_PRESETS.hd,
+  } satisfies SessionRequestMessage);
+  await agent.nextJson<SessionRequestMessage>();
+
+  agent.sendJson({
+    type: "session.ready",
+    sessionId: "sess-desktop-01",
+    deviceId: "desk-win11-01",
+    transport: "webrtc",
+    screenWidth: 2560,
+    screenHeight: 1440,
+    rotation: 0,
+  } satisfies SessionReadyMessage);
+  await ctrl.nextJson<SessionReadyMessage>();
+
+  // 1. Valid desktop commands forward cleanly
+  const validCommands: ControlCmdMessage["command"][] = [
+    { action: "mouse_move", x: 0.5, y: 0.25 },
+    { action: "mouse_down", x: 0.5, y: 0.25, button: "left", clickCount: 2 },
+    { action: "mouse_up", x: 0.5, y: 0.25, button: "left" },
+    { action: "mouse_down", x: 0.8, y: 0.1, button: "right" },
+    { action: "mouse_up", x: 0.8, y: 0.1, button: "middle" },
+    { action: "mouse_wheel", x: 0.5, y: 0.5, deltaX: -12, deltaY: 120 },
+    {
+      action: "key_event",
+      phase: "down",
+      code: "KeyC",
+      key: "c",
+      modifiers: { ctrl: true, shift: false, alt: false, meta: false },
+    },
+    { action: "key_event", phase: "up", code: "KeyC", key: "c" },
+    { action: "key_event", phase: "press", code: "Enter", key: "Enter" },
+    { action: "select_display", displayId: "win-disp-2" },
+  ];
+
+  let seq = 10;
+  for (const command of validCommands) {
+    seq += 1;
+    ctrl.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-desktop-01",
+      deviceId: "desk-win11-01",
+      seq,
+      command,
+    } satisfies ControlCmdMessage);
+    const forwarded = await agent.nextJson<ControlCmdMessage>();
+    assert.equal(forwarded.type, "control.cmd");
+    assert.equal(forwarded.sessionId, "sess-desktop-01");
+    assert.equal(forwarded.deviceId, "desk-win11-01");
+    assert.equal(forwarded.seq, seq);
+    assert.deepEqual(forwarded.command, command);
+  }
+
+  // Verify control.ack routes back for desktop command
+  agent.sendJson({
+    type: "control.ack",
+    sessionId: "sess-desktop-01",
+    deviceId: "desk-win11-01",
+    seq,
+    ok: true,
+    message: "display_selected",
+  } satisfies ControlAckMessage);
+  const ack = await ctrl.nextJson<ControlAckMessage>();
+  assert.equal(ack.type, "control.ack");
+  assert.equal(ack.seq, seq);
+  assert.equal(ack.ok, true);
+
+  // 2. Malformed desktop commands are rejected with INVALID_MESSAGE and never forwarded
+  const invalidCommands: unknown[] = [
+    { action: "mouse_move", x: Number.NaN, y: 0.5 },
+    { action: "mouse_move", x: "100", y: 200 },
+    { action: "mouse_down", x: 0.5, y: 0.5, button: "side" },
+    { action: "mouse_down", x: 0.5, y: 0.5, button: "left", clickCount: 0 },
+    { action: "mouse_down", x: 0.5, y: 0.5, button: "left", clickCount: 6 },
+    { action: "mouse_down", x: 0.5, y: 0.5, button: "left", clickCount: 1.5 },
+    { action: "mouse_up", x: Number.NaN, y: 0.5, button: "right" },
+    { action: "mouse_up", x: 0.5, y: 0.5, button: "invalid" },
+    { action: "mouse_wheel", x: 0.5, y: 0.5, deltaX: 0, deltaY: Number.NaN },
+    { action: "mouse_wheel", x: 0.5, y: 0.5, deltaX: "up", deltaY: 10 },
+    { action: "key_event", phase: "hold", code: "KeyA", key: "a" },
+    { action: "key_event", phase: "down", code: "A".repeat(65), key: "a" },
+    { action: "key_event", phase: "down", code: "KeyA", key: "k".repeat(65) },
+    { action: "key_event", phase: "down", code: "KeyA", key: "a", modifiers: { ctrl: "yes" } },
+    { action: "select_display", displayId: "" },
+    { action: "select_display", displayId: "   " },
+    { action: "select_display", displayId: "d".repeat(65) },
+  ];
+
+  for (const badCmd of invalidCommands) {
+    seq += 1;
+    ctrl.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-desktop-01",
+      deviceId: "desk-win11-01",
+      seq,
+      command: badCmd,
+    });
+    const err = await ctrl.nextJson<ErrorMessage>();
+    assert.equal(err.type, "error");
+    assert.equal(err.code, "INVALID_MESSAGE");
+    assert.equal(err.sessionId, "sess-desktop-01");
+    assert.equal(err.deviceId, "desk-win11-01");
+  }
+
+  // Confirm none of the malformed commands were forwarded to the desktop agent
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(agent.drainJson().length, 0);
 });

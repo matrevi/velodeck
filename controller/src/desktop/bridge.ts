@@ -21,6 +21,43 @@ export interface DesktopServerConfig {
   recentServers: string[];
 }
 
+export interface DesktopDisplayInfo {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  primary: boolean;
+}
+
+export interface DesktopHostPermissions {
+  accessibility: boolean;
+  screenCapture: boolean;
+  platform: DesktopPlatform;
+}
+
+export interface DesktopHostState {
+  enabled: boolean;
+  status: "stopped" | "connecting" | "online" | "controlling" | "error";
+  deviceId: string;
+  deviceName: string;
+  controlCode: string;
+  controlPassword: string;
+  ownerUsername: string;
+  activeSessionId: string | null;
+  activeTransport: "webrtc" | "ws-jpeg" | null;
+  activeDisplayId: string;
+  displays: DesktopDisplayInfo[];
+  permissions: DesktopHostPermissions;
+  lastError: string | null;
+  lastReceivedFile: { fileName: string; savedPath: string; at: number } | null;
+}
+
+export interface DesktopHostConfigPatch {
+  deviceName?: string;
+  controlPassword?: string;
+  activeDisplayId?: string;
+}
+
 export interface VeloDeckDesktopBridge {
   readonly platform: DesktopPlatform;
   readonly appVersion: string;
@@ -44,6 +81,18 @@ export interface VeloDeckDesktopBridge {
   setServerConfig(serverUrl: string): Promise<DesktopServerConfig>;
   removeRecentServer(serverUrl: string): Promise<DesktopServerConfig>;
   onCommand(cb: (command: DesktopMenuCommand) => void): () => void;
+  getHostState?(): Promise<DesktopHostState>;
+  onHostStateChange?(cb: (state: DesktopHostState) => void): () => void;
+  startHost?(authToken?: string | null): Promise<DesktopHostState>;
+  stopHost?(): Promise<DesktopHostState>;
+  updateHostConfig?(patch: DesktopHostConfigPatch): Promise<DesktopHostState>;
+  regenerateHostPassword?(): Promise<DesktopHostState>;
+  bindHostAccount?(authToken: string): Promise<DesktopHostState>;
+  unbindHostAccount?(): Promise<DesktopHostState>;
+  selectHostDisplay?(displayId: string): Promise<DesktopHostState>;
+  disconnectHostSession?(): Promise<DesktopHostState>;
+  refreshHostPermissions?(): Promise<DesktopHostPermissions>;
+  openPermissionSettings?(kind: "accessibility" | "screen"): Promise<void>;
 }
 
 declare global {
@@ -127,6 +176,26 @@ export function isDesktopApp(): boolean {
 
 export function isMacDesktop(): boolean {
   return getDesktopBridge()?.platform === "darwin";
+}
+
+export function hasDesktopHostBridge(
+  bridge: VeloDeckDesktopBridge | null = getDesktopBridge(),
+): boolean {
+  if (!bridge) return false;
+  return (
+    typeof bridge.getHostState === "function" &&
+    typeof bridge.onHostStateChange === "function" &&
+    typeof bridge.startHost === "function" &&
+    typeof bridge.stopHost === "function" &&
+    typeof bridge.updateHostConfig === "function" &&
+    typeof bridge.regenerateHostPassword === "function" &&
+    typeof bridge.bindHostAccount === "function" &&
+    typeof bridge.unbindHostAccount === "function" &&
+    typeof bridge.selectHostDisplay === "function" &&
+    typeof bridge.disconnectHostSession === "function" &&
+    typeof bridge.refreshHostPermissions === "function" &&
+    typeof bridge.openPermissionSettings === "function"
+  );
 }
 
 /**

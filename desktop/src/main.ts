@@ -10,6 +10,7 @@ import {
   nativeImage,
   protocol,
   screen,
+  session,
   shell,
   Tray,
   type IpcMainEvent,
@@ -17,6 +18,14 @@ import {
   type MenuItemConstructorOptions,
   type SaveDialogOptions,
 } from "electron";
+import {
+  formatHostControlCode,
+  HOST_WORKER_HOST,
+  HOST_WORKER_ORIGIN,
+  HostManager,
+  type DesktopHostConfigPatch,
+  type DesktopHostState,
+} from "./hostManager";
 import {
   APP_ORIGIN,
   APP_SCHEME,
@@ -144,9 +153,25 @@ let settings: DesktopSettings = {
 
 let tray: Tray | null = null;
 let primaryWindow: BrowserWindow | null = null;
+let hostManager: HostManager | null = null;
 let isQuitting = false;
 let saveBoundsTimer: NodeJS.Timeout | null = null;
 const windowPresetMap = new WeakMap<BrowserWindow, WindowPreset>();
+
+function getControllerWindows(): BrowserWindow[] {
+  return BrowserWindow.getAllWindows().filter(
+    (w) => !w.isDestroyed() && !hostManager?.isWorkerWindow(w),
+  );
+}
+
+function broadcastHostState(state: DesktopHostState): void {
+  for (const win of getControllerWindows()) {
+    if (!win.webContents.isDestroyed()) {
+      win.webContents.send("velodeck:host-state-changed", state);
+    }
+  }
+  refreshMenus();
+}
 
 function isValidPreset(value: unknown): value is WindowPreset {
   return value === "phone" || value === "compact" || value === "dashboard";
@@ -200,13 +225,13 @@ function emitWindowState(win: BrowserWindow): void {
 
 function getTargetWindow(): BrowserWindow | null {
   const focused = BrowserWindow.getFocusedWindow();
-  if (focused && !focused.isDestroyed()) {
+  if (focused && !focused.isDestroyed() && !hostManager?.isWorkerWindow(focused)) {
     return focused;
   }
   if (primaryWindow && !primaryWindow.isDestroyed()) {
     return primaryWindow;
   }
-  const all = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed());
+  const all = getControllerWindows();
   return all[0] ?? null;
 }
 
@@ -492,9 +517,7 @@ function createMainWindow(options: CreateWindowOptions = {}): BrowserWindow {
     if (isQuitting || !tray) {
       return;
     }
-    const openWindows = BrowserWindow.getAllWindows().filter(
-      (w) => !w.isDestroyed(),
-    );
+    const openWindows = getControllerWindows();
     if (openWindows.length <= 1) {
       event.preventDefault();
       if (process.platform === "darwin" && win.isFullScreen()) {
@@ -512,9 +535,7 @@ function createMainWindow(options: CreateWindowOptions = {}): BrowserWindow {
 
   win.on("closed", () => {
     if (primaryWindow === win) {
-      const remaining = BrowserWindow.getAllWindows().filter(
-        (w) => !w.isDestroyed() && w !== win,
-      );
+      const remaining = getControllerWindows().filter((w) => w !== win);
       primaryWindow = remaining[0] ?? null;
     }
     refreshMenus();
@@ -528,6 +549,74 @@ function createMainWindow(options: CreateWindowOptions = {}): BrowserWindow {
 function buildTrayContextMenu(): Menu {
   const activeWin = getTargetWindow();
   const isPinned = activeWin ? activeWin.isAlwaysOnTop() : settings.alwaysOnTop;
+  const hostState = hostManager?.getHostState();
+  const formattedCode = hostState?.controlCode
+    ? formatHostControlCode(hostState.controlCode)
+    : "";
+
+  let hostStatusLabel = "本机被控: 未开启";
+  if (hostState?.enabled) {
+    switch (hostState.status) {
+      case "controlling":
+        hostStatusLabel = formattedCode
+          ? `本机被控: 正在被控 (${formattedCode})`
+          : "本机被控: 正在被控";
+        break;
+      case "online":
+        hostStatusLabel = formattedCode
+          ? `本机被控: 在线 (${formattedCode})`
+          : "本机被控: 在线";
+        break;
+      case "connecting":
+        hostStatusLabel = "本机被控: 连接中...";
+        break;
+      case "error":
+        hostStatusLabel = "本机被控: 连接异常";
+        break;
+      default:
+        hostStatusLabel = "本机被控: 未开启";
+        break;
+    }
+  }
+
+  const hostMenuItems: MenuItemConstructorOptions[] = [
+    {
+      label: hostStatusLabel,
+      enabled: false,
+    },
+    {
+      label: hostState?.enabled ? "关闭本机被控" : "开启本机被控",
+      click: () => {
+        if (!hostManager) return;
+        if (hostManager.getHostState().enabled) {
+          void hostManager.stopHost();
+        } else {
+          void hostManager.startHost();
+        }
+      },
+    },
+    ...(formattedCode
+      ? [
+          {
+            label: `复制本机控制码 (${formattedCode})`,
+            click: () => {
+              clipboard.writeText(hostState?.controlCode ?? "");
+            },
+          } as MenuItemConstructorOptions,
+        ]
+      : []),
+    ...(hostState?.activeSessionId
+      ? [
+          {
+            label: "断开当前远控会话",
+            click: () => {
+              void hostManager?.disconnectHostSession();
+            },
+          } as MenuItemConstructorOptions,
+        ]
+      : []),
+    { type: "separator" },
+  ];
 
   const template: MenuItemConstructorOptions[] = [
     {
@@ -543,6 +632,7 @@ function buildTrayContextMenu(): Menu {
       },
     },
     { type: "separator" },
+    ...hostMenuItems,
     {
       label: "置顶当前窗口",
       type: "checkbox",
@@ -824,10 +914,47 @@ function createSystemTray(): void {
   }
 }
 
+const HOST_WORKER_ALLOWED_FILES: Readonly<Record<string, string>> = {
+  "/hostWorker.html": path.join(__dirname, "hostWorker.html"),
+  "/hostWorkerRenderer.js": path.join(__dirname, "hostWorkerRenderer.js"),
+};
+
 function registerStaticProtocol(): void {
   protocol.handle(APP_SCHEME, async (request) => {
     if (request.method !== "GET" && request.method !== "HEAD") {
       return new Response("Method Not Allowed", { status: 405 });
+    }
+
+    // Dedicated isolated origin for the hidden Desktop Host streaming worker
+    try {
+      const parsed = new URL(request.url);
+      if (parsed.hostname.toLowerCase() === HOST_WORKER_HOST) {
+        const targetFile = HOST_WORKER_ALLOWED_FILES[parsed.pathname];
+        if (!targetFile) {
+          return new Response("Not Found", { status: 404 });
+        }
+        try {
+          const stat = await fs.promises.stat(targetFile);
+          if (!stat.isFile()) {
+            return new Response("Not Found", { status: 404 });
+          }
+          const headers = new Headers({
+            "Content-Type": getMimeType(targetFile),
+            "Content-Length": String(stat.size),
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "X-Content-Type-Options": "nosniff",
+          });
+          if (request.method === "HEAD") {
+            return new Response(null, { status: 200, headers });
+          }
+          const data = await fs.promises.readFile(targetFile);
+          return new Response(data, { status: 200, headers });
+        } catch {
+          return new Response("Not Found", { status: 404 });
+        }
+      }
+    } catch {
+      return new Response("Forbidden", { status: 403 });
     }
 
     const resolvedPath = resolveStaticAssetPath(rendererDistDir, request.url);
@@ -1083,6 +1210,7 @@ function registerIpcHandlers(): void {
     if (trimmed === "") {
       settings.serverUrl = "";
       persistSettings();
+      void hostManager?.onServerUrlChanged();
       return {
         serverUrl: "",
         recentServers: [...settings.recentServers],
@@ -1099,6 +1227,7 @@ function registerIpcHandlers(): void {
       MAX_RECENT_SERVERS,
     );
     persistSettings();
+    void hostManager?.onServerUrlChanged();
     return getServerConfigPayload();
   });
 
@@ -1118,6 +1247,135 @@ function registerIpcHandlers(): void {
     }
     return getServerConfigPayload();
   });
+
+  // --- Desktop Host (电脑被控端) IPC Handlers ---
+
+  ipcMain.handle("velodeck:host-get-state", (event) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    return hostManager.getHostState();
+  });
+
+  ipcMain.handle("velodeck:host-start", (event, authToken: unknown) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    return hostManager.startHost(
+      typeof authToken === "string" ? authToken : null,
+    );
+  });
+
+  ipcMain.handle("velodeck:host-stop", (event) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    return hostManager.stopHost();
+  });
+
+  ipcMain.handle("velodeck:host-update-config", (event, rawPatch: unknown) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    if (!rawPatch || typeof rawPatch !== "object") {
+      throw new Error("Invalid host config patch");
+    }
+    return hostManager.updateHostConfig(rawPatch as DesktopHostConfigPatch);
+  });
+
+  ipcMain.handle("velodeck:host-regenerate-password", (event) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    return hostManager.regenerateHostPassword();
+  });
+
+  ipcMain.handle("velodeck:host-bind-account", (event, authToken: unknown) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    if (typeof authToken !== "string") {
+      throw new Error("Invalid auth token");
+    }
+    return hostManager.bindHostAccount(authToken);
+  });
+
+  ipcMain.handle("velodeck:host-unbind-account", (event) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    return hostManager.unbindHostAccount();
+  });
+
+  ipcMain.handle("velodeck:host-select-display", (event, displayId: unknown) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    if (typeof displayId !== "string") {
+      throw new Error("Invalid display ID");
+    }
+    return hostManager.selectHostDisplay(displayId);
+  });
+
+  ipcMain.handle("velodeck:host-disconnect-session", (event) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    return hostManager.disconnectHostSession();
+  });
+
+  ipcMain.handle("velodeck:host-refresh-permissions", (event) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    return hostManager.refreshHostPermissions();
+  });
+
+  ipcMain.handle(
+    "velodeck:host-open-permission-settings",
+    (event, kind: unknown) => {
+      if (!isTrustedIpcEvent(event)) {
+        throw new Error("Untrusted IPC sender");
+      }
+      if (!hostManager) {
+        throw new Error("Host manager unavailable");
+      }
+      if (kind !== "accessibility" && kind !== "screen") {
+        throw new Error("Invalid permission kind");
+      }
+      return hostManager.openPermissionSettings(kind);
+    },
+  );
 }
 
 // Single-instance lock: second launch focuses existing window (or creates one if hidden)
@@ -1132,6 +1390,7 @@ if (!gotSingleInstanceLock) {
 
   app.on("before-quit", () => {
     isQuitting = true;
+    hostManager?.dispose();
   });
 
   app.on("activate", () => {
@@ -1151,7 +1410,37 @@ if (!gotSingleInstanceLock) {
     );
     settings = loadSettings(settingsFilePath);
 
+    // Allow desktop capture permissions strictly for the isolated Host worker origin
+    session.defaultSession.setPermissionRequestHandler(
+      (webContents, permission, callback) => {
+        const url = webContents.getURL();
+        if (
+          url.startsWith(`${HOST_WORKER_ORIGIN}/`) &&
+          (permission === "media" || permission === "display-capture")
+        ) {
+          callback(true);
+          return;
+        }
+        callback(false);
+      },
+    );
+
     registerStaticProtocol();
+    hostManager = new HostManager({
+      getSettings: () => settings,
+      updateSettings: (mutator) => {
+        mutator(settings);
+        persistSettings();
+        return settings;
+      },
+      getEffectiveServerUrl: () => settings.serverUrl || defaultServerUrl,
+      desktopRootDir,
+      onStateChanged: (nextState) => {
+        broadcastHostState(nextState);
+      },
+    });
+    hostManager.init();
+
     registerIpcHandlers();
     createSystemTray();
     refreshMenus();

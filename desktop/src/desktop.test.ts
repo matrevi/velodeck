@@ -4,6 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import {
+  mapNormalizedPointToDisplay,
+  translateControlCommandToNativeEvents,
+  type DisplayBounds,
+} from "./inputInjector.ts";
+import {
   APP_ORIGIN,
   getMimeType,
   isAllowedRendererUrl,
@@ -13,6 +18,11 @@ import {
 import {
   clampWindowBounds,
   computePresetBounds,
+  ensureHostSettings,
+  generateHostControlPassword,
+  generateHostDeviceId,
+  generateHostDeviceSecret,
+  HOST_DEVICE_ID_REGEX,
   loadSettings,
   normalizeServerUrl,
   PRESET_SIZES,
@@ -330,5 +340,301 @@ describe("settings helpers", () => {
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it("generates and atomically round-trips desktop host identity and credentials", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "velodeck-host-settings-"));
+    const settingsPath = path.join(tmpDir, "desktop-settings.json");
+
+    try {
+      const generatedId = generateHostDeviceId();
+      assert.match(generatedId, HOST_DEVICE_ID_REGEX);
+
+      const generatedSecret = generateHostDeviceSecret();
+      assert.ok(generatedSecret.length >= 24);
+
+      const generatedPass = generateHostControlPassword(8);
+      assert.equal(generatedPass.length, 8);
+      assert.match(generatedPass, /[A-Z]/);
+      assert.match(generatedPass, /[a-z]/);
+      assert.match(generatedPass, /[0-9]/);
+
+      const base = loadSettings(settingsPath);
+      const ensured = ensureHostSettings(base, "Workstation-Mac");
+      assert.equal(ensured.changed, true);
+      assert.match(ensured.settings.hostDeviceId ?? "", HOST_DEVICE_ID_REGEX);
+      assert.ok((ensured.settings.hostDeviceSecret ?? "").length >= 24);
+      assert.equal(ensured.settings.hostDeviceName, "Workstation-Mac");
+      assert.equal((ensured.settings.hostControlPassword ?? "").length, 8);
+
+      // Re-running ensureHostSettings is idempotent and preserves generated values
+      const ensuredAgain = ensureHostSettings(ensured.settings, "Other-Name");
+      assert.equal(ensuredAgain.changed, false);
+      assert.deepEqual(ensuredAgain.settings, ensured.settings);
+
+      const fullSettings: DesktopSettings = {
+        ...ensured.settings,
+        serverUrl: "https://relay.example.com",
+        hostEnabled: true,
+        hostDisplayId: "69733248",
+        hostAuthToken: "jwt.payload.signature",
+      };
+      saveSettingsAtomic(settingsPath, fullSettings);
+
+      const loaded = loadSettings(settingsPath);
+      assert.deepEqual(loaded, fullSettings);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("desktop host input mapping & command translation", () => {
+  const primaryDisplay: DisplayBounds = { x: 0, y: 0, width: 1920, height: 1080 };
+  const leftSecondaryDisplay: DisplayBounds = {
+    x: -1920,
+    y: 0,
+    width: 1920,
+    height: 1080,
+  };
+  const retinaLogicalDisplay: DisplayBounds = {
+    x: 0,
+    y: 0,
+    width: 1728,
+    height: 1117,
+  };
+
+  it("maps normalized points across primary, negative-offset secondary, Retina logical bounds, and clamps out-of-range inputs", () => {
+    assert.deepEqual(mapNormalizedPointToDisplay(0, 0, primaryDisplay), { x: 0, y: 0 });
+    assert.deepEqual(mapNormalizedPointToDisplay(0.5, 0.5, primaryDisplay), {
+      x: 960,
+      y: 540,
+    });
+    assert.deepEqual(mapNormalizedPointToDisplay(1, 1, primaryDisplay), {
+      x: 1919,
+      y: 1079,
+    });
+
+    // Secondary monitor placed to the left of primary (negative X offset)
+    assert.deepEqual(mapNormalizedPointToDisplay(0, 0.5, leftSecondaryDisplay), {
+      x: -1920,
+      y: 540,
+    });
+    assert.deepEqual(mapNormalizedPointToDisplay(1, 1, leftSecondaryDisplay), {
+      x: -1,
+      y: 1079,
+    });
+
+    // Retina MacBook Pro logical display coords
+    assert.deepEqual(mapNormalizedPointToDisplay(0.5, 0.5, retinaLogicalDisplay), {
+      x: 864,
+      y: 558,
+    });
+
+    // Out-of-bounds and non-finite clamping
+    assert.deepEqual(mapNormalizedPointToDisplay(-0.4, 1.9, primaryDisplay), {
+      x: 0,
+      y: 1079,
+    });
+    assert.deepEqual(mapNormalizedPointToDisplay(Number.NaN, Number.POSITIVE_INFINITY, primaryDisplay), {
+      x: 0,
+      y: 0,
+    });
+  });
+
+  it("translates native desktop mouse, wheel, and keyboard events cleanly", () => {
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "mouse_move", x: 0.5, y: 0.5 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "mouse_move", x: 960, y: 540 }],
+    );
+
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "mouse_down", x: 0.25, y: 0.5, button: "right", clickCount: 2 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "mouse_down", x: 480, y: 540, button: "right", clickCount: 2 }],
+    );
+
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "mouse_up", x: 0.25, y: 0.5, button: "right" },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "mouse_up", x: 480, y: 540, button: "right", clickCount: 1 }],
+    );
+
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "mouse_wheel", x: 0.5, y: 0.5, deltaX: 0, deltaY: -120 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "mouse_wheel", x: 960, y: 540, deltaX: 0, deltaY: -120 }],
+    );
+
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        {
+          action: "key_event",
+          phase: "press",
+          code: "KeyC",
+          key: "c",
+          modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+        },
+        primaryDisplay,
+        "darwin",
+      ),
+      [
+        {
+          action: "key_event",
+          phase: "press",
+          code: "KeyC",
+          key: "c",
+          modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+        },
+      ],
+    );
+  });
+
+  it("translates legacy mobile touch, long_press, swipe, remote keys, and Unicode text commands", () => {
+    // tap -> left click
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "tap", x: 0.5, y: 0.5 },
+        leftSecondaryDisplay,
+        "darwin",
+      ),
+      [{ action: "tap", x: -960, y: 540, clickCount: 1 }],
+    );
+
+    // long_press -> right click (context menu)
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "long_press", x: 0.5, y: 0.5 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "long_press", x: 960, y: 540 }],
+    );
+
+    // swipe upward on mobile touch (y1=0.7 -> y2=0.3) -> positive DOM deltaY wheel scroll down
+    const swipeEvents = translateControlCommandToNativeEvents(
+      { action: "swipe", x1: 0.5, y1: 0.7, x2: 0.5, y2: 0.3 },
+      primaryDisplay,
+      "darwin",
+    );
+    assert.equal(swipeEvents.length, 1);
+    assert.equal(swipeEvents[0]?.action, "mouse_wheel");
+    assert.equal(swipeEvents[0]?.x, 960);
+    assert.ok((swipeEvents[0]?.deltaY ?? 0) > 0);
+
+    // touch_down -> touch_move -> touch_up -> left mouse drag
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "touch_down", pointerId: 1, x: 0.1, y: 0.2 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "mouse_down", x: 192, y: 216, button: "left", clickCount: 1 }],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "touch_move", pointerId: 1, x: 0.2, y: 0.2 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "mouse_move", x: 384, y: 216 }],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "touch_up", pointerId: 1, x: 0.2, y: 0.2 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "mouse_up", x: 384, y: 216, button: "left", clickCount: 1 }],
+    );
+
+    // OS-specific legacy remote key mappings
+    assert.deepEqual(
+      translateControlCommandToNativeEvents({ action: "key", key: "back" }, primaryDisplay, "darwin"),
+      [
+        {
+          action: "key_event",
+          phase: "press",
+          code: "Escape",
+          key: "Escape",
+          modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+        },
+      ],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents({ action: "key", key: "home" }, primaryDisplay, "darwin"),
+      [
+        {
+          action: "key_event",
+          phase: "press",
+          code: "KeyH",
+          key: "h",
+          modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+        },
+      ],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents({ action: "key", key: "home" }, primaryDisplay, "win32"),
+      [
+        {
+          action: "key_event",
+          phase: "press",
+          code: "KeyD",
+          key: "d",
+          modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+        },
+      ],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents({ action: "key", key: "recents" }, primaryDisplay, "darwin"),
+      [
+        {
+          action: "key_event",
+          phase: "press",
+          code: "ArrowUp",
+          key: "ArrowUp",
+          modifiers: { ctrl: true, alt: false, shift: false, meta: false },
+        },
+      ],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents({ action: "key", key: "recents" }, primaryDisplay, "win32"),
+      [
+        {
+          action: "key_event",
+          phase: "press",
+          code: "Tab",
+          key: "Tab",
+          modifiers: { ctrl: false, alt: true, shift: false, meta: false },
+        },
+      ],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents({ action: "key", key: "lock" }, primaryDisplay, "darwin"),
+      [{ action: "lock" }],
+    );
+
+    // Unicode text injection
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "text", text: "你好 VeloDeck 🚀", submit: true },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "text", text: "你好 VeloDeck 🚀", submit: true }],
+    );
   });
 });

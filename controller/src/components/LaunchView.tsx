@@ -11,6 +11,7 @@ import {
   KeyRound,
   Loader2,
   Lock,
+  Monitor,
   RefreshCw,
   Server,
   Share,
@@ -40,14 +41,19 @@ import {
   formatServerHostLabel,
   isDesktopApp,
   isMacDesktop,
+  type DesktopHostState,
 } from "../desktop/bridge";
 import { isPrivateHost } from "../state/profiles";
 import type { RemoteClientState } from "../transport/RemoteClient";
+import {
+  DesktopHostPanel,
+  type DesktopHostHandlers,
+} from "./DesktopHostPanel";
 
 export interface LaunchViewProps {
   apiBase: string;
   serverInfo: ServerInfo;
-  initialTab?: "code" | "account";
+  initialTab?: "code" | "account" | "host";
   savedAccount: SavedAccountSession | null;
   recentCodes: RecentControlCode[];
   profileCount: number;
@@ -57,6 +63,8 @@ export interface LaunchViewProps {
     deviceName?: string;
   } | null;
   desktopServerUrl?: string;
+  hostState?: DesktopHostState | null;
+  hostHandlers?: DesktopHostHandlers;
   onConnectWithCode: (input: {
     controlCode: string;
     controlPassword: string;
@@ -81,6 +89,8 @@ export function LaunchView({
   clientState,
   codeOfflineNotice,
   desktopServerUrl,
+  hostState,
+  hostHandlers,
   onConnectWithCode,
   onCancelCodeConnect,
   onRetryCodeConnect,
@@ -93,7 +103,8 @@ export function LaunchView({
   const desktopApp = isDesktopApp();
   const macDesktop = isMacDesktop();
   const desktopServerHost = formatServerHostLabel(desktopServerUrl ?? apiBase);
-  const [activeTab, setActiveTab] = useState<"code" | "account">(initialTab);
+  const canShowHostTab = Boolean(desktopApp && hostState && hostHandlers);
+  const [activeTab, setActiveTab] = useState<"code" | "account" | "host">(initialTab);
   const [showIosBanner, setShowIosBanner] = useState(false);
   const [copiedSha256, setCopiedSha256] = useState(false);
 
@@ -442,17 +453,68 @@ export function LaunchView({
                 <User className="h-4 w-4" />
                 <span>账号登录</span>
               </button>
+
+              {canShowHostTab && hostState && (
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === "host"}
+                  onClick={() => setActiveTab("host")}
+                  className={`relative -mb-px inline-flex items-center gap-2 border-b-2 px-3 py-3 text-sm font-medium transition-colors ${
+                    activeTab === "host"
+                      ? "border-[#2563EB] text-[#111318]"
+                      : "border-transparent text-[#6B7280] hover:text-[#111318]"
+                  }`}
+                >
+                  <Monitor className="h-4 w-4" />
+                  <span>本机被控</span>
+                  {(hostState.status === "online" ||
+                    hostState.status === "controlling" ||
+                    hostState.status === "connecting" ||
+                    hostState.status === "error") && (
+                    <span
+                      className={`h-2 w-2 rounded-full ${
+                        hostState.status === "controlling"
+                          ? "bg-[#2563EB]"
+                          : hostState.status === "online"
+                            ? "bg-[#16A34A]"
+                            : hostState.status === "error"
+                              ? "bg-[#DC2626]"
+                              : "bg-[#D97706]"
+                      }`}
+                      title={
+                        hostState.status === "controlling"
+                          ? "正在被远控"
+                          : hostState.status === "online"
+                            ? "本机被控在线"
+                            : hostState.status === "error"
+                              ? "连接异常"
+                              : "连接中"
+                      }
+                    />
+                  )}
+                </button>
+              )}
             </div>
 
             <div className="p-5 sm:p-6">
-              {activeTab === "code" ? (
+              {activeTab === "host" && canShowHostTab && hostState && hostHandlers ? (
+                <DesktopHostPanel
+                  embedded
+                  hostState={hostState}
+                  serverUrl={desktopServerUrl ?? apiBase}
+                  savedAccount={savedAccount}
+                  handlers={hostHandlers}
+                  onOpenServerSettings={onOpenServerSettings}
+                />
+              ) : activeTab === "code" ? (
                 <form onSubmit={handleCodeSubmit} className="space-y-5">
                   <div>
                     <h1 className="text-lg font-semibold tracking-tight text-[#111318]">
                       输入 9 位设备控制码
                     </h1>
                     <p className="mt-1 text-xs text-[#6B7280]">
-                      在被控 Android 手机上打开 VeloDeck Agent 即可看到本机永久控制码与密码。
+                      在被控 Android 手机或电脑上打开 VeloDeck 即可看到本机永久控制码与密码。
                     </p>
                   </div>
 

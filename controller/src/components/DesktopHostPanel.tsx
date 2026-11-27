@@ -1,0 +1,927 @@
+import { useEffect, useState } from "react";
+import {
+  AlertCircle,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Copy,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  FileCheck2,
+  Link2,
+  Loader2,
+  Monitor,
+  Pencil,
+  PowerOff,
+  RefreshCw,
+  RotateCcw,
+  Server,
+  ShieldAlert,
+  ShieldCheck,
+  Unlink,
+  X,
+} from "lucide-react";
+import { formatControlCode } from "@velodeck/protocol";
+import type {
+  DesktopHostConfigPatch,
+  DesktopHostState,
+} from "../desktop/bridge";
+import { MIN_PASSWORD_LENGTH, type SavedAccountSession } from "../state/auth";
+
+export interface DesktopHostHandlers {
+  onStartHost: () => Promise<void>;
+  onStopHost: () => Promise<void>;
+  onUpdateConfig: (patch: DesktopHostConfigPatch) => Promise<void>;
+  onRegeneratePassword: () => Promise<void>;
+  onBindAccount: () => Promise<void>;
+  onUnbindAccount: () => Promise<void>;
+  onSelectDisplay: (displayId: string) => Promise<void>;
+  onDisconnectSession: () => Promise<void>;
+  onRefreshPermissions: () => Promise<void>;
+  onOpenPermissionSettings: (kind: "accessibility" | "screen") => Promise<void>;
+}
+
+export interface DesktopHostPanelProps {
+  hostState: DesktopHostState;
+  serverUrl: string;
+  savedAccount: SavedAccountSession | null;
+  handlers: DesktopHostHandlers;
+  onOpenServerSettings?: () => void;
+  /** Omit outer card chrome when rendered inside another `.panel` sheet (e.g. LaunchView tab). */
+  embedded?: boolean;
+  /** Allow collapsing into a compact operational strip (e.g. DashboardView when stopped). */
+  collapsible?: boolean;
+}
+
+function getHostStatusBadge(hostState: DesktopHostState): {
+  label: string;
+  pillClass: string;
+  dotClass: string;
+} {
+  switch (hostState.status) {
+    case "connecting":
+      return {
+        label: "连接中...",
+        pillClass: "bg-[#EFF6FF] text-[#1D4ED8] border-[#BFDBFE]",
+        dotClass: "bg-[#2563EB]",
+      };
+    case "online":
+      return {
+        label: "在线等待连接",
+        pillClass: "bg-[#ECFDF3] text-[#15803D] border-[#BBF7D0]",
+        dotClass: "bg-[#16A34A]",
+      };
+    case "controlling":
+      return {
+        label:
+          hostState.activeTransport === "ws-jpeg"
+            ? "正在被远控 · WS 帧流"
+            : "正在被远控 · WebRTC",
+        pillClass: "bg-[#EFF6FF] text-[#1D4ED8] border-[#93C5FD]",
+        dotClass: "bg-[#2563EB]",
+      };
+    case "error":
+      return {
+        label: "连接异常",
+        pillClass: "bg-[#FEF2F2] text-[#B91C1C] border-[#FECACA]",
+        dotClass: "bg-[#DC2626]",
+      };
+    default:
+      return {
+        label: "已停止",
+        pillClass: "bg-[#F3F4F6] text-[#4B5563] border-[#E2E6EC]",
+        dotClass: "bg-[#9CA3AF]",
+      };
+  }
+}
+
+function formatReceivedTime(ts: number): string {
+  if (!ts) return "";
+  try {
+    return new Date(ts).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+
+export function DesktopHostPanel({
+  hostState,
+  serverUrl,
+  savedAccount,
+  handlers,
+  onOpenServerSettings,
+  embedded = false,
+  collapsible = false,
+}: DesktopHostPanelProps) {
+  const [expanded, setExpanded] = useState<boolean>(
+    () => !collapsible || hostState.enabled || hostState.status !== "stopped",
+  );
+  const [toggling, setToggling] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [regeneratingPwd, setRegeneratingPwd] = useState(false);
+  const [bindingBusy, setBindingBusy] = useState(false);
+  const [refreshingPerms, setRefreshingPerms] = useState(false);
+  const [selectingDisplayId, setSelectingDisplayId] = useState<string | null>(null);
+
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [copiedPassword, setCopiedPassword] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+
+  const [editingPassword, setEditingPassword] = useState(false);
+  const [passwordDraft, setPasswordDraft] = useState(hostState.controlPassword);
+  const [savingPassword, setSavingPassword] = useState(false);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState(hostState.deviceName);
+  const [savingName, setSavingName] = useState(false);
+
+  // Auto-expand collapsible dashboard card when host becomes active or receives an incoming session
+  useEffect(() => {
+    if (!collapsible) return;
+    if (hostState.enabled || hostState.activeSessionId || hostState.status === "error") {
+      setExpanded(true);
+    }
+  }, [collapsible, hostState.enabled, hostState.activeSessionId, hostState.status]);
+
+  // Keep draft inputs aligned with external IPC updates while not editing
+  useEffect(() => {
+    if (!editingPassword) {
+      setPasswordDraft(hostState.controlPassword);
+      setPasswordError(null);
+    }
+  }, [editingPassword, hostState.controlPassword]);
+
+  useEffect(() => {
+    if (!editingName) {
+      setNameDraft(hostState.deviceName);
+    }
+  }, [editingName, hostState.deviceName]);
+
+  const statusMeta = getHostStatusBadge(hostState);
+  const formattedCode = hostState.controlCode
+    ? formatControlCode(hostState.controlCode)
+    : "--- --- ---";
+  const isHostEnabled =
+    hostState.enabled ||
+    hostState.status === "connecting" ||
+    hostState.status === "online" ||
+    hostState.status === "controlling";
+  const hasServerUrl = Boolean(serverUrl.trim());
+  const isMacHost = hostState.permissions.platform === "darwin";
+  const needsMacPermission =
+    isMacHost &&
+    (!hostState.permissions.screenCapture || !hostState.permissions.accessibility);
+
+  async function handleToggleHost() {
+    if (toggling) return;
+    if (!isHostEnabled && !hasServerUrl) {
+      onOpenServerSettings?.();
+      return;
+    }
+    setToggling(true);
+    try {
+      if (isHostEnabled) {
+        await handlers.onStopHost();
+      } else {
+        await handlers.onStartHost();
+      }
+    } finally {
+      setToggling(false);
+    }
+  }
+
+  async function handleCopyCode() {
+    if (!hostState.controlCode) return;
+    try {
+      await navigator.clipboard.writeText(formatControlCode(hostState.controlCode));
+      setCopiedCode(true);
+      window.setTimeout(() => setCopiedCode(false), 1500);
+    } catch {
+      // Ignore clipboard denial
+    }
+  }
+
+  async function handleCopyPassword() {
+    if (!hostState.controlPassword) return;
+    try {
+      await navigator.clipboard.writeText(hostState.controlPassword);
+      setCopiedPassword(true);
+      window.setTimeout(() => setCopiedPassword(false), 1500);
+    } catch {
+      // Ignore clipboard denial
+    }
+  }
+
+  async function handleSavePassword() {
+    const trimmed = passwordDraft.trim();
+    if (trimmed.length < MIN_PASSWORD_LENGTH) {
+      setPasswordError(`无人值守控制密码至少需要 ${MIN_PASSWORD_LENGTH} 位`);
+      return;
+    }
+    setPasswordError(null);
+    setSavingPassword(true);
+    try {
+      await handlers.onUpdateConfig({ controlPassword: trimmed });
+      setEditingPassword(false);
+    } finally {
+      setSavingPassword(false);
+    }
+  }
+
+  async function handleRegeneratePasswordClick() {
+    if (regeneratingPwd) return;
+    setRegeneratingPwd(true);
+    try {
+      await handlers.onRegeneratePassword();
+      setEditingPassword(false);
+      setPasswordError(null);
+    } finally {
+      setRegeneratingPwd(false);
+    }
+  }
+
+  async function handleSaveDeviceName() {
+    const trimmed = nameDraft.trim();
+    if (!trimmed) return;
+    if (trimmed === hostState.deviceName) {
+      setEditingName(false);
+      return;
+    }
+    setSavingName(true);
+    try {
+      await handlers.onUpdateConfig({ deviceName: trimmed });
+      setEditingName(false);
+    } finally {
+      setSavingName(false);
+    }
+  }
+
+  async function handleBindToggle(action: "bind" | "unbind") {
+    if (bindingBusy) return;
+    setBindingBusy(true);
+    try {
+      if (action === "bind") {
+        await handlers.onBindAccount();
+      } else {
+        await handlers.onUnbindAccount();
+      }
+    } finally {
+      setBindingBusy(false);
+    }
+  }
+
+  async function handleSelectDisplayClick(displayId: string) {
+    if (selectingDisplayId || displayId === hostState.activeDisplayId) return;
+    setSelectingDisplayId(displayId);
+    try {
+      await handlers.onSelectDisplay(displayId);
+    } finally {
+      setSelectingDisplayId(null);
+    }
+  }
+
+  async function handleDisconnectClick() {
+    if (disconnecting) return;
+    setDisconnecting(true);
+    try {
+      await handlers.onDisconnectSession();
+    } finally {
+      setDisconnecting(false);
+    }
+  }
+
+  async function handleRefreshPermsClick() {
+    if (refreshingPerms) return;
+    setRefreshingPerms(true);
+    try {
+      await handlers.onRefreshPermissions();
+    } finally {
+      setRefreshingPerms(false);
+    }
+  }
+
+  const showBody = !collapsible || expanded;
+
+  const content = (
+    <>
+      {/* Header Row */}
+      <div
+        className={`flex flex-wrap items-center justify-between gap-3 ${
+          embedded
+            ? "pb-4 border-b border-[#ECEFF4]"
+            : `px-4 py-3.5 sm:px-5 ${showBody ? "border-b border-[#E2E6EC] bg-[#F8F9FB]" : "bg-white"}`
+        }`}
+      >
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          <div
+            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border ${
+              hostState.status === "controlling"
+                ? "border-[#93C5FD] bg-[#EFF6FF] text-[#2563EB]"
+                : hostState.status === "online"
+                  ? "border-[#BBF7D0] bg-[#ECFDF3] text-[#15803D]"
+                  : "border-[#E2E6EC] bg-[#F4F5F7] text-[#374151]"
+            }`}
+          >
+            <Monitor className="h-4.5 w-4.5" />
+          </div>
+
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-sm font-semibold tracking-tight text-[#111318]">
+                本机被控
+              </h2>
+              <span
+                className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-medium ${statusMeta.pillClass}`}
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${statusMeta.dotClass}`} />
+                <span>{statusMeta.label}</span>
+              </span>
+              {collapsible && !expanded && hostState.controlCode && (
+                <span className="hidden rounded border border-[#E2E6EC] bg-[#F8F9FB] px-1.5 py-0.5 font-mono text-[11px] font-semibold text-[#374151] sm:inline">
+                  {formattedCode}
+                </span>
+              )}
+            </div>
+            <p className="mt-0.5 truncate text-xs text-[#6B7280]">
+              允许其他手机或电脑远程控制这台电脑（支持 60fps WebRTC 与键鼠直通）
+            </p>
+          </div>
+        </div>
+
+        <div className="flex shrink-0 items-center gap-2.5">
+          {/* Primary Hardware Toggle Switch */}
+          <button
+            type="button"
+            role="switch"
+            aria-checked={isHostEnabled}
+            aria-label={isHostEnabled ? "关闭本机被控" : "开启本机被控"}
+            disabled={toggling}
+            onClick={() => void handleToggleHost()}
+            className={`inline-flex h-9 items-center gap-2 rounded-lg border px-3 text-xs font-medium transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2563EB] disabled:opacity-60 ${
+              isHostEnabled
+                ? "border-[#2563EB] bg-[#2563EB] text-white hover:bg-[#1D4ED8]"
+                : "border-[#CBD2DC] bg-white text-[#111318] hover:bg-[#F8F9FB]"
+            }`}
+          >
+            <span
+              className={`relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors ${
+                isHostEnabled ? "bg-white/30" : "bg-[#D1D5DB]"
+              }`}
+            >
+              <span
+                className={`inline-block h-3 w-3 transform rounded-full bg-white shadow-xs transition-transform ${
+                  isHostEnabled ? "translate-x-3.5" : "translate-x-0.5"
+                }`}
+              />
+            </span>
+            {toggling ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <span>{isHostEnabled ? "已开启" : "开启被控"}</span>
+            )}
+          </button>
+
+          {collapsible && (
+            <button
+              type="button"
+              onClick={() => setExpanded((prev) => !prev)}
+              aria-expanded={expanded}
+              aria-label={expanded ? "收起本机被控面板" : "展开本机被控面板"}
+              className="btn-outline inline-flex h-9 w-9 items-center justify-center rounded-lg text-[#4B5563]"
+            >
+              {expanded ? (
+                <ChevronUp className="h-4 w-4" />
+              ) : (
+                <ChevronDown className="h-4 w-4" />
+              )}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Expandable Structured Console Body */}
+      {showBody && (
+        <div className={embedded ? "pt-4 space-y-4" : "p-4 sm:p-5 space-y-4"}>
+          {/* Missing Server Configuration Banner */}
+          {!hasServerUrl && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#FDE68A] bg-[#FFFBEB] px-3.5 py-2.5 text-xs text-[#92400E]">
+              <div className="flex min-w-0 items-start gap-2">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-[#D97706]" />
+                <span className="leading-relaxed">
+                  开启本机被控前，请先配置你的自托管 VeloDeck 服务器地址。
+                </span>
+              </div>
+              {onOpenServerSettings && (
+                <button
+                  type="button"
+                  onClick={onOpenServerSettings}
+                  className="btn-outline inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border-[#F59E0B]/50 bg-white px-2.5 text-xs font-medium text-[#92400E] hover:bg-[#FEF3C7]"
+                >
+                  <Server className="h-3.5 w-3.5" />
+                  先配置自托管服务器
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Active Incoming Remote Control Alert */}
+          {hostState.activeSessionId && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#93C5FD] bg-[#EFF6FF] px-3.5 py-3 text-xs text-[#1E3A8A]">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-[#2563EB]" />
+                <div className="min-w-0">
+                  <p className="font-semibold text-[#111318]">
+                    当前正被远程控制（
+                    {hostState.activeTransport === "webrtc"
+                      ? "WebRTC 60fps"
+                      : "WS 帧流"}
+                    ）
+                  </p>
+                  <p className="mt-0.5 font-mono text-[11px] text-[#3B82F6]">
+                    会话 ID: {hostState.activeSessionId.slice(0, 12)}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={disconnecting}
+                onClick={() => void handleDisconnectClick()}
+                className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-[#DC2626] bg-[#DC2626] px-3 text-xs font-medium text-white transition hover:bg-[#B91C1C] disabled:opacity-50"
+              >
+                {disconnecting ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <PowerOff className="h-3.5 w-3.5" />
+                )}
+                断开远控
+              </button>
+            </div>
+          )}
+
+          {/* Error Notice */}
+          {hostState.lastError && (
+            <div className="flex items-start gap-2 rounded-lg border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2.5 text-xs text-[#991B1B]">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-[#DC2626]" />
+              <span className="min-w-0 flex-1 leading-relaxed">
+                {hostState.lastError}
+              </span>
+            </div>
+          )}
+
+          {/* 9-Digit Control Code + Unattended Password Grid */}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {/* Control Code Cell */}
+            <div className="rounded-lg border border-[#E2E6EC] bg-[#F8F9FB] p-3.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-[#6B7280]">
+                  本机 9 位控制码
+                </span>
+                <button
+                  type="button"
+                  disabled={!hostState.controlCode}
+                  onClick={() => void handleCopyCode()}
+                  className="btn-outline inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] font-medium disabled:opacity-45"
+                >
+                  {copiedCode ? (
+                    <>
+                      <Check className="h-3 w-3 text-[#15803D]" />
+                      <span className="text-[#15803D]">已复制</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-3 w-3 text-[#4B5563]" />
+                      <span>复制</span>
+                    </>
+                  )}
+                </button>
+              </div>
+              <p className="mt-2 font-mono text-2xl font-bold tracking-[0.14em] text-[#111318]">
+                {formattedCode}
+              </p>
+              <p className="mt-1 text-[11px] text-[#6B7280]">
+                在手机浏览器或另一台电脑输入此控制码即可连接本机
+              </p>
+            </div>
+
+            {/* Unattended Password Cell */}
+            <div className="rounded-lg border border-[#E2E6EC] bg-[#F8F9FB] p-3.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-[#6B7280]">
+                  无人值守控制密码
+                </span>
+                {!editingPassword && (
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword((prev) => !prev)}
+                      className="btn-outline inline-flex h-7 w-7 items-center justify-center rounded-md text-[#4B5563]"
+                      title={showPassword ? "隐藏密码" : "显示密码"}
+                      aria-label={showPassword ? "隐藏密码" : "显示密码"}
+                    >
+                      {showPassword ? (
+                        <EyeOff className="h-3.5 w-3.5" />
+                      ) : (
+                        <Eye className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!hostState.controlPassword}
+                      onClick={() => void handleCopyPassword()}
+                      className="btn-outline inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] font-medium disabled:opacity-45"
+                    >
+                      {copiedPassword ? (
+                        <Check className="h-3 w-3 text-[#15803D]" />
+                      ) : (
+                        <Copy className="h-3 w-3 text-[#4B5563]" />
+                      )}
+                      <span>{copiedPassword ? "已复制" : "复制"}</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {editingPassword ? (
+                <div className="mt-2 space-y-2">
+                  <input
+                    type="text"
+                    value={passwordDraft}
+                    onChange={(e) => {
+                      setPasswordDraft(e.target.value);
+                      if (passwordError) setPasswordError(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void handleSavePassword();
+                      } else if (e.key === "Escape") {
+                        setEditingPassword(false);
+                        setPasswordDraft(hostState.controlPassword);
+                        setPasswordError(null);
+                      }
+                    }}
+                    placeholder={`至少 ${MIN_PASSWORD_LENGTH} 位字符`}
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="field h-9 w-full rounded-md px-2.5 font-mono text-xs"
+                  />
+                  {passwordError && (
+                    <p className="text-[11px] text-[#DC2626]">{passwordError}</p>
+                  )}
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={savingPassword}
+                      onClick={() => void handleSavePassword()}
+                      className="btn-primary inline-flex h-7 items-center gap-1 rounded-md px-2.5 text-[11px] font-medium"
+                    >
+                      {savingPassword && <Loader2 className="h-3 w-3 animate-spin" />}
+                      保存密码
+                    </button>
+                    <button
+                      type="button"
+                      disabled={savingPassword}
+                      onClick={() => {
+                        setEditingPassword(false);
+                        setPasswordDraft(hostState.controlPassword);
+                        setPasswordError(null);
+                      }}
+                      className="btn-outline inline-flex h-7 items-center rounded-md px-2 text-[11px] text-[#4B5563]"
+                    >
+                      取消
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <p className="mt-2 truncate font-mono text-lg font-semibold tracking-wider text-[#111318]">
+                    {hostState.controlPassword
+                      ? showPassword
+                        ? hostState.controlPassword
+                        : "•".repeat(Math.min(14, Math.max(8, hostState.controlPassword.length)))
+                      : "未设置"}
+                  </p>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPasswordDraft(hostState.controlPassword);
+                        setPasswordError(null);
+                        setEditingPassword(true);
+                      }}
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-[#2563EB] hover:underline"
+                    >
+                      <Pencil className="h-3 w-3" />
+                      修改密码
+                    </button>
+                    <span className="text-[#CBD5E1]">|</span>
+                    <button
+                      type="button"
+                      disabled={regeneratingPwd}
+                      onClick={() => void handleRegeneratePasswordClick()}
+                      className="inline-flex items-center gap-1 text-[11px] font-medium text-[#4B5563] hover:text-[#111318] disabled:opacity-50"
+                    >
+                      <RotateCcw
+                        className={`h-3 w-3 ${regeneratingPwd ? "animate-spin" : ""}`}
+                      />
+                      重置密码
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Device Name + Account Binding Structured Rows */}
+          <div className="divide-y divide-[#ECEFF4] rounded-lg border border-[#E2E6EC] bg-white">
+            {/* Editable Device Name Row */}
+            <div className="flex flex-wrap items-center justify-between gap-2.5 px-3.5 py-2.5">
+              <span className="text-xs font-medium text-[#4B5563]">本机名称</span>
+              {editingName ? (
+                <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 sm:max-w-xs">
+                  <input
+                    type="text"
+                    value={nameDraft}
+                    onChange={(e) => setNameDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void handleSaveDeviceName();
+                      } else if (e.key === "Escape") {
+                        setEditingName(false);
+                        setNameDraft(hostState.deviceName);
+                      }
+                    }}
+                    maxLength={48}
+                    className="field h-8 min-w-0 flex-1 rounded-md px-2.5 text-xs"
+                  />
+                  <button
+                    type="button"
+                    disabled={savingName || !nameDraft.trim()}
+                    onClick={() => void handleSaveDeviceName()}
+                    className="btn-primary inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs font-medium"
+                  >
+                    {savingName ? <Loader2 className="h-3 w-3 animate-spin" /> : "保存"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={savingName}
+                    onClick={() => {
+                      setEditingName(false);
+                      setNameDraft(hostState.deviceName);
+                    }}
+                    className="btn-outline inline-flex h-8 w-8 items-center justify-center rounded-md text-[#6B7280]"
+                    aria-label="取消重命名"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ) : (
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="truncate text-xs font-semibold text-[#111318]">
+                    {hostState.deviceName || "未命名电脑"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setNameDraft(hostState.deviceName);
+                      setEditingName(true);
+                    }}
+                    className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-[#4B5563] hover:bg-[#F3F4F6] hover:text-[#111318]"
+                  >
+                    <Pencil className="h-3 w-3" />
+                    编辑
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Account Binding Row */}
+            <div className="flex flex-wrap items-center justify-between gap-2.5 px-3.5 py-2.5">
+              <div className="flex min-w-0 items-center gap-2 text-xs">
+                <Link2
+                  className={`h-3.5 w-3.5 shrink-0 ${
+                    hostState.ownerUsername ? "text-[#15803D]" : "text-[#6B7280]"
+                  }`}
+                />
+                {hostState.ownerUsername ? (
+                  <span className="text-[#111318]">
+                    已绑定账号{" "}
+                    <strong className="font-mono font-semibold">
+                      @{hostState.ownerUsername}
+                    </strong>{" "}
+                    <span className="text-[#6B7280]">
+                      · 同账号手机/电脑可直接连接
+                    </span>
+                  </span>
+                ) : savedAccount ? (
+                  <span className="text-[#4B5563]">
+                    尚未绑定账号（绑定后同账号免输控制码直接接管）
+                  </span>
+                ) : (
+                  <span className="text-[#6B7280]">
+                    登录账号后可一键绑定本机，免输控制码随时连接
+                  </span>
+                )}
+              </div>
+
+              {hostState.ownerUsername ? (
+                <button
+                  type="button"
+                  disabled={bindingBusy}
+                  onClick={() => void handleBindToggle("unbind")}
+                  className="btn-outline inline-flex h-8 shrink-0 items-center gap-1 rounded-md px-2.5 text-xs font-medium text-[#4B5563] hover:text-[#DC2626] disabled:opacity-50"
+                >
+                  {bindingBusy ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Unlink className="h-3.5 w-3.5" />
+                  )}
+                  解绑
+                </button>
+              ) : savedAccount ? (
+                <button
+                  type="button"
+                  disabled={bindingBusy || !hasServerUrl}
+                  onClick={() => void handleBindToggle("bind")}
+                  className="btn-primary inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md px-3 text-xs font-medium disabled:cursor-not-allowed"
+                >
+                  {bindingBusy ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Link2 className="h-3.5 w-3.5" />
+                  )}
+                  绑定到当前账号 (@{savedAccount.user.username})
+                </button>
+              ) : null}
+            </div>
+          </div>
+
+          {/* Multi-Monitor Display Selector */}
+          {hostState.displays.length > 0 && (
+            <div>
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="text-xs font-medium text-[#374151]">
+                  共享显示器（{hostState.displays.length} 块）
+                </span>
+                <span className="text-[11px] text-[#6B7280]">
+                  选择被远程采集与键鼠映射的目标屏幕
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {hostState.displays.map((display, idx) => {
+                  const active = display.id === hostState.activeDisplayId;
+                  const busy = selectingDisplayId === display.id;
+                  return (
+                    <button
+                      key={display.id}
+                      type="button"
+                      disabled={Boolean(selectingDisplayId)}
+                      onClick={() => void handleSelectDisplayClick(display.id)}
+                      title={display.name}
+                      className={`inline-flex h-9 items-center gap-1.5 rounded-lg border px-3 text-xs font-medium transition ${
+                        active
+                          ? "border-[#2563EB] bg-[#EFF6FF] text-[#1D4ED8]"
+                          : "border-[#CBD2DC] bg-white text-[#374151] hover:bg-[#F8F9FB]"
+                      }`}
+                    >
+                      {busy ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Monitor className="h-3.5 w-3.5" />
+                      )}
+                      <span>
+                        显示器 {idx + 1}
+                        {display.primary ? "（主）" : ""}
+                      </span>
+                      <span className="font-mono text-[11px] opacity-80">
+                        · {display.width}×{display.height}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* macOS System Permissions Checklist */}
+          {isMacHost && (
+            <div className="overflow-hidden rounded-lg border border-[#E2E6EC] bg-white">
+              <div className="flex items-center justify-between gap-2 border-b border-[#ECEFF4] bg-[#F8F9FB] px-3.5 py-2">
+                <div className="flex items-center gap-1.5">
+                  {needsMacPermission ? (
+                    <ShieldAlert className="h-3.5 w-3.5 text-[#D97706]" />
+                  ) : (
+                    <ShieldCheck className="h-3.5 w-3.5 text-[#15803D]" />
+                  )}
+                  <span className="text-xs font-semibold text-[#374151]">
+                    macOS 权限检查
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  disabled={refreshingPerms}
+                  onClick={() => void handleRefreshPermsClick()}
+                  className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-[#4B5563] hover:bg-[#ECEFF4] hover:text-[#111318] disabled:opacity-50"
+                >
+                  <RefreshCw
+                    className={`h-3 w-3 ${refreshingPerms ? "animate-spin text-[#2563EB]" : ""}`}
+                  />
+                  刷新权限状态
+                </button>
+              </div>
+
+              <div className="divide-y divide-[#ECEFF4] text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5">
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium text-[#111318]">
+                      屏幕录制权限（画面采集）
+                    </span>
+                    <span
+                      className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                        hostState.permissions.screenCapture
+                          ? "bg-[#ECFDF3] text-[#15803D]"
+                          : "bg-[#FFFBEB] text-[#B45309]"
+                      }`}
+                    >
+                      {hostState.permissions.screenCapture ? "已授权" : "未授权"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handlers.onOpenPermissionSettings("screen")}
+                    className="btn-outline inline-flex h-7 items-center gap-1 rounded-md px-2.5 text-[11px] font-medium"
+                  >
+                    <span>打开设置</span>
+                    <ExternalLink className="h-3 w-3 text-[#6B7280]" />
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5">
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium text-[#111318]">
+                      辅助功能权限（鼠标与键盘控制）
+                    </span>
+                    <span
+                      className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                        hostState.permissions.accessibility
+                          ? "bg-[#ECFDF3] text-[#15803D]"
+                          : "bg-[#FFFBEB] text-[#B45309]"
+                      }`}
+                    >
+                      {hostState.permissions.accessibility ? "已授权" : "未授权"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handlers.onOpenPermissionSettings("accessibility")
+                    }
+                    className="btn-outline inline-flex h-7 items-center gap-1 rounded-md px-2.5 text-[11px] font-medium"
+                  >
+                    <span>打开设置</span>
+                    <ExternalLink className="h-3 w-3 text-[#6B7280]" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Last Received File Notice */}
+          {hostState.lastReceivedFile && (
+            <div className="flex items-start gap-2.5 rounded-lg border border-[#E2E6EC] bg-[#F8F9FB] px-3.5 py-2.5 text-xs">
+              <FileCheck2 className="mt-0.5 h-4 w-4 shrink-0 text-[#15803D]" />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-medium text-[#111318]">
+                    最近接收文件：{hostState.lastReceivedFile.fileName}
+                  </span>
+                  {hostState.lastReceivedFile.at > 0 && (
+                    <span className="font-mono text-[11px] text-[#6B7280]">
+                      {formatReceivedTime(hostState.lastReceivedFile.at)}
+                    </span>
+                  )}
+                </div>
+                <p className="mt-0.5 truncate font-mono text-[11px] text-[#6B7280]">
+                  {hostState.lastReceivedFile.savedPath}
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  );
+
+  if (embedded) {
+    return <div>{content}</div>;
+  }
+
+  return <section className="panel overflow-hidden rounded-xl">{content}</section>;
+}

@@ -1,5 +1,24 @@
 export type TransportMode = "webrtc" | "ws-jpeg";
 
+export type DeviceType = "android" | "desktop";
+export type DevicePlatform = "android" | "darwin" | "win32" | "linux";
+export type MouseButton = "left" | "right" | "middle";
+
+export interface DisplayInfo {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  primary?: boolean;
+}
+
+export interface KeyModifiers {
+  ctrl?: boolean;
+  alt?: boolean;
+  shift?: boolean;
+  meta?: boolean;
+}
+
 export type RemoteKey =
   | "back"
   | "home"
@@ -51,6 +70,10 @@ export interface DeviceSummary {
   blackScreenActive?: boolean;
   forcePortraitActive?: boolean;
   directUrl?: string;
+  deviceType?: DeviceType;
+  osPlatform?: DevicePlatform;
+  displays?: DisplayInfo[];
+  activeDisplayId?: string;
   capabilities: DeviceCapabilities;
 }
 
@@ -105,7 +128,13 @@ export type ControlCommand =
   | { action: "black_screen"; enabled: boolean }
   | { action: "force_portrait"; enabled: boolean }
   | { action: "quality"; quality: StreamQuality }
-  | { action: "request_keyframe" };
+  | { action: "request_keyframe" }
+  | { action: "mouse_move"; x: number; y: number }
+  | { action: "mouse_down"; x: number; y: number; button: MouseButton; clickCount?: number }
+  | { action: "mouse_up"; x: number; y: number; button: MouseButton }
+  | { action: "mouse_wheel"; x: number; y: number; deltaX: number; deltaY: number }
+  | { action: "key_event"; phase: "down" | "up" | "press"; code: string; key: string; modifiers?: KeyModifiers }
+  | { action: "select_display"; displayId: string };
 
 export interface AgentRegisterMessage {
   type: "agent.register";
@@ -132,6 +161,10 @@ export interface AgentRegisterMessage {
   blackScreenActive?: boolean;
   forcePortraitActive?: boolean;
   directUrl?: string;
+  deviceType?: DeviceType;
+  osPlatform?: DevicePlatform;
+  displays?: DisplayInfo[];
+  activeDisplayId?: string;
   capabilities: DeviceCapabilities;
 }
 
@@ -156,6 +189,10 @@ export interface AgentTelemetryMessage {
   screenOn?: boolean;
   blackScreenActive?: boolean;
   forcePortraitActive?: boolean;
+  deviceType?: DeviceType;
+  osPlatform?: DevicePlatform;
+  displays?: DisplayInfo[];
+  activeDisplayId?: string;
   capabilities?: Partial<DeviceCapabilities>;
 }
 

@@ -9,6 +9,7 @@ import {
   Loader2,
   Lock,
   LogOut,
+  Monitor,
   MonitorSmartphone,
   Plus,
   RefreshCw,
@@ -36,9 +37,14 @@ import {
   formatServerHostLabel,
   isDesktopApp,
   isMacDesktop,
+  type DesktopHostState,
 } from "../desktop/bridge";
 import { isAllowedDirectUrl } from "../state/profiles";
 import type { RemoteClientState } from "../transport/RemoteClient";
+import {
+  DesktopHostPanel,
+  type DesktopHostHandlers,
+} from "./DesktopHostPanel";
 import { SecuritySettingsModal } from "./SecuritySettingsModal";
 
 interface DashboardViewProps {
@@ -48,6 +54,8 @@ interface DashboardViewProps {
   serverInfo: ServerInfo;
   profileCount: number;
   desktopServerUrl?: string;
+  hostState?: DesktopHostState | null;
+  hostHandlers?: DesktopHostHandlers;
   onOpenConnections: (editProfileId?: string) => void;
   onOpenControlCode: () => void;
   onLogoutAccount: () => void;
@@ -64,6 +72,19 @@ interface DashboardViewProps {
   onSwitchToDirectUrl?: (device: DeviceSummary) => void;
   onOpenServerSettings?: () => void;
   onOpenNewWindow?: () => void;
+}
+
+function formatDesktopOsLabel(device: DeviceSummary): string {
+  switch (device.osPlatform) {
+    case "darwin":
+      return "macOS";
+    case "win32":
+      return "Windows";
+    case "linux":
+      return "Linux";
+    default:
+      return device.androidVersion || "Desktop";
+  }
 }
 
 function formatLastSeen(ts: number): string {
@@ -126,6 +147,8 @@ export function DashboardView({
   serverInfo,
   profileCount,
   desktopServerUrl,
+  hostState,
+  hostHandlers,
   onOpenConnections,
   onOpenControlCode,
   onLogoutAccount,
@@ -413,6 +436,18 @@ export function DashboardView({
           </div>
         )}
 
+        {/* Local Desktop Host Panel (shown ONLY in Desktop App) */}
+        {desktopApp && hostState && hostHandlers && (
+          <DesktopHostPanel
+            collapsible
+            hostState={hostState}
+            serverUrl={desktopServerUrl ?? apiBase}
+            savedAccount={savedAccount}
+            handlers={hostHandlers}
+            onOpenServerSettings={onOpenServerSettings}
+          />
+        )}
+
         {/* Unified White Fleet Sheet (Zero nested cards!) */}
         {!hasActiveConnection ? (
           <section className="panel rounded-xl px-6 py-12 text-center">
@@ -510,12 +545,17 @@ export function DashboardView({
             <div className="hidden grid-cols-12 items-center gap-4 border-b border-[#E2E6EC] bg-[#F8F9FB] px-5 py-2.5 text-[11px] font-semibold uppercase tracking-wider text-[#6B7280] md:grid">
               <div className="col-span-4">设备</div>
               <div className="col-span-2">控制码</div>
-              <div className="col-span-3">状态与电源</div>
+              <div className="col-span-3">状态与硬件</div>
               <div className="col-span-3 text-right">操作</div>
             </div>
 
             <ul className="divide-y divide-[#ECEFF4]">
               {clientState.devices.map((device) => {
+                const isDesktopDevice = device.deviceType === "desktop";
+                const displayCount = device.displays?.length ?? 0;
+                const desktopOsLabel = isDesktopDevice
+                  ? formatDesktopOsLabel(device)
+                  : "";
                 const isLowBattery = device.battery <= 20 && !device.charging;
                 const batteryPct = Math.max(0, Math.min(100, device.battery));
                 const isWaking = wakingDeviceId === device.deviceId;
@@ -537,14 +577,21 @@ export function DashboardView({
                   >
                     {/* Col 1: Device Identity & Hardware Specs */}
                     <div className="flex min-w-0 items-start gap-3 md:col-span-4">
-                      <span
-                        className={`mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full ${
-                          device.online ? "bg-[#16A34A]" : "bg-[#CBD5E1]"
-                        }`}
-                        title={device.online ? "在线" : "离线"}
-                      />
+                      <div className="relative mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#E2E6EC] bg-[#F8F9FB] text-[#374151]">
+                        {isDesktopDevice ? (
+                          <Monitor className="h-4 w-4" />
+                        ) : (
+                          <Smartphone className="h-4 w-4" />
+                        )}
+                        <span
+                          className={`absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full ring-2 ring-white ${
+                            device.online ? "bg-[#16A34A]" : "bg-[#CBD5E1]"
+                          }`}
+                          title={device.online ? "在线" : "离线"}
+                        />
+                      </div>
                       <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-1.5">
                           <h3 className="truncate text-sm font-semibold text-[#111318]">
                             {device.name || device.model}
                           </h3>
@@ -557,21 +604,42 @@ export function DashboardView({
                           >
                             {device.online ? "在线" : formatLastSeen(device.lastSeen)}
                           </span>
+                          {isDesktopDevice && displayCount > 1 && (
+                            <span className="shrink-0 rounded border border-[#D8E2F8] bg-[#EFF4FF] px-1.5 py-0.5 font-mono text-[10px] font-medium text-[#1D4ED8]">
+                              {displayCount} 块屏幕
+                            </span>
+                          )}
                         </div>
                         <p className="mt-0.5 truncate text-xs text-[#6B7280]">
-                          {device.model} · Android {device.androidVersion} ·{" "}
-                          <span className="font-mono">
-                            {device.screenWidth}×{device.screenHeight}
-                          </span>
+                          {isDesktopDevice ? (
+                            <>
+                              {desktopOsLabel}
+                              {device.model &&
+                              device.model.toLowerCase() !== desktopOsLabel.toLowerCase()
+                                ? ` · ${device.model}`
+                                : ""}{" "}
+                              ·{" "}
+                              <span className="font-mono">
+                                {device.screenWidth}×{device.screenHeight}
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              {device.model} · Android {device.androidVersion} ·{" "}
+                              <span className="font-mono">
+                                {device.screenWidth}×{device.screenHeight}
+                              </span>
+                            </>
+                          )}
                         </p>
                         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
                           <CapabilityTag
-                            label="无障碍"
+                            label={isDesktopDevice ? "键鼠辅助" : "无障碍"}
                             enabled={capabilities.accessibility}
                             warnWhenOff
                           />
                           <CapabilityTag
-                            label="免确认录屏"
+                            label={isDesktopDevice ? "画面采集" : "免确认录屏"}
                             enabled={capabilities.mediaProjection}
                             warnWhenOff
                           />
@@ -605,45 +673,71 @@ export function DashboardView({
                       )}
                     </div>
 
-                    {/* Col 3: Power & Lock Telemetry */}
+                    {/* Col 3: Hardware & Power Telemetry */}
                     <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[#4B5563] md:col-span-3 md:flex-col md:items-start md:gap-1.5">
-                      <div className="flex items-center gap-2">
-                        {device.charging && (
-                          <BatteryCharging className="h-3.5 w-3.5 text-[#16A34A]" />
-                        )}
-                        <div className="h-1.5 w-16 overflow-hidden rounded-full bg-[#E5E7EB]">
-                          <div
-                            className={`h-full rounded-full ${
-                              device.charging
-                                ? "bg-[#16A34A]"
-                                : isLowBattery
-                                  ? "bg-[#DC2626]"
-                                  : "bg-[#374151]"
-                            }`}
-                            style={{ width: `${batteryPct}%` }}
-                          />
-                        </div>
-                        <span className="font-mono text-xs font-medium text-[#111318]">
-                          {device.battery}%
-                        </span>
-                      </div>
+                      {isDesktopDevice ? (
+                        <>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="inline-flex items-center gap-1 rounded border border-[#E2E6EC] bg-[#F8F9FB] px-1.5 py-0.5 text-[11px] font-medium text-[#111318]">
+                              <Monitor className="h-3 w-3 text-[#4B5563]" />
+                              {desktopOsLabel}
+                            </span>
+                            <span className="font-mono text-xs text-[#4B5563]">
+                              {device.screenWidth}×{device.screenHeight}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-3 text-xs text-[#6B7280]">
+                            <span>
+                              {displayCount > 1
+                                ? `多显示器 (${displayCount} 块)`
+                                : "桌面主机"}
+                            </span>
+                            {capabilities.p2pFileTransfer && (
+                              <span className="text-[#15803D]">P2P 文件</span>
+                            )}
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="flex items-center gap-2">
+                            {device.charging && (
+                              <BatteryCharging className="h-3.5 w-3.5 text-[#16A34A]" />
+                            )}
+                            <div className="h-1.5 w-16 overflow-hidden rounded-full bg-[#E5E7EB]">
+                              <div
+                                className={`h-full rounded-full ${
+                                  device.charging
+                                    ? "bg-[#16A34A]"
+                                    : isLowBattery
+                                      ? "bg-[#DC2626]"
+                                      : "bg-[#374151]"
+                                }`}
+                                style={{ width: `${batteryPct}%` }}
+                              />
+                            </div>
+                            <span className="font-mono text-xs font-medium text-[#111318]">
+                              {device.battery}%
+                            </span>
+                          </div>
 
-                      <div className="flex items-center gap-3 text-xs text-[#6B7280]">
-                        <span className="inline-flex items-center gap-1">
-                          {device.locked ? (
-                            <Lock className="h-3 w-3 text-[#B45309]" />
-                          ) : (
-                            <Unlock className="h-3 w-3 text-[#15803D]" />
-                          )}
-                          {device.locked ? "已锁屏" : "已解锁"}
-                        </span>
-                        {device.screenOn !== undefined && (
-                          <span className="inline-flex items-center gap-1">
-                            <Sun className="h-3 w-3 text-[#6B7280]" />
-                            {device.screenOn ? "亮屏" : "息屏"}
-                          </span>
-                        )}
-                      </div>
+                          <div className="flex items-center gap-3 text-xs text-[#6B7280]">
+                            <span className="inline-flex items-center gap-1">
+                              {device.locked ? (
+                                <Lock className="h-3 w-3 text-[#B45309]" />
+                              ) : (
+                                <Unlock className="h-3 w-3 text-[#15803D]" />
+                              )}
+                              {device.locked ? "已锁屏" : "已解锁"}
+                            </span>
+                            {device.screenOn !== undefined && (
+                              <span className="inline-flex items-center gap-1">
+                                <Sun className="h-3 w-3 text-[#6B7280]" />
+                                {device.screenOn ? "亮屏" : "息屏"}
+                              </span>
+                            )}
+                          </div>
+                        </>
+                      )}
                     </div>
 
                     {/* Col 4: Actions */}
@@ -655,19 +749,21 @@ export function DashboardView({
                           onClick={() => onControlDevice(device)}
                           className="btn-primary inline-flex h-9 flex-1 items-center justify-center gap-1 rounded-lg px-3.5 text-xs font-medium disabled:cursor-not-allowed md:flex-none"
                         >
-                          <span>连接控制</span>
+                          <span>进入控制</span>
                           <ChevronRight className="h-3.5 w-3.5" />
                         </button>
 
-                        <button
-                          type="button"
-                          disabled={!device.online}
-                          onClick={() => handleWakeClick(device)}
-                          className="btn-outline inline-flex h-9 items-center justify-center gap-1 rounded-lg px-3 text-xs font-medium disabled:cursor-not-allowed"
-                        >
-                          <Zap className="h-3.5 w-3.5 text-[#D97706]" />
-                          <span>{isWaking ? "已发送" : "唤醒"}</span>
-                        </button>
+                        {!isDesktopDevice && (
+                          <button
+                            type="button"
+                            disabled={!device.online}
+                            onClick={() => handleWakeClick(device)}
+                            className="btn-outline inline-flex h-9 items-center justify-center gap-1 rounded-lg px-3 text-xs font-medium disabled:cursor-not-allowed"
+                          >
+                            <Zap className="h-3.5 w-3.5 text-[#D97706]" />
+                            <span>{isWaking ? "已发送" : "唤醒"}</span>
+                          </button>
+                        )}
                       </div>
 
                       <div className="flex items-center justify-end gap-2">

@@ -18,6 +18,7 @@
   ],
   "exclude": [
     "src/**/*.test.ts",
+    "src/hostWorkerRenderer.ts",
     "dist",
     "release",
     "renderer-dist"

@@ -6,6 +6,7 @@ import {
   normalizeControlCode,
   type DeviceCapabilities,
   type DeviceSummary,
+  type DisplayInfo,
   type UserProfile,
 } from "@velodeck/protocol";
 import {
@@ -114,6 +115,26 @@ function cloneCapabilities(cap: DeviceCapabilities): DeviceCapabilities {
   return copy;
 }
 
+function cloneDisplays(displays: DisplayInfo[]): DisplayInfo[] {
+  const cloned: DisplayInfo[] = [];
+  for (const display of displays) {
+    if (!display || typeof display !== "object") {
+      continue;
+    }
+    const copy: DisplayInfo = {
+      id: display.id,
+      name: display.name,
+      width: display.width,
+      height: display.height,
+    };
+    if (display.primary !== undefined) {
+      copy.primary = Boolean(display.primary);
+    }
+    cloned.push(copy);
+  }
+  return cloned;
+}
+
 export function cloneDeviceSummary(summary: DeviceSummary): DeviceSummary {
   const copy: DeviceSummary = {
     deviceId: summary.deviceId,
@@ -147,6 +168,18 @@ export function cloneDeviceSummary(summary: DeviceSummary): DeviceSummary {
   }
   if (summary.directUrl !== undefined) {
     copy.directUrl = summary.directUrl;
+  }
+  if (summary.deviceType !== undefined) {
+    copy.deviceType = summary.deviceType;
+  }
+  if (summary.osPlatform !== undefined) {
+    copy.osPlatform = summary.osPlatform;
+  }
+  if (Array.isArray(summary.displays)) {
+    copy.displays = cloneDisplays(summary.displays);
+  }
+  if (summary.activeDisplayId !== undefined) {
+    copy.activeDisplayId = summary.activeDisplayId;
   }
   return copy;
 }

@@ -310,7 +310,8 @@ curl -fsS http://127.0.0.1:8080/api/info
 - **原生电脑客户端（macOS / Windows）**：
   - 本地编译打包：`pnpm install && pnpm dist:desktop:mac`（输出 `desktop/release/VeloDeck-*-mac-arm64.dmg`）或 `pnpm dist:desktop:win`（输出 `.exe` 安装包与绿色便携版）。
   - 云端自动打包：在 Fork 仓库进入 **Actions → Build Desktop App (macOS & Windows) → Run workflow**，可一键云端同时编译 macOS `.dmg` 与 Windows `.exe`（支持读取 `VELODECK_API_URL` Secret 预置默认服务器，或留空在 App 内随时填写切换）。
-  - 服务端已原生信任 `Origin: app://velodeck`，无需额外配置 `ALLOWED_ORIGINS`。
+  - 服务端已原生信任 `Origin: app://velodeck` 与 `app://velodeck-host`，无需额外配置 `ALLOWED_ORIGINS`。
+  - **双向被控（用手机或另一台电脑反控这台电脑）**：在桌面软件内切换到 **「本机被控」** 面板开启开关即可上线（可绑定同账号或使用 9 位控制码 + 无人值守密码）；macOS 首次开启按面板指引授予「屏幕录制」与「辅助功能」两项系统权限即可支持 60fps 画面与原生键鼠/中文输入。
 - **iPhone / 桌面浏览器**：
   - 直接访问 `https://remote.example.com`（或 `http://203.0.113.10`）登录账号即可控制。
   - **iPhone 用户**：在 Safari 点底部「分享」→ **「添加到主屏幕」**，即可以全屏独立 App 形态使用。

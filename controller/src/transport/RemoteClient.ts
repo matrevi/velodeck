@@ -983,6 +983,9 @@ export class RemoteClient {
     const isTouchDown = command.action === "touch_down";
     const isTouchMove = command.action === "touch_move";
     const isTouchUp = command.action === "touch_up";
+    const isMouseMove = command.action === "mouse_move";
+    const isMouseWheel = command.action === "mouse_wheel";
+    const isPointerChannelCommand = isTouchMove || isMouseMove || isMouseWheel;
 
     if (isTouchDown) {
       this.activeTouchViaWs = false;
@@ -999,14 +1002,15 @@ export class RemoteClient {
       this.activeTouchFirstMovePending = false;
     }
 
-    // Route steady-state touch_move over partially-reliable, in-order "pointer" DataChannel
+    // Route high-frequency unreliable pointer commands (steady-state touch_move, mouse_move,
+    // mouse_wheel) over the partially-reliable, in-order "pointer" DataChannel
     // (ordered: true, maxRetransmits: 0) to avoid HoL retransmit stalls without backward jumps.
-    // Never split a gesture started on WS onto DC, and send the first touch_move right after
-    // touch_down on the ordered "control" DC so it cannot overtake touch_down across SCTP streams.
+    // State-critical commands (mouse_down, mouse_up, key_event, select_display, tap, long_press,
+    // text, clipboard_set) ALWAYS bypass this branch and use the reliable "control" DataChannel
+    // (or WebSocket fallback) so clicks and key releases are never dropped.
     if (
-      isTouchMove &&
-      !pinTouchToWs &&
-      !routeFirstMoveOnControlDc &&
+      isPointerChannelCommand &&
+      !(isTouchMove && (pinTouchToWs || routeFirstMoveOnControlDc)) &&
       isCurrentSessionDevice &&
       this.pointerDataChannel &&
       this.pointerDataChannel.readyState === "open"
@@ -1016,14 +1020,17 @@ export class RemoteClient {
           ? this.pointerDataChannel.bufferedAmount
           : 0;
       if (buffered > POINTER_DC_MAX_BUFFERED_BYTES) {
-        return { sent: false, seq, channel: "none" };
-      }
-      try {
-        this.pointerDataChannel.send(payload);
-        this.lastCommandSentAt = Date.now();
-        return { sent: true, seq, channel: "datachannel" };
-      } catch {
-        // Fall through to ordered control DataChannel / WebSocket
+        if (isTouchMove || isMouseMove) {
+          return { sent: false, seq, channel: "none" };
+        }
+      } else {
+        try {
+          this.pointerDataChannel.send(payload);
+          this.lastCommandSentAt = Date.now();
+          return { sent: true, seq, channel: "datachannel" };
+        } catch {
+          // Fall through to ordered control DataChannel / WebSocket
+        }
       }
     }
 
@@ -1388,11 +1395,15 @@ export class RemoteClient {
     );
 
     if (this.fileTransferGeneration === generation) {
+      const targetDevice = this.state.devices.find(
+        (d) => d.deviceId === this.state.activeDeviceId,
+      );
+      const isDesktopTarget = targetDevice?.deviceType === "desktop";
       this.pushNotice(
         needsInstallPermission ? "warn" : "info",
         purpose === "apk_install"
           ? finalMessage
-          : `文件「${fileName}」已传至手机`,
+          : `文件「${fileName}」已传至${isDesktopTarget ? "远端电脑" : "手机"}`,
       );
     }
 

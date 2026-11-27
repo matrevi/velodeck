@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DESKTOP_RECENT_SERVERS_STORAGE_KEY,
   DESKTOP_SERVER_URL_STORAGE_KEY,
   deriveRelayWsUrlFromApiBase,
   formatServerHostLabel,
   getDesktopBridge,
+  hasDesktopHostBridge,
   isDesktopApp,
   isMacDesktop,
   loadCachedDesktopServerUrl,
@@ -12,6 +13,8 @@ import {
   normalizeServerBaseUrl,
   saveCachedDesktopServerUrl,
   saveCachedRecentDesktopServers,
+  type DesktopHostPermissions,
+  type DesktopHostState,
   type VeloDeckDesktopBridge,
 } from "./bridge";
 
@@ -253,5 +256,146 @@ describe("desktop bridge detection", () => {
     };
     expect(isDesktopApp()).toBe(true);
     expect(isMacDesktop()).toBe(false);
+    expect(hasDesktopHostBridge()).toBe(false);
+  });
+
+  it("detects full desktop host bridge support and invokes all 12 host IPC methods cleanly", async () => {
+    const basePermissions: DesktopHostPermissions = {
+      accessibility: true,
+      screenCapture: true,
+      platform: "darwin",
+    };
+    const baseHostState: DesktopHostState = {
+      enabled: true,
+      status: "online",
+      deviceId: "mac-host-1",
+      deviceName: "MacBook Pro",
+      controlCode: "683291405",
+      controlPassword: "secret-password",
+      ownerUsername: "alice",
+      activeSessionId: null,
+      activeTransport: null,
+      activeDisplayId: "disp-1",
+      displays: [
+        {
+          id: "disp-1",
+          name: "Built-in Retina Display",
+          width: 2560,
+          height: 1600,
+          primary: true,
+        },
+        {
+          id: "disp-2",
+          name: "Studio Display",
+          width: 5120,
+          height: 2880,
+          primary: false,
+        },
+      ],
+      permissions: basePermissions,
+      lastError: null,
+      lastReceivedFile: null,
+    };
+
+    const unsubSpy = vi.fn();
+    const subscribedListeners: Array<(state: DesktopHostState) => void> = [];
+
+    const fullBridge = {
+      platform: "darwin" as const,
+      appVersion: "1.1.0",
+      defaultServerUrl: "https://remote.example.com",
+      getHostState: vi.fn(async () => baseHostState),
+      onHostStateChange: vi.fn((cb: (state: DesktopHostState) => void) => {
+        subscribedListeners.push(cb);
+        return unsubSpy;
+      }),
+      startHost: vi.fn(async (_authToken?: string | null) => baseHostState),
+      stopHost: vi.fn(async () => ({
+        ...baseHostState,
+        enabled: false,
+        status: "stopped" as const,
+      })),
+      updateHostConfig: vi.fn(async (patch) => ({
+        ...baseHostState,
+        ...patch,
+      })),
+      regenerateHostPassword: vi.fn(async () => ({
+        ...baseHostState,
+        controlPassword: "new-password-123",
+      })),
+      bindHostAccount: vi.fn(async (_authToken: string) => baseHostState),
+      unbindHostAccount: vi.fn(async () => ({
+        ...baseHostState,
+        ownerUsername: "",
+      })),
+      selectHostDisplay: vi.fn(async (displayId: string) => ({
+        ...baseHostState,
+        activeDisplayId: displayId,
+      })),
+      disconnectHostSession: vi.fn(async () => ({
+        ...baseHostState,
+        activeSessionId: null,
+        activeTransport: null,
+      })),
+      refreshHostPermissions: vi.fn(async () => basePermissions),
+      openPermissionSettings: vi.fn(async () => undefined),
+    } as unknown as VeloDeckDesktopBridge;
+
+    (globalThis as { window?: unknown }).window = {
+      velodeckDesktop: fullBridge,
+    };
+
+    expect(hasDesktopHostBridge()).toBe(true);
+
+    const bridge = getDesktopBridge()!;
+    expect(await bridge.getHostState?.()).toEqual(baseHostState);
+
+    const listener = vi.fn();
+    const unsub = bridge.onHostStateChange?.(listener);
+    expect(subscribedListeners).toHaveLength(1);
+    subscribedListeners[0]?.(baseHostState);
+    expect(listener).toHaveBeenCalledWith(baseHostState);
+    unsub?.();
+    expect(unsubSpy).toHaveBeenCalledTimes(1);
+
+    await bridge.startHost?.("jwt-token");
+    expect(fullBridge.startHost).toHaveBeenCalledWith("jwt-token");
+
+    const stopped = await bridge.stopHost?.();
+    expect(stopped?.status).toBe("stopped");
+
+    const updated = await bridge.updateHostConfig?.({
+      deviceName: "Work Mac",
+      controlPassword: "new-password-999",
+    });
+    expect(updated?.deviceName).toBe("Work Mac");
+
+    const regen = await bridge.regenerateHostPassword?.();
+    expect(regen?.controlPassword).toBe("new-password-123");
+
+    await bridge.bindHostAccount?.("jwt-token");
+    expect(fullBridge.bindHostAccount).toHaveBeenCalledWith("jwt-token");
+
+    const unbound = await bridge.unbindHostAccount?.();
+    expect(unbound?.ownerUsername).toBe("");
+
+    const switched = await bridge.selectHostDisplay?.("disp-2");
+    expect(switched?.activeDisplayId).toBe("disp-2");
+
+    await bridge.disconnectHostSession?.();
+    expect(fullBridge.disconnectHostSession).toHaveBeenCalledTimes(1);
+
+    expect(await bridge.refreshHostPermissions?.()).toEqual(basePermissions);
+
+    await bridge.openPermissionSettings?.("screen");
+    await bridge.openPermissionSettings?.("accessibility");
+    expect(fullBridge.openPermissionSettings).toHaveBeenCalledWith("screen");
+    expect(fullBridge.openPermissionSettings).toHaveBeenCalledWith("accessibility");
+
+    // Partial preload bridge (missing even one host method) must return false
+    const { openPermissionSettings: _omitted, ...partialBridge } = fullBridge;
+    expect(
+      hasDesktopHostBridge(partialBridge as unknown as VeloDeckDesktopBridge),
+    ).toBe(false);
   });
 });

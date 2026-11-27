@@ -13,9 +13,14 @@ import {
   type ControllerAuthMessage,
   type ControllerAuthedMessage,
   type DeviceCapabilities,
+  type DevicePlatform,
   type DeviceStatusMessage,
   type DeviceSummary,
+  type DeviceType,
+  type DisplayInfo,
   type ErrorMessage,
+  type KeyModifiers,
+  type MouseButton,
   type PongMessage,
   type RtcAnswerMessage,
   type RtcIceMessage,
@@ -199,6 +204,99 @@ function clampNumber(value: unknown, fallback: number, min: number, max: number)
     return fallback;
   }
   return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+const MAX_DISPLAYS = 8;
+
+function sanitizeDeviceType(value: unknown): DeviceType | undefined {
+  if (value === "android" || value === "desktop") {
+    return value;
+  }
+  return undefined;
+}
+
+function sanitizeOsPlatform(value: unknown): DevicePlatform | undefined {
+  if (value === "android" || value === "darwin" || value === "win32" || value === "linux") {
+    return value;
+  }
+  return undefined;
+}
+
+function sanitizeDisplayId(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const clean = value.replace(/[\x00-\x1f\x7f]/g, "").trim();
+  if (clean.length === 0 || clean.length > 64) {
+    return undefined;
+  }
+  return clean;
+}
+
+function sanitizeDisplays(value: unknown): DisplayInfo[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const displays: DisplayInfo[] = [];
+  const seenIds = new Set<string>();
+  const maxScan = Math.min(value.length, 32);
+  for (let i = 0; i < maxScan; i += 1) {
+    if (displays.length >= MAX_DISPLAYS) {
+      break;
+    }
+    const entry = value[i];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+    const raw = entry as Record<string, unknown>;
+    const id = sanitizeDisplayId(raw.id);
+    if (!id || seenIds.has(id)) {
+      continue;
+    }
+    if (
+      typeof raw.width !== "number" ||
+      !Number.isFinite(raw.width) ||
+      raw.width <= 0 ||
+      typeof raw.height !== "number" ||
+      !Number.isFinite(raw.height) ||
+      raw.height <= 0
+    ) {
+      continue;
+    }
+    const display: DisplayInfo = {
+      id,
+      name: sanitizeLabel(raw.name, id, 64),
+      width: clampNumber(raw.width, 1, 1, 16_384),
+      height: clampNumber(raw.height, 1, 1, 16_384),
+    };
+    if (typeof raw.primary === "boolean") {
+      display.primary = raw.primary;
+    }
+    seenIds.add(id);
+    displays.push(display);
+  }
+  return displays.length > 0 ? displays : undefined;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isValidMouseButton(value: unknown): value is MouseButton {
+  return value === "left" || value === "right" || value === "middle";
+}
+
+function isValidKeyModifiers(value: unknown): value is KeyModifiers {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const mods = value as Record<string, unknown>;
+  return (
+    (mods.ctrl === undefined || typeof mods.ctrl === "boolean") &&
+    (mods.alt === undefined || typeof mods.alt === "boolean") &&
+    (mods.shift === undefined || typeof mods.shift === "boolean") &&
+    (mods.meta === undefined || typeof mods.meta === "boolean")
+  );
 }
 
 function parseIpv4Octets(ip: string): [number, number, number, number] | null {
@@ -1838,6 +1936,30 @@ export class VeloDeckHub {
     if (directUrl !== undefined) {
       summary.directUrl = directUrl;
     }
+    const deviceType =
+      sanitizeDeviceType(msg.deviceType) ?? sanitizeDeviceType(prev?.deviceType);
+    if (deviceType !== undefined) {
+      summary.deviceType = deviceType;
+    }
+    const osPlatform =
+      sanitizeOsPlatform(msg.osPlatform) ?? sanitizeOsPlatform(prev?.osPlatform);
+    if (osPlatform !== undefined) {
+      summary.osPlatform = osPlatform;
+    }
+    const displays =
+      msg.displays !== undefined
+        ? sanitizeDisplays(msg.displays)
+        : sanitizeDisplays(prev?.displays);
+    if (displays !== undefined) {
+      summary.displays = displays;
+    }
+    const activeDisplayId =
+      msg.activeDisplayId !== undefined
+        ? sanitizeDisplayId(msg.activeDisplayId)
+        : sanitizeDisplayId(prev?.activeDisplayId);
+    if (activeDisplayId !== undefined) {
+      summary.activeDisplayId = activeDisplayId;
+    }
     return summary;
   }
 
@@ -1879,6 +2001,26 @@ export class VeloDeckHub {
     }
     if (typeof msg.forcePortraitActive === "boolean") {
       s.forcePortraitActive = msg.forcePortraitActive;
+    }
+    const telemetryDeviceType = sanitizeDeviceType(msg.deviceType);
+    if (telemetryDeviceType !== undefined) {
+      s.deviceType = telemetryDeviceType;
+    }
+    const telemetryOsPlatform = sanitizeOsPlatform(msg.osPlatform);
+    if (telemetryOsPlatform !== undefined) {
+      s.osPlatform = telemetryOsPlatform;
+    }
+    if (msg.displays !== undefined) {
+      const sanitizedDisplays = sanitizeDisplays(msg.displays);
+      if (sanitizedDisplays !== undefined) {
+        s.displays = sanitizedDisplays;
+      }
+    }
+    if (msg.activeDisplayId !== undefined) {
+      const sanitizedActiveDisplayId = sanitizeDisplayId(msg.activeDisplayId);
+      if (sanitizedActiveDisplayId !== undefined) {
+        s.activeDisplayId = sanitizedActiveDisplayId;
+      }
     }
     if (msg.capabilities) {
       s.capabilities = mergeCapabilities(s.capabilities, msg.capabilities);
@@ -2476,6 +2618,108 @@ export class VeloDeckHub {
           conn.ws,
           "INVALID_MESSAGE",
           "quality must contain positive finite numbers",
+          {
+            sessionId: msg.sessionId,
+            deviceId: msg.deviceId,
+          },
+        );
+        return;
+      }
+    }
+
+    if (cmd.action === "mouse_move") {
+      if (!isFiniteNumber(cmd.x) || !isFiniteNumber(cmd.y)) {
+        this.sendError(
+          conn.ws,
+          "INVALID_MESSAGE",
+          "mouse_move requires finite x and y coordinates",
+          {
+            sessionId: msg.sessionId,
+            deviceId: msg.deviceId,
+          },
+        );
+        return;
+      }
+    }
+
+    if (cmd.action === "mouse_down" || cmd.action === "mouse_up") {
+      const clickCount = (cmd as { clickCount?: unknown }).clickCount;
+      const clickCountValid =
+        clickCount === undefined ||
+        (isFiniteNumber(clickCount) &&
+          Number.isInteger(clickCount) &&
+          clickCount >= 1 &&
+          clickCount <= 5);
+      if (
+        !isFiniteNumber(cmd.x) ||
+        !isFiniteNumber(cmd.y) ||
+        !isValidMouseButton(cmd.button) ||
+        !clickCountValid
+      ) {
+        this.sendError(
+          conn.ws,
+          "INVALID_MESSAGE",
+          `${cmd.action} requires finite x, y, valid button, and optional clickCount (1..5)`,
+          {
+            sessionId: msg.sessionId,
+            deviceId: msg.deviceId,
+          },
+        );
+        return;
+      }
+    }
+
+    if (cmd.action === "mouse_wheel") {
+      if (
+        !isFiniteNumber(cmd.x) ||
+        !isFiniteNumber(cmd.y) ||
+        !isFiniteNumber(cmd.deltaX) ||
+        !isFiniteNumber(cmd.deltaY)
+      ) {
+        this.sendError(
+          conn.ws,
+          "INVALID_MESSAGE",
+          "mouse_wheel requires finite x, y, deltaX, and deltaY",
+          {
+            sessionId: msg.sessionId,
+            deviceId: msg.deviceId,
+          },
+        );
+        return;
+      }
+    }
+
+    if (cmd.action === "key_event") {
+      const phaseValid = cmd.phase === "down" || cmd.phase === "up" || cmd.phase === "press";
+      const codeValid = typeof cmd.code === "string" && cmd.code.length <= 64;
+      const keyValid = typeof cmd.key === "string" && cmd.key.length <= 64;
+      const modifiersValid =
+        cmd.modifiers === undefined || isValidKeyModifiers(cmd.modifiers);
+      if (!phaseValid || !codeValid || !keyValid || !modifiersValid) {
+        this.sendError(
+          conn.ws,
+          "INVALID_MESSAGE",
+          "key_event requires valid phase, code (<= 64 chars), key (<= 64 chars), and optional boolean modifiers",
+          {
+            sessionId: msg.sessionId,
+            deviceId: msg.deviceId,
+          },
+        );
+        return;
+      }
+    }
+
+    if (cmd.action === "select_display") {
+      if (
+        typeof cmd.displayId !== "string" ||
+        cmd.displayId.trim().length === 0 ||
+        cmd.displayId.length > 64 ||
+        sanitizeDisplayId(cmd.displayId) === undefined
+      ) {
+        this.sendError(
+          conn.ws,
+          "INVALID_MESSAGE",
+          "select_display requires a non-empty displayId (<= 64 chars)",
           {
             sessionId: msg.sessionId,
             deviceId: msg.deviceId,

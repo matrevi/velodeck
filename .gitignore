@@ -45,6 +45,7 @@ desktop/renderer-dist/
 desktop/release/
 desktop/build-config.json
 desktop/.env.local
+desktop/native/bin/
 
 # Coverage
 coverage/

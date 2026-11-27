@@ -52,7 +52,7 @@
 | `packages/protocol` (`@velodeck/protocol`) | 共享 TypeScript 信令协议、9 位控制码工具与 20 字节固定头二进制媒体帧编解码 |
 | `server` (`@velodeck/server`) | 自托管信令中继、账号与设备持久化存储、动态 TURN 签发、APK 断点下载与 Docker Compose 编排 |
 | `controller` (`@velodeck/controller`) | 移动/桌面通用控制端（React + Vite + PWA + Capacitor），支持 WebRTC 与文件直传 |
-| `desktop` (`@velodeck/desktop`) | 原生桌面控制端（Electron · macOS / Windows），支持置顶手机浮窗、系统托盘、右键返回、一键高清截图、多窗口多机同控与自托管服务器切换 |
+| `desktop` (`@velodeck/desktop`) | 双向原生桌面软件（Electron · macOS / Windows）：既可远程控制手机/电脑（置顶浮窗、右键返回、高清截图、多机同控），也可开启 **本机被控（Desktop Host）** 让手机或另一台电脑 60fps 反控本电脑 |
 | `android-agent` (`com.velodeck.agent`) | 原生 Android 被控端（Kotlin），持久化录屏、无障碍触控、伪装黑屏、内嵌局域网直连服务 |
 | `scripts` | ADB 一次性无人值守授权脚本与控制端静态资源同步脚本 |
 
@@ -208,6 +208,7 @@ velodeck.apiUrl=https://your-server.example.com
 - **桌面鼠键直控**：鼠标滚轮滚动、**右键 = 返回**、**中键 = 桌面**、直接键入与 `Cmd/Ctrl+V` 粘贴
 - **高清截图 & 多机同控**：`Cmd/Ctrl+Shift+C` 一键截屏到剪贴板、`Cmd/Ctrl+Shift+S` 保存 PNG、`Cmd/Ctrl+N` 多开窗口同时控制多台手机
 - **系统托盘 & 服务器切换器**：`Cmd/Ctrl+,` 随时切换自托管服务器（自动适配域名 HTTPS 与纯 IP）
+- **双向电脑被控端（Desktop Host）**：同一款软件内一键开启 **「本机被控」**，即可获得 9 位本机控制码 + 无人值守密码或一键绑定当前账号，让你的 **iPhone 浏览器/PWA 或另一台电脑** 60fps 远程观看并操控这台 Mac / Windows（支持 macOS 原生 Swift `CGEvent` / Windows Win32 `SendInput` 鼠键与中文输入、多显示器热切换、iPhone 直点/触控板双模式、WebRTC 文件直传、空闲自动停采零占用）
 
 ```bash
 # 本地运行或打包 macOS / Windows 安装包

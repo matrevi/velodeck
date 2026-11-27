@@ -74,3 +74,10 @@ console.log(`[prepare-build] Copied ${controllerDist} -> ${rendererDist}`);
 console.log(
   `[prepare-build] Wrote ${buildConfigPath} (defaultServerUrl=${defaultServerUrl ? "<configured>" : "<empty>"})`,
 );
+
+// Ensure host worker HTML is staged alongside compiled JS if dist already exists
+const hostWorkerSrc = path.join(desktopRoot, "src", "hostWorker.html");
+const distDir = path.join(desktopRoot, "dist");
+if (fs.existsSync(hostWorkerSrc) && fs.existsSync(distDir)) {
+  fs.copyFileSync(hostWorkerSrc, path.join(distDir, "hostWorker.html"));
+}

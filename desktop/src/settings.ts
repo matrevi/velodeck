@@ -1,4 +1,6 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export type WindowPreset = "phone" | "compact" | "dashboard";
@@ -23,6 +25,13 @@ export interface DesktopSettings {
   alwaysOnTop: boolean;
   lastPreset: WindowPreset;
   windowBounds?: WindowBounds;
+  hostEnabled?: boolean;
+  hostDeviceId?: string;
+  hostDeviceSecret?: string;
+  hostDeviceName?: string;
+  hostControlPassword?: string;
+  hostDisplayId?: string;
+  hostAuthToken?: string;
 }
 
 export const PRESET_SIZES: Readonly<
@@ -37,6 +46,196 @@ export const MIN_WINDOW_WIDTH = 340;
 export const MIN_WINDOW_HEIGHT = 560;
 export const MAX_SERVER_URL_LENGTH = 512;
 export const MAX_RECENT_SERVERS = 8;
+export const HOST_DEVICE_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
+export const MIN_HOST_PASSWORD_LENGTH = 8;
+export const MAX_HOST_PASSWORD_LENGTH = 64;
+export const MAX_HOST_DEVICE_NAME_LENGTH = 64;
+
+const HOST_PASSWORD_UPPER = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+const HOST_PASSWORD_LOWER = "abcdefghjkmnpqrstuvwxyz";
+const HOST_PASSWORD_DIGITS = "23456789";
+const HOST_PASSWORD_ALPHABET =
+  HOST_PASSWORD_UPPER + HOST_PASSWORD_LOWER + HOST_PASSWORD_DIGITS;
+
+function randomCharFrom(alphabet: string): string {
+  const idx = crypto.randomInt(0, alphabet.length);
+  return alphabet[idx] ?? "A";
+}
+
+export function generateHostDeviceId(): string {
+  return `desktop-${crypto.randomBytes(8).toString("hex")}`;
+}
+
+export function generateHostDeviceSecret(): string {
+  return crypto.randomBytes(24).toString("base64url");
+}
+
+/**
+ * Generates an unambiguous alphanumeric unattended control password (default 8 chars)
+ * guaranteed to contain at least 1 uppercase letter, 1 lowercase letter, and 1 digit.
+ */
+export function generateHostControlPassword(length = 8): string {
+  const targetLen = Math.max(
+    MIN_HOST_PASSWORD_LENGTH,
+    Math.min(MAX_HOST_PASSWORD_LENGTH, Math.floor(length)),
+  );
+  const chars: string[] = [
+    randomCharFrom(HOST_PASSWORD_UPPER),
+    randomCharFrom(HOST_PASSWORD_LOWER),
+    randomCharFrom(HOST_PASSWORD_DIGITS),
+  ];
+  while (chars.length < targetLen) {
+    chars.push(randomCharFrom(HOST_PASSWORD_ALPHABET));
+  }
+  // Unbiased Fisher-Yates shuffle
+  for (let i = chars.length - 1; i > 0; i -= 1) {
+    const j = crypto.randomInt(0, i + 1);
+    const tmp = chars[i];
+    chars[i] = chars[j]!;
+    chars[j] = tmp!;
+  }
+  return chars.join("");
+}
+
+export function sanitizeHostDeviceId(raw: unknown): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  return HOST_DEVICE_ID_REGEX.test(trimmed) ? trimmed : undefined;
+}
+
+export function sanitizeHostDeviceSecret(raw: unknown): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (
+    trimmed.length < 16 ||
+    trimmed.length > 256 ||
+    /[\s\u0000-\u001f\u007f]/.test(trimmed)
+  ) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+export function sanitizeHostDeviceName(
+  raw: unknown,
+  fallback?: string,
+): string | undefined {
+  if (typeof raw === "string") {
+    const clean = raw
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim()
+      .slice(0, MAX_HOST_DEVICE_NAME_LENGTH);
+    if (clean.length > 0) {
+      return clean;
+    }
+  }
+  if (typeof fallback === "string") {
+    const cleanFallback = fallback
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim()
+      .slice(0, MAX_HOST_DEVICE_NAME_LENGTH);
+    if (cleanFallback.length > 0) {
+      return cleanFallback;
+    }
+  }
+  return undefined;
+}
+
+export function sanitizeHostControlPassword(raw: unknown): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (
+    trimmed.length < MIN_HOST_PASSWORD_LENGTH ||
+    trimmed.length > MAX_HOST_PASSWORD_LENGTH ||
+    /[\s\u0000-\u001f\u007f]/.test(trimmed)
+  ) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+export function sanitizeHostDisplayId(raw: unknown): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim().slice(0, 64);
+  if (!trimmed || /[\u0000-\u001f\u007f]/.test(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+export function sanitizeHostAuthToken(raw: unknown): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (
+    trimmed.length === 0 ||
+    trimmed.length > 4096 ||
+    /[\s\u0000-\u001f\u007f]/.test(trimmed)
+  ) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+export function defaultHostDeviceName(): string {
+  try {
+    const host = os.hostname().replace(/\.local$/i, "").trim();
+    if (host.length > 0) {
+      return host.slice(0, MAX_HOST_DEVICE_NAME_LENGTH);
+    }
+  } catch {
+    // Ignore hostname lookup errors
+  }
+  return process.platform === "darwin"
+    ? "Mac"
+    : process.platform === "win32"
+      ? "Windows PC"
+      : "Linux Desktop";
+}
+
+/**
+ * Ensures required Desktop Host identity & credential fields exist on `settings`
+ * without clobbering any valid persisted values.
+ */
+export function ensureHostSettings(
+  current: DesktopSettings,
+  fallbackDeviceName?: string,
+): { settings: DesktopSettings; changed: boolean } {
+  const next: DesktopSettings = { ...current };
+  let changed = false;
+
+  if (!sanitizeHostDeviceId(next.hostDeviceId)) {
+    next.hostDeviceId = generateHostDeviceId();
+    changed = true;
+  }
+  if (!sanitizeHostDeviceSecret(next.hostDeviceSecret)) {
+    next.hostDeviceSecret = generateHostDeviceSecret();
+    changed = true;
+  }
+  const resolvedName = sanitizeHostDeviceName(
+    next.hostDeviceName,
+    fallbackDeviceName ?? defaultHostDeviceName(),
+  );
+  if (resolvedName && next.hostDeviceName !== resolvedName) {
+    next.hostDeviceName = resolvedName;
+    changed = true;
+  }
+  if (!sanitizeHostControlPassword(next.hostControlPassword)) {
+    next.hostControlPassword = generateHostControlPassword(8);
+    changed = true;
+  }
+
+  return { settings: next, changed };
+}
 
 const WORK_AREA_MARGIN = 24;
 const IPV4_REGEX = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
@@ -445,6 +644,33 @@ function sanitizeSettings(raw: unknown): DesktopSettings {
   };
   if (windowBounds) {
     sanitized.windowBounds = windowBounds;
+  }
+  if (typeof obj.hostEnabled === "boolean") {
+    sanitized.hostEnabled = obj.hostEnabled;
+  }
+  const hostDeviceId = sanitizeHostDeviceId(obj.hostDeviceId);
+  if (hostDeviceId) {
+    sanitized.hostDeviceId = hostDeviceId;
+  }
+  const hostDeviceSecret = sanitizeHostDeviceSecret(obj.hostDeviceSecret);
+  if (hostDeviceSecret) {
+    sanitized.hostDeviceSecret = hostDeviceSecret;
+  }
+  const hostDeviceName = sanitizeHostDeviceName(obj.hostDeviceName);
+  if (hostDeviceName) {
+    sanitized.hostDeviceName = hostDeviceName;
+  }
+  const hostControlPassword = sanitizeHostControlPassword(obj.hostControlPassword);
+  if (hostControlPassword) {
+    sanitized.hostControlPassword = hostControlPassword;
+  }
+  const hostDisplayId = sanitizeHostDisplayId(obj.hostDisplayId);
+  if (hostDisplayId) {
+    sanitized.hostDisplayId = hostDisplayId;
+  }
+  const hostAuthToken = sanitizeHostAuthToken(obj.hostAuthToken);
+  if (hostAuthToken) {
+    sanitized.hostAuthToken = hostAuthToken;
   }
   return sanitized;
 }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { normalizeControlCode, type DeviceSummary } from "@velodeck/protocol";
 import { ConnectionModal } from "./components/ConnectionModal";
 import { DashboardView } from "./components/DashboardView";
+import type { DesktopHostHandlers } from "./components/DesktopHostPanel";
 import { LaunchView } from "./components/LaunchView";
 import { QuickConnectConfirmModal } from "./components/QuickConnectConfirmModal";
 import { RemoteViewport } from "./components/RemoteViewport";
@@ -10,11 +11,14 @@ import {
   deriveRelayWsUrlFromApiBase,
   formatServerHostLabel,
   getDesktopBridge,
+  hasDesktopHostBridge,
   loadCachedDesktopServerUrl,
   loadCachedRecentDesktopServers,
   normalizeServerBaseUrl,
   saveCachedDesktopServerUrl,
   saveCachedRecentDesktopServers,
+  type DesktopHostConfigPatch,
+  type DesktopHostState,
   type DesktopWindowPreset,
   type DesktopWindowState,
 } from "./desktop/bridge";
@@ -108,6 +112,7 @@ export function App() {
       preset: "dashboard",
       isFullScreen: false,
     });
+  const [hostState, setHostState] = useState<DesktopHostState | null>(null);
 
   const [clientState, setClientState] = useState<RemoteClientState>(() =>
     client.getState(),
@@ -151,7 +156,7 @@ export function App() {
     }
     return "launch";
   });
-  const [launchTab, setLaunchTab] = useState<"code" | "account">("code");
+  const [launchTab, setLaunchTab] = useState<"code" | "account" | "host">("code");
   const [codeOfflineNotice, setCodeOfflineNotice] = useState<{
     controlCode: string;
     deviceName?: string;
@@ -236,9 +241,29 @@ export function App() {
       }
     });
 
+    let unsubHost = () => {};
+    if (typeof desktopBridge.getHostState === "function") {
+      void desktopBridge
+        .getHostState()
+        .then((state) => {
+          if (!cancelled && state) {
+            setHostState(state);
+          }
+        })
+        .catch(() => {});
+    }
+    if (typeof desktopBridge.onHostStateChange === "function") {
+      unsubHost = desktopBridge.onHostStateChange((state) => {
+        if (!cancelled && state) {
+          setHostState(state);
+        }
+      });
+    }
+
     return () => {
       cancelled = true;
       unsubWindow();
+      unsubHost();
     };
   }, [desktopBridge]);
 
@@ -811,6 +836,14 @@ export function App() {
           .filter(Boolean);
         setRecentServers(cleanRecent);
         saveCachedRecentDesktopServers(cleanRecent);
+        if (typeof desktopBridge.getHostState === "function") {
+          void desktopBridge
+            .getHostState()
+            .then((nextHost) => {
+              if (nextHost) setHostState(nextHost);
+            })
+            .catch(() => {});
+        }
       } catch {
         const fallbackRecent = [
           normalized,
@@ -912,6 +945,213 @@ export function App() {
     }
   }, [desktopBridge, showToast]);
 
+  const handleStartHost = useCallback(async () => {
+    if (!desktopBridge || typeof desktopBridge.startHost !== "function") return;
+    if (!desktopServerUrl) {
+      showToast("warn", "请先配置自托管服务器地址");
+      setServerConfigModalOpen(true);
+      return;
+    }
+    try {
+      const next = await desktopBridge.startHost(savedAccount?.authToken ?? null);
+      if (next) {
+        setHostState(next);
+        if (next.lastError) {
+          showToast("error", next.lastError);
+        } else {
+          showToast("info", "已开启本机被控服务");
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "开启本机被控失败";
+      showToast("error", msg);
+    }
+  }, [desktopBridge, desktopServerUrl, savedAccount?.authToken, showToast]);
+
+  const handleStopHost = useCallback(async () => {
+    if (!desktopBridge || typeof desktopBridge.stopHost !== "function") return;
+    try {
+      const next = await desktopBridge.stopHost();
+      if (next) setHostState(next);
+      showToast("info", "已停止本机被控服务");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "停止本机被控失败";
+      showToast("error", msg);
+    }
+  }, [desktopBridge, showToast]);
+
+  const handleUpdateHostConfig = useCallback(
+    async (patch: DesktopHostConfigPatch) => {
+      if (!desktopBridge || typeof desktopBridge.updateHostConfig !== "function") {
+        return;
+      }
+      try {
+        const next = await desktopBridge.updateHostConfig(patch);
+        if (next) setHostState(next);
+        showToast("info", "本机被控配置已更新");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "保存本机配置失败";
+        showToast("error", msg);
+      }
+    },
+    [desktopBridge, showToast],
+  );
+
+  const handleRegenerateHostPassword = useCallback(async () => {
+    if (
+      !desktopBridge ||
+      typeof desktopBridge.regenerateHostPassword !== "function"
+    ) {
+      return;
+    }
+    try {
+      const next = await desktopBridge.regenerateHostPassword();
+      if (next) setHostState(next);
+      showToast("info", "已重置无人值守控制密码");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "重置控制密码失败";
+      showToast("error", msg);
+    }
+  }, [desktopBridge, showToast]);
+
+  const handleBindHostAccount = useCallback(async () => {
+    if (!desktopBridge || typeof desktopBridge.bindHostAccount !== "function") {
+      return;
+    }
+    if (!savedAccount?.authToken) {
+      showToast("warn", "请先登录账号后再绑定本机");
+      return;
+    }
+    try {
+      const next = await desktopBridge.bindHostAccount(savedAccount.authToken);
+      if (next) setHostState(next);
+      showToast("info", `本机已绑定到账号 @${savedAccount.user.username}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "绑定账号失败";
+      showToast("error", msg);
+    }
+  }, [desktopBridge, savedAccount, showToast]);
+
+  const handleUnbindHostAccount = useCallback(async () => {
+    if (!desktopBridge || typeof desktopBridge.unbindHostAccount !== "function") {
+      return;
+    }
+    try {
+      const next = await desktopBridge.unbindHostAccount();
+      if (next) setHostState(next);
+      showToast("info", "已解除本机账号绑定");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "解除账号绑定失败";
+      showToast("error", msg);
+    }
+  }, [desktopBridge, showToast]);
+
+  const handleSelectHostDisplay = useCallback(
+    async (displayId: string) => {
+      if (!desktopBridge || typeof desktopBridge.selectHostDisplay !== "function") {
+        return;
+      }
+      try {
+        const next = await desktopBridge.selectHostDisplay(displayId);
+        if (next) setHostState(next);
+        showToast("info", "已切换本机共享显示器");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "切换显示器失败";
+        showToast("error", msg);
+      }
+    },
+    [desktopBridge, showToast],
+  );
+
+  const handleDisconnectHostSession = useCallback(async () => {
+    if (
+      !desktopBridge ||
+      typeof desktopBridge.disconnectHostSession !== "function"
+    ) {
+      return;
+    }
+    try {
+      const next = await desktopBridge.disconnectHostSession();
+      if (next) setHostState(next);
+      showToast("info", "已断开当前远程控制会话");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "断开远程会话失败";
+      showToast("error", msg);
+    }
+  }, [desktopBridge, showToast]);
+
+  const handleRefreshHostPermissions = useCallback(async () => {
+    if (
+      !desktopBridge ||
+      typeof desktopBridge.refreshHostPermissions !== "function"
+    ) {
+      return;
+    }
+    try {
+      const perms = await desktopBridge.refreshHostPermissions();
+      if (perms) {
+        setHostState((prev) => (prev ? { ...prev, permissions: perms } : prev));
+      }
+      showToast("info", "已刷新系统权限状态");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "刷新权限状态失败";
+      showToast("error", msg);
+    }
+  }, [desktopBridge, showToast]);
+
+  const handleOpenPermissionSettings = useCallback(
+    async (kind: "accessibility" | "screen") => {
+      if (
+        !desktopBridge ||
+        typeof desktopBridge.openPermissionSettings !== "function"
+      ) {
+        return;
+      }
+      try {
+        await desktopBridge.openPermissionSettings(kind);
+        showToast(
+          "info",
+          kind === "screen"
+            ? "已打开系统「屏幕录制」权限设置"
+            : "已打开系统「辅助功能」权限设置",
+        );
+      } catch {
+        showToast("error", "无法打开系统权限设置，请手动前往系统设置授权");
+      }
+    },
+    [desktopBridge, showToast],
+  );
+
+  const desktopHostHandlers = useMemo<DesktopHostHandlers | undefined>(() => {
+    if (!desktopBridge || !hasDesktopHostBridge(desktopBridge)) {
+      return undefined;
+    }
+    return {
+      onStartHost: handleStartHost,
+      onStopHost: handleStopHost,
+      onUpdateConfig: handleUpdateHostConfig,
+      onRegeneratePassword: handleRegenerateHostPassword,
+      onBindAccount: handleBindHostAccount,
+      onUnbindAccount: handleUnbindHostAccount,
+      onSelectDisplay: handleSelectHostDisplay,
+      onDisconnectSession: handleDisconnectHostSession,
+      onRefreshPermissions: handleRefreshHostPermissions,
+      onOpenPermissionSettings: handleOpenPermissionSettings,
+    };
+  }, [
+    desktopBridge,
+    handleStartHost,
+    handleStopHost,
+    handleUpdateHostConfig,
+    handleRegenerateHostPassword,
+    handleBindHostAccount,
+    handleUnbindHostAccount,
+    handleSelectHostDisplay,
+    handleDisconnectHostSession,
+    handleRefreshHostPermissions,
+    handleOpenPermissionSettings,
+  ]);
+
   function handleExitViewport() {
     if (clientState.authType === "code") {
       pendingCodeRef.current = null;
@@ -963,6 +1203,8 @@ export function App() {
           clientState={clientState}
           codeOfflineNotice={codeOfflineNotice}
           desktopServerUrl={desktopBridge ? desktopServerUrl : undefined}
+          hostState={desktopBridge ? hostState : null}
+          hostHandlers={desktopHostHandlers}
           onConnectWithCode={handleConnectWithCode}
           onCancelCodeConnect={handleCancelCodeConnect}
           onRetryCodeConnect={handleRetryCodeConnect}
@@ -985,6 +1227,8 @@ export function App() {
           serverInfo={serverInfo}
           profileCount={profiles.length}
           desktopServerUrl={desktopBridge ? desktopServerUrl : undefined}
+          hostState={desktopBridge ? hostState : null}
+          hostHandlers={desktopHostHandlers}
           onOpenConnections={(editId) => {
             setEditProfileId(editId ?? null);
             setModalOpen(true);
