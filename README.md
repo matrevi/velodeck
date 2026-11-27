@@ -13,18 +13,19 @@
 </p>
 
 - Repository: <https://github.com/matrevi/velodeck>
+- **Fork 与自托管完整部署指南**：[docs/SELF_HOSTING.md](docs/SELF_HOSTING.md)（含 Docker 域名/纯 IP 方案、GitHub Actions 零环境云端编译专属 APK、应用内自更新与排障）
 
 ---
 
 ## 核心特性 · Key Features
 
-- **60fps 硬件视频流与双通道回退**：优先建立 WebRTC H.264 硬件编码低延迟直连，受限网络自动切换 WebSocket 二进制帧中继（支持 `eco` / `balanced` / `hd` 三档动态画质）。
-- **跨网穿透（P2P + 自托管 coturn）**：内置可达 STUN 默认配置，并由中继服务端按每次会话动态签发短生命周期 HMAC-SHA1 TURN 临时凭据，彻底避免 7×24 长连接凭据过期。
+- **60fps 硬件视频流与自适应码控**：优先建立 WebRTC H.264 硬件编码低延迟直连，默认内置 RustDesk 风格 **「智能（`auto`）」** 自适应 QoS 档位（同步支持 `eco` / `balanced` / `hd` 手动档位），根据 P2P/TURN 带宽与排队 RTT 自动调节码率、帧率与分辨率，受限网络自动回退 WebSocket 二进制帧中继。
+- **跨网穿透（P2P + 自托管 coturn）**：同机房 STUN 优先探测 + 国内可达 STUN 备选，并由中继服务端按每次会话动态签发短生命周期 HMAC-SHA1 TURN 临时凭据，彻底避免 7×24 长连接凭据过期。
 - **双重免确认连接模式**：
   - **同账号设备管理**：控制端与 Android 被控端登录同一自托管账号，上线即见设备电量/锁屏/状态，点击即控；
   - **9 位永久控制码 + 无人值守密码**：支持跨账号临时授权或记住设备一键重连，密码轮换即时踢出旧会话。
-- **7×24 无人值守与伪装黑屏**：持久化 `MediaProjection` 录屏会话（空闲零流量挂起不销毁）、无障碍远程触控/多指手势/系统按键/双向剪贴板、远程唤醒解锁与伪装黑屏（低功耗防窥视）。
-- **WebRTC 文件直传与远程 OTA**：通过 WebRTC DataChannel 端到端直传文件；服务端内置支持 `Range` 断点续传与 `ETag` / `SHA-256` 校验的 APK 分发接口，支持被控端远程升级。
+- **7×24 无人值守、强制竖屏与伪装黑屏**：持久化 `MediaProjection` 录屏会话（空闲零流量挂起不销毁）、无障碍远程触控/多指手势/系统按键/双向剪贴板、零额外权限全局强制竖屏、远程唤醒解锁与伪装黑屏（低功耗防窥视）。
+- **应用内一键自更新 & WebRTC 文件直传**：Android 端支持直接查询 `/api/info` 一键下载并 SHA-256 校验安装新版 APK（按哈希生成独立文件名避免 OEM 安装器缓存冲突）；同时支持通过 WebRTC DataChannel 端到端传文件与网页端远程 OTA 推送。
 - **零门槛跨端控制端**：React + PWA 移动优先界面，iPhone Safari 点击「添加到主屏幕」即可作为独立全屏 App 长期使用（无需开发者签名），同时支持桌面浏览器、Capacitor 原生壳与局域网直连。
 - **默认安全加固**：`scrypt` 加盐哈希、JWT Token Version 全局注销、首次注册自动锁定邀请制（`first-user-then-invite`）、IP 与目标账号/控制码双维度防爆破锁定、SSRF 防护与结构化 JSON 审计日志。
 
@@ -141,20 +142,32 @@ cd android-agent
   -PvelodeckApiUrl=http://203.0.113.10
 ```
 
-### 方式 2：写入 `android-agent/local.properties`（已被 Git 忽略）
+### 方式 2：Fork 后通过 GitHub Actions 云端自动编译（推荐，无需本地装 Android Studio）
+
+Fork 本仓库后，在仓库 **Settings → Secrets and variables → Actions** 配置 `VELODECK_RELAY_URL`、`VELODECK_API_URL`（以及可选的签名密钥 Secrets），即可在 **Actions → Build Custom Server APK** 一键云端编译专属 APK，详细步骤见 [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md)。
+
+### 方式 3：写入 `android-agent/local.properties`（已被 Git 忽略）
+
+```bash
+cp android-agent/local.properties.example android-agent/local.properties
+cp android-agent/keystore.properties.example android-agent/keystore.properties
+```
+
+在 `android-agent/local.properties` 中填写（注意属性名包含点号）：
 
 ```properties
-velodeckRelayUrl=wss://your-server.example.com/ws
-velodeckApiUrl=https://your-server.example.com
+velodeck.relayUrl=wss://your-server.example.com/ws
+velodeck.apiUrl=https://your-server.example.com
 ```
 
 随后直接运行 `./gradlew assembleDebug` 或 `./gradlew assembleRelease` 即可。
 
 ### 配置服务端 APK 下载与远程 OTA
 
-将编译生成的 APK 复制到 `server/downloads/velodeck-agent.apk` 后，即可通过以下端点下载与 OTA 校验（自动计算 `X-APK-SHA256`、`ETag` 并支持 `Range` 断点续传）：
+将编译生成的 APK 复制到 `server/downloads/velodeck-agent.apk` 后，即可通过以下端点下载、应用内自更新与远程 OTA 校验（自动计算 `X-APK-SHA256`、`ETag`、防缓存头并支持 `Range` 断点续传）：
 
 - 主下载地址：`https://your-server.example.com/api/download/velodeck-agent.apk`
+- 版本化地址：`https://your-server.example.com/api/download/velodeck-agent-v1.0.9.apk`
 - 通用别名：`https://your-server.example.com/api/download/android`
 
 ---

@@ -1,0 +1,11 @@
+# Copy this file to `android-agent/local.properties` (automatically gitignored).
+#
+# Android SDK location (Android Studio generates this automatically):
+# sdk.dir=/path/to/Android/sdk
+#
+# Default self-hosted server endpoints baked into the Android Agent APK.
+# - Domain + HTTPS deployment (recommended): use wss:// and https://
+# - Pure-IP deployment: use ws:// and http:// (Gradle will automatically whitelist
+#   that exact host in network_security_config.xml while blocking all other cleartext).
+velodeck.relayUrl=wss://your-server.example.com/ws
+velodeck.apiUrl=https://your-server.example.com

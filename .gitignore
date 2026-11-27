@@ -20,6 +20,7 @@ audit.jsonl*
 
 # Android
 android-agent/.gradle/
+android-agent/.kotlin/
 android-agent/build/
 android-agent/app/build/
 android-agent/local.properties

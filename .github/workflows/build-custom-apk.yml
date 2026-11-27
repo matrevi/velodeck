@@ -1,0 +1,161 @@
+name: Build Custom Server APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Build variant: release (requires keystore secrets) or debug (zero-secret test build)"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+      relay_url_override:
+        description: "Optional relay URL override (leave blank to read VELODECK_RELAY_URL secret)"
+        required: false
+        default: ""
+        type: string
+      api_url_override:
+        description: "Optional API base URL override (leave blank to read VELODECK_API_URL secret)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Build VeloDeck Android APK (${{ inputs.build_type }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve server URLs & validate configuration
+        id: cfg
+        env:
+          INPUT_RELAY_URL: ${{ inputs.relay_url_override }}
+          INPUT_API_URL: ${{ inputs.api_url_override }}
+          SECRET_RELAY_URL: ${{ secrets.VELODECK_RELAY_URL }}
+          SECRET_API_URL: ${{ secrets.VELODECK_API_URL }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+          HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
+        run: |
+          RELAY_URL="${INPUT_RELAY_URL:-$SECRET_RELAY_URL}"
+          API_URL="${INPUT_API_URL:-$SECRET_API_URL}"
+
+          if [ -z "$RELAY_URL" ] || [ -z "$API_URL" ]; then
+            echo "::error::Missing server URLs. Configure VELODECK_RELAY_URL and VELODECK_API_URL in Repository Secrets (or pass overrides in workflow_dispatch)."
+            exit 1
+          fi
+
+          if [ "$BUILD_TYPE" = "release" ] && [ "$HAS_KEYSTORE" != "true" ]; then
+            echo "::error::Release build requires ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD secrets. See docs/SELF_HOSTING.md, or pick build_type=debug for a quick test build."
+            exit 1
+          fi
+
+          # Mask private endpoints in workflow logs
+          echo "::add-mask::$RELAY_URL"
+          echo "::add-mask::$API_URL"
+
+          VERSION_NAME="$(grep -E 'versionName\s*=' android-agent/app/build.gradle.kts | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "version=${VERSION_NAME:-custom}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Build web controller & sync embedded Android assets
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build:protocol
+          pnpm build:controller
+          pnpm sync:android-web
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode release signing keystore
+        if: inputs.build_type == 'release'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 --decode > android-agent/ci-release.jks
+          cat > android-agent/keystore.properties <<EOF
+          storeFile=ci-release.jks
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
+
+      - name: Build Android APK
+        working-directory: android-agent
+        env:
+          INPUT_RELAY_URL: ${{ inputs.relay_url_override }}
+          INPUT_API_URL: ${{ inputs.api_url_override }}
+          SECRET_RELAY_URL: ${{ secrets.VELODECK_RELAY_URL }}
+          SECRET_API_URL: ${{ secrets.VELODECK_API_URL }}
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          RELAY_URL="${INPUT_RELAY_URL:-$SECRET_RELAY_URL}"
+          API_URL="${INPUT_API_URL:-$SECRET_API_URL}"
+          chmod +x gradlew
+          if [ "$BUILD_TYPE" = "release" ]; then
+            ./gradlew assembleRelease \
+              -PvelodeckRelayUrl="$RELAY_URL" \
+              -PvelodeckApiUrl="$API_URL"
+          else
+            ./gradlew assembleDebug \
+              -PvelodeckRelayUrl="$RELAY_URL" \
+              -PvelodeckApiUrl="$API_URL"
+          fi
+
+      - name: Package APK and SHA-256 checksum
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+          APP_VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          mkdir -p out
+          if [ "$BUILD_TYPE" = "release" ]; then
+            SRC="android-agent/app/build/outputs/apk/release/app-release.apk"
+            DST="out/velodeck-agent-v${APP_VERSION}.apk"
+          else
+            SRC="android-agent/app/build/outputs/apk/debug/app-debug.apk"
+            DST="out/velodeck-agent-v${APP_VERSION}-debug.apk"
+          fi
+          cp "$SRC" "$DST"
+          (cd out && sha256sum "$(basename "$DST")" > "$(basename "$DST").sha256")
+          ls -lh out/
+          cat out/*.sha256
+
+      - name: Clean up temporary signing files
+        if: always()
+        run: rm -f android-agent/ci-release.jks android-agent/keystore.properties
+
+      - name: Upload custom APK artifact (private to your Actions run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: velodeck-agent-custom-apk
+          path: out/*
+          retention-days: 14
