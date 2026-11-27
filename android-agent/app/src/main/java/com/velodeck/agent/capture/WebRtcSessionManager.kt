@@ -32,6 +32,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.abs
 
 interface WebRtcCallbacks {
     fun onLocalOffer(sessionId: String, sdp: String)
@@ -133,12 +134,19 @@ class WebRtcSessionManager(
     private var statsLogRunnable: Runnable? = null
 
     @Volatile
+    private var statsLogSessionId: String? = null
+
+    @Volatile
     private var sessionStartedElapsedMs: Long = 0L
 
     private var lastAdaptedWidth: Int = 0
     private var lastAdaptedHeight: Int = 0
     private var lastStatsBytesSent: Long = 0L
     private var lastStatsTimestampMs: Long = 0L
+    private var statsPollTick: Int = 0
+    private var isActiveRouteTurn: Boolean = false
+    private val rttCongestionGuard = RttCongestionGuard()
+    private var lastAppliedMaxBitrateKbps: Int = 0
 
     val isAvailable: Boolean
         get() = !initFailed.get() && ensureInitialized()
@@ -220,6 +228,7 @@ class WebRtcSessionManager(
         }
         // Tear down any previous session sequentially on rtcExecutor without holding locks across JNI
         closeSessionInternal()
+        resetAdaptiveRateState()
         if (cancelled.get()) {
             Log.w(TAG, "startSessionOnExecutor($sessionId) aborted after closing previous session")
             return false
@@ -290,7 +299,20 @@ class WebRtcSessionManager(
                             try {
                                 rtcExecutor.execute {
                                     if (activeSessionId == sessionId) {
-                                        applyVideoSenderParameters(videoSender, activeQuality)
+                                        val effectiveOverride = if (isActiveRouteTurn || rttCongestionGuard.scale < 1.0) {
+                                            val routeMax = LowLatencyEncoderMath.computeRouteMaxBitrateKbps(
+                                                resolveTargetBitrateKbps(activeQuality),
+                                                isActiveRouteTurn,
+                                            )
+                                            rttCongestionGuard.applyScale(routeMax, rttCongestionGuard.scale)
+                                        } else {
+                                            null
+                                        }
+                                        applyVideoSenderParameters(
+                                            videoSender,
+                                            activeQuality,
+                                            maxKbpsOverride = effectiveOverride,
+                                        )
                                         forceCaptureFrameOnExecutor()
                                         startStatsLogger(sessionId)
                                     }
@@ -606,6 +628,7 @@ class WebRtcSessionManager(
                     activeQuality = quality
                     Quad(videoSource, surfaceTextureHelper, captureSurface, videoSender)
                 }
+                resetAdaptiveRateState(resetStatsTick = false)
                 if (src == null || sth == null || surf == null) return@execute
                 val (w, h) = captureManager.computeTargetDimensions(quality.maxWidth)
                 lastAdaptedWidth = w
@@ -679,17 +702,23 @@ class WebRtcSessionManager(
         )
     }
 
-    private fun applyVideoSenderParameters(sender: RtpSender?, quality: StreamQuality) {
-        if (sender == null) return
-        try {
-            val params = sender.parameters ?: return
+    private fun applyVideoSenderParameters(
+        sender: RtpSender?,
+        quality: StreamQuality,
+        maxKbpsOverride: Int? = null,
+    ): Boolean {
+        if (sender == null) return false
+        return try {
+            val params = sender.parameters ?: return false
             // Match ScalingSettings.OFF cleanly: bitrate floors (300-500k) + QP_P_MAX=46 adapt
             // smoothly on WAN/TURN without resolution reinit glitches or FPS collapses.
             params.degradationPreference = RtpParameters.DegradationPreference.DISABLED
-            val maxKbps = resolveTargetBitrateKbps(quality)
+            val presetMaxKbps = resolveTargetBitrateKbps(quality)
+            val maxKbps = (maxKbpsOverride ?: presetMaxKbps).coerceAtLeast(300)
             val maxBps = maxKbps * 1_000
-            // Adaptive 15% floor (300-600 kbps) lets BWE scale smoothly on congested WAN/TURN links
-            val minBps = LowLatencyEncoderMath.computeSdpMinBitrateKbps(maxKbps) * 1_000
+            // Adaptive 15% floor (300-600 kbps) clamped <= maxKbps so minBitrateBps <= maxBitrateBps ALWAYS holds
+            val minKbps = minOf(LowLatencyEncoderMath.computeSdpMinBitrateKbps(presetMaxKbps), maxKbps)
+            val minBps = minKbps * 1_000
             val maxFps = resolveTargetFps(quality)
             for (encoding in params.encodings) {
                 encoding.maxBitrateBps = maxBps
@@ -700,8 +729,11 @@ class WebRtcSessionManager(
                 encoding.networkPriority = 3
             }
             sender.parameters = params
+            lastAppliedMaxBitrateKbps = maxKbps
+            true
         } catch (t: Throwable) {
             Log.w(TAG, "Failed to apply video sender parameters", t)
+            false
         }
     }
 
@@ -749,9 +781,14 @@ class WebRtcSessionManager(
     }
 
     private fun startStatsLogger(sessionId: String) {
+        if (statsLogRunnable != null && statsLogSessionId == sessionId) {
+            return
+        }
         stopStatsLogger()
+        statsLogSessionId = sessionId
         lastStatsBytesSent = 0L
         lastStatsTimestampMs = SystemClock.elapsedRealtime()
+        statsPollTick = 0
         val task = object : Runnable {
             override fun run() {
                 if (activeSessionId != sessionId || rtcExecutor.isShutdown) {
@@ -763,7 +800,16 @@ class WebRtcSessionManager(
                         if (pc != null) {
                             try {
                                 pc.getStats { report ->
-                                    logPeerConnectionStats(sessionId, report)
+                                    if (!rtcExecutor.isShutdown) {
+                                        try {
+                                            rtcExecutor.execute {
+                                                if (activeSessionId == sessionId && peerConnection === pc) {
+                                                    logPeerConnectionStats(sessionId, report)
+                                                }
+                                            }
+                                        } catch (_: Throwable) {
+                                        }
+                                    }
                                 }
                             } catch (_: Throwable) {
                             }
@@ -772,17 +818,18 @@ class WebRtcSessionManager(
                 } catch (_: Throwable) {
                 }
                 if (activeSessionId == sessionId) {
-                    mainHandler.postDelayed(this, 5_000L)
+                    mainHandler.postDelayed(this, STATS_POLL_INTERVAL_MS)
                 }
             }
         }
         statsLogRunnable = task
-        mainHandler.postDelayed(task, 3_000L)
+        mainHandler.postDelayed(task, STATS_POLL_INTERVAL_MS)
     }
 
     private fun stopStatsLogger() {
         val old = statsLogRunnable
         statsLogRunnable = null
+        statsLogSessionId = null
         if (old != null) {
             mainHandler.removeCallbacks(old)
         }
@@ -790,6 +837,7 @@ class WebRtcSessionManager(
 
     private fun logPeerConnectionStats(sessionId: String, report: org.webrtc.RTCStatsReport) {
         try {
+            statsPollTick++
             val map = report.statsMap
             var fps: Any? = null
             var bytesSent = 0L
@@ -835,7 +883,8 @@ class WebRtcSessionManager(
 
             val selectedPairMembers = selectedPairId?.let { map[it]?.members } ?: fallbackPairMembers
             val rttSec = (selectedPairMembers?.get("currentRoundTripTime") as? Number)?.toDouble()
-            val rttMs = if (rttSec != null) "${(rttSec * 1000.0).toInt()}ms" else "--"
+            val rttMsInt = rttSec?.let { (it * 1000.0).toInt() }
+            val rttMs = if (rttMsInt != null) "${rttMsInt}ms" else "--"
             val availOutBps = (selectedPairMembers?.get("availableOutgoingBitrate") as? Number)?.toLong()
             val availOutDesc = if (availOutBps != null) "${availOutBps / 1_000L}kbps" else "--"
             val localCandId = selectedPairMembers?.get("localCandidateId") as? String
@@ -857,21 +906,73 @@ class WebRtcSessionManager(
                 "pending"
             }
 
-            val nowMs = SystemClock.elapsedRealtime()
-            val dtMs = (nowMs - lastStatsTimestampMs).coerceAtLeast(1L)
-            val kbps = if (lastStatsBytesSent > 0L && bytesSent >= lastStatsBytesSent) {
-                ((bytesSent - lastStatsBytesSent) * 8L) / dtMs
+            // 1-second route-aware ceiling & RTT bufferbloat enforcement (runs on rtcExecutor)
+            val hasSelectedCandidates = localCand != null || remoteCand != null
+            val turnRelay = if (hasSelectedCandidates) {
+                localCand?.get("candidateType") == "relay" || remoteCand?.get("candidateType") == "relay"
             } else {
-                0L
+                isActiveRouteTurn
             }
-            lastStatsBytesSent = bytesSent
-            lastStatsTimestampMs = nowMs
+            val prevScale = rttCongestionGuard.scale
+            val scale = if (rttMsInt != null) {
+                rttCongestionGuard.onRttSample(rttMsInt)
+            } else {
+                prevScale
+            }
+            val quality = activeQuality
+            val presetMaxKbps = resolveTargetBitrateKbps(quality)
+            val routeMaxKbps = LowLatencyEncoderMath.computeRouteMaxBitrateKbps(presetMaxKbps, turnRelay)
+            val effectiveMaxKbps = rttCongestionGuard.applyScale(routeMaxKbps, scale)
 
-            Log.i(
-                TAG,
-                "WebRtcStats($sessionId): ${width}x${height} fps=$fps rate=${kbps}kbps bwe=$availOutDesc rtt=$rttMs " +
-                    "retx=$retransmitted limit=$qualityLimit enc=$encoderImpl pair=$pairDesc",
-            )
+            val routeChanged = turnRelay != isActiveRouteTurn
+            val prevAppliedMaxKbps = lastAppliedMaxBitrateKbps
+            val deltaThresholdKbps = maxOf(100, prevAppliedMaxKbps / 20)
+            if (routeChanged || abs(effectiveMaxKbps - prevAppliedMaxKbps) >= deltaThresholdKbps) {
+                val applied = applyVideoSenderParameters(
+                    sender = videoSender,
+                    quality = quality,
+                    maxKbpsOverride = effectiveMaxKbps,
+                )
+                if (applied) {
+                    isActiveRouteTurn = turnRelay
+                    val routeTag = if (turnRelay) "TURN" else "P2P"
+                    val reason = when {
+                        routeChanged && turnRelay -> "TURN_CEILING"
+                        routeChanged -> "P2P_UNLOCK"
+                        scale < prevScale -> "RTT_BACKOFF"
+                        scale > prevScale -> "RTT_RECOVERY"
+                        else -> "ADAPT"
+                    }
+                    val baseDesc = rttCongestionGuard.baselineRttMs?.let { "${it}ms" } ?: "--"
+                    Log.i(
+                        TAG,
+                        "Adaptive bitrate ($sessionId): $reason ${prevAppliedMaxKbps}->${effectiveMaxKbps}kbps " +
+                            "(route=$routeTag preset=${presetMaxKbps}kbps routeCap=${routeMaxKbps}kbps " +
+                            "scale=${"%.2f".format(scale)} rtt=$rttMs base=$baseDesc)",
+                    )
+                }
+            }
+
+            // Log full WebRtcStats summary every 3rd tick (= 3s) so logcat stays quiet
+            if (statsPollTick % STATS_LOG_EVERY_N_TICKS == 0) {
+                val nowMs = SystemClock.elapsedRealtime()
+                val dtMs = (nowMs - lastStatsTimestampMs).coerceAtLeast(1L)
+                val kbps = if (bytesSent >= lastStatsBytesSent) {
+                    ((bytesSent - lastStatsBytesSent) * 8L) / dtMs
+                } else {
+                    0L
+                }
+                lastStatsBytesSent = bytesSent
+                lastStatsTimestampMs = nowMs
+
+                val routeTag = if (turnRelay) "TURN" else "P2P"
+                Log.i(
+                    TAG,
+                    "WebRtcStats($sessionId): ${width}x${height} fps=$fps rate=${kbps}kbps cap=${effectiveMaxKbps}kbps " +
+                        "bwe=$availOutDesc rtt=$rttMs scale=${"%.2f".format(scale)} route=$routeTag " +
+                        "retx=$retransmitted limit=$qualityLimit enc=$encoderImpl pair=$pairDesc",
+                )
+            }
         } catch (_: Throwable) {
         }
     }
@@ -992,9 +1093,19 @@ class WebRtcSessionManager(
         }
     }
 
+    private fun resetAdaptiveRateState(resetStatsTick: Boolean = true) {
+        isActiveRouteTurn = false
+        rttCongestionGuard.reset()
+        lastAppliedMaxBitrateKbps = 0
+        if (resetStatsTick) {
+            statsPollTick = 0
+        }
+    }
+
     private fun closeSessionInternal() {
         stopStaticFramePump()
         stopStatsLogger()
+        resetAdaptiveRateState()
         captureManager.setExternalResizeListener(null)
         lastAdaptedWidth = 0
         lastAdaptedHeight = 0
@@ -1257,11 +1368,12 @@ class WebRtcSessionManager(
         private const val POINTER_CHANNEL_LABEL = "pointer"
         private const val FILE_CHANNEL_LABEL = "file"
         private const val START_SESSION_TIMEOUT_SEC = 4L
+        private const val STATS_POLL_INTERVAL_MS = 1_000L
+        private const val STATS_LOG_EVERY_N_TICKS = 3
         internal const val SDP_SESSION_MAX_BITRATE_KBPS = 10_000
         private const val WEBRTC_FIELD_TRIALS =
-            "WebRTC-VideoRateControl/alr_probing:true,pacing_factor:3.0,bitrate_adjuster:false/" +
-                "WebRTC-Bwe-AlrProbing/Enabled/" +
-                "WebRTC-CongestionWindow/QueueSize:500,MinBitrate:30000,DropFrame:false/"
+            "WebRTC-VideoRateControl/pacing_factor:1.25,alr_probing:false/" +
+                "WebRTC-CongestionWindow/QueueSize:120,MinBitrate:30000,DropFrame:true/"
 
         /**
          * Injects `x-google-min-bitrate`, `x-google-start-bitrate`, `x-google-max-bitrate`, and

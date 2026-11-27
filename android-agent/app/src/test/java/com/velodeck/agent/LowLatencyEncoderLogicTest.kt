@@ -5,6 +5,7 @@ import android.os.Build
 import com.velodeck.agent.capture.DisplayScaleMath
 import com.velodeck.agent.capture.LowLatencyEncoderMath
 import com.velodeck.agent.capture.LowLatencyH264EncoderFactory
+import com.velodeck.agent.capture.RttCongestionGuard
 import com.velodeck.agent.capture.WebRtcSessionManager
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -213,14 +214,16 @@ class LowLatencyEncoderLogicTest {
         assertEquals(42, LowLatencyEncoderMath.QP_I_MAX)
         assertEquals(46, LowLatencyEncoderMath.QP_P_MAX)
 
-        // Adaptive SDP/sender min (15% clamped 300..600 kbps) and start (55% clamped 1200..4000 kbps)
+        // Adaptive SDP/sender min (15% clamped 300..600 kbps) and conservative start (35% clamped 1000..2000 kbps)
         assertEquals(300, LowLatencyEncoderMath.computeSdpMinBitrateKbps(1_600))   // ECO
         assertEquals(360, LowLatencyEncoderMath.computeSdpMinBitrateKbps(2_400))   // 720p
         assertEquals(600, LowLatencyEncoderMath.computeSdpMinBitrateKbps(4_500))   // BALANCED
         assertEquals(600, LowLatencyEncoderMath.computeSdpMinBitrateKbps(7_500))   // HD
-        assertEquals(1_200, LowLatencyEncoderMath.computeSdpStartBitrateKbps(1_600))
-        assertEquals(2_475, LowLatencyEncoderMath.computeSdpStartBitrateKbps(4_500))
-        assertEquals(4_000, LowLatencyEncoderMath.computeSdpStartBitrateKbps(7_500))
+        assertEquals(1_000, LowLatencyEncoderMath.computeSdpStartBitrateKbps(1_600))
+        assertEquals(1_000, LowLatencyEncoderMath.computeSdpStartBitrateKbps(2_400))
+        assertEquals(1_050, LowLatencyEncoderMath.computeSdpStartBitrateKbps(3_000))
+        assertEquals(1_575, LowLatencyEncoderMath.computeSdpStartBitrateKbps(4_500))
+        assertEquals(2_000, LowLatencyEncoderMath.computeSdpStartBitrateKbps(7_500))
 
         // 2.5% delta < 3% threshold -> ignored even after 500ms
         assertFalse(LowLatencyEncoderMath.shouldApplyBitrateUpdate(2_000_000, 2_050_000, 500L))
@@ -583,5 +586,108 @@ class LowLatencyEncoderLogicTest {
         val (oddW, oddH) = DisplayScaleMath.computeScaledSize(1081, 2341, 720)
         assertEquals(0, oddW % 2)
         assertEquals(0, oddH % 2)
+    }
+
+    @Test
+    fun `computeRouteMaxBitrateKbps preserves full LAN P2P bitrate and caps cloud TURN below 3 Mbps`() {
+        // Direct LAN / P2P route: unchanged full preset bitrates
+        assertEquals(900, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(900, isTurnRelay = false))
+        assertEquals(1_600, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(1_600, isTurnRelay = false))
+        assertEquals(2_400, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(2_400, isTurnRelay = false))
+        assertEquals(4_500, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(4_500, isTurnRelay = false))
+        assertEquals(7_500, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(7_500, isTurnRelay = false))
+
+        // Cloud TURN relay route: capped cleanly below 3 Mbps VPS egress ceiling
+        assertEquals(900, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(900, isTurnRelay = true))
+        assertEquals(1_200, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(1_600, isTurnRelay = true))
+        assertEquals(1_200, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(2_400, isTurnRelay = true))
+        assertEquals(2_100, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(3_000, isTurnRelay = true))
+        assertEquals(2_100, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(4_500, isTurnRelay = true))
+        assertEquals(2_500, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(6_000, isTurnRelay = true))
+        assertEquals(2_500, LowLatencyEncoderMath.computeRouteMaxBitrateKbps(7_500, isTurnRelay = true))
+    }
+
+    @Test
+    fun `RttCongestionGuard tracks baseline floor, cuts fast on bufferbloat, holds moderate RTT, and recovers smoothly`() {
+        val guard = RttCongestionGuard()
+        assertNull(guard.baselineRttMs)
+        assertEquals(1.0, guard.scale, 1e-6)
+        assertEquals(0, guard.calmStreak)
+
+        // Non-positive RTT samples are ignored completely
+        assertEquals(1.0, guard.onRttSample(0), 1e-6)
+        assertEquals(1.0, guard.onRttSample(-15), 1e-6)
+        assertNull(guard.baselineRttMs)
+        assertEquals(0, guard.calmStreak)
+
+        // First valid sample anchors empty-queue baseline (36ms on Tencent Cloud VPS)
+        assertEquals(1.0, guard.onRttSample(36), 1e-6)
+        assertEquals(36, guard.baselineRttMs)
+        assertEquals(1, guard.calmStreak)
+
+        // Lower subsequent sample lowers baseline floor (clamped >= 10ms); higher calm sample never raises it
+        assertEquals(1.0, guard.onRttSample(30), 1e-6)
+        assertEquals(30, guard.baselineRttMs)
+        assertEquals(1.0, guard.onRttSample(50), 1e-6)
+        assertEquals(30, guard.baselineRttMs)
+
+        // Fast bufferbloat cut: excess >= 65ms (30 + 65 = 95ms) triggers 0.70x cut and resets calmStreak
+        assertEquals(0.70, guard.onRttSample(95), 1e-6)
+        assertEquals(0, guard.calmStreak)
+        assertEquals(1_470, guard.applyScale(2_100, guard.scale))
+
+        // Second fast cut via absolute RTT >= 180ms -> 0.49x
+        assertEquals(0.49, guard.onRttSample(180), 1e-6)
+        assertEquals(1_029, guard.applyScale(2_100, guard.scale))
+
+        // Third fast cut hits hard floor 0.35x and never drops below 0.35x on further spikes
+        assertEquals(0.35, guard.onRttSample(260), 1e-6)
+        assertEquals(0.35, guard.onRttSample(500), 1e-6)
+        assertEquals(735, guard.applyScale(2_100, guard.scale))
+
+        // Moderate elevated RTT hold (excess >= 35ms -> 30 + 35 = 65ms) holds scale and resets calmStreak
+        assertEquals(0.35, guard.onRttSample(35), 1e-6)
+        assertEquals(1, guard.calmStreak)
+        assertEquals(0.35, guard.onRttSample(40), 1e-6)
+        assertEquals(2, guard.calmStreak)
+        assertEquals(0.35, guard.onRttSample(65), 1e-6) // excess=35 -> hold & reset streak
+        assertEquals(0, guard.calmStreak)
+
+        // Moderate elevated absolute RTT >= 140ms also holds without recovering
+        assertEquals(0.35, guard.onRttSample(32), 1e-6)
+        assertEquals(0.35, guard.onRttSample(140), 1e-6)
+        assertEquals(0, guard.calmStreak)
+
+        // 3 consecutive calm polls recover +0.10 (0.35 -> 0.45) and reset calmStreak to 0
+        assertEquals(0.35, guard.onRttSample(32), 1e-6)
+        assertEquals(0.35, guard.onRttSample(34), 1e-6)
+        assertEquals(0.45, guard.onRttSample(33), 1e-6)
+        assertEquals(0, guard.calmStreak)
+
+        // Continued calm polls recover smoothly all the way back to 1.0 without overshooting
+        repeat(18) { guard.onRttSample(31) }
+        assertEquals(1.0, guard.scale, 1e-6)
+        assertEquals(2_100, guard.applyScale(2_100, guard.scale))
+
+        // applyScale enforces 600 kbps floor even for low route ceilings
+        assertEquals(600, guard.applyScale(1_200, 0.35))
+        assertEquals(600, guard.applyScale(500, 1.0))
+
+        // Congested initial sample clamps initial baseline to [10, 120] and triggers immediate cut
+        guard.reset()
+        assertNull(guard.baselineRttMs)
+        assertEquals(1.0, guard.scale, 1e-6)
+        assertEquals(0, guard.calmStreak)
+
+        assertEquals(0.70, guard.onRttSample(200), 1e-6)
+        assertEquals(120, guard.baselineRttMs)
+        // Subsequent ultra-low LAN RTT lowers baseline floor to minimum 10ms
+        assertEquals(0.70, guard.onRttSample(4), 1e-6)
+        assertEquals(10, guard.baselineRttMs)
+        // Absolute RTT >= 180ms cuts even if baseline=120 and excess=60 < 65
+        guard.reset()
+        assertEquals(1.0, guard.onRttSample(120), 1e-6)
+        assertEquals(120, guard.baselineRttMs)
+        assertEquals(0.70, guard.onRttSample(180), 1e-6)
     }
 }

@@ -124,8 +124,8 @@ android {
         applicationId = "com.velodeck.agent"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.0.5"
+        versionCode = 7
+        versionName = "1.0.6"
 
         ndk {
             // Strip desktop emulator x86/x86_64 native libs (~25 MB bloat); cover 100% of real ARM Android devices

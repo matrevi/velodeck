@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.round
 
 /**
  * Pure algorithmic helpers for [LowLatencyH264Encoder] — kept Android-free so JVM unit tests can
@@ -183,11 +184,27 @@ internal object LowLatencyEncoderMath {
         ((presetMaxKbps * 15) / 100).coerceIn(300, 600)
 
     /**
-     * Brisk initial bitrate (`55%` of preset max, clamped to `[1200, 4000] kbps`) for SDP
-     * `x-google-start-bitrate` so LAN starts crisp immediately while WAN/TURN can adapt downward.
+     * Conservative initial bitrate (`35%` of preset max, clamped to `[1000, 2000] kbps`) for SDP
+     * `x-google-start-bitrate` so even second #1 over a bandwidth-capped 3 Mbps cloud TURN VPS
+     * never overflows its hypervisor FIFO, while LAN P2P ramps to 4.5-7.5 Mbps within ~1s.
      */
     fun computeSdpStartBitrateKbps(presetMaxKbps: Int): Int =
-        ((presetMaxKbps * 55) / 100).coerceIn(1_200, 4_000)
+        ((presetMaxKbps * 35) / 100).coerceIn(1_000, 2_000)
+
+    /**
+     * Applies a route-aware maximum bitrate ceiling:
+     * - Direct LAN / P2P (`!isTurnRelay`): keeps [presetMaxKbps] unchanged.
+     * - Cloud TURN relay (`isTurnRelay`): caps below a 3 Mbps VPS egress limit so hypervisor FIFO
+     *   bufferbloat never builds up while keeping 60fps UI text crisp.
+     */
+    fun computeRouteMaxBitrateKbps(presetMaxKbps: Int, isTurnRelay: Boolean): Int {
+        if (!isTurnRelay) return presetMaxKbps
+        return when {
+            presetMaxKbps >= 6_000 -> minOf(presetMaxKbps, 2_500)
+            presetMaxKbps >= 3_000 -> minOf(presetMaxKbps, 2_100)
+            else -> minOf(presetMaxKbps, 1_200)
+        }
+    }
 
     /**
      * Selects the H.264 AVC codec level matching the target resolution and VPU operating rate.
@@ -341,6 +358,85 @@ internal object LowLatencyEncoderMath {
         System.arraycopy(cachedConfig, 0, combined, 0, cachedConfig.size)
         System.arraycopy(frameBytes, 0, combined, cachedConfig.size, frameBytes.size)
         return combined
+    }
+}
+
+/**
+ * Pure, Android-free RTT-reactive bufferbloat backoff state machine.
+ *
+ * Tracks the session's empty-queue baseline RTT floor (`[10, 120] ms` initial clamp, lowered on
+ * subsequent calmer samples down to `10 ms`) and dynamically scales down sender bitrate when
+ * queueing delay spikes (`excess >= 65 ms` or absolute `rttMs >= 180 ms`), holds steady on
+ * moderate incipient queueing (`excess >= 35 ms` or `rttMs >= 140 ms`), and gradually recovers
+ * (`+0.10` per 3 consecutive calm 1-second polls) once queues drain.
+ */
+internal class RttCongestionGuard {
+    var baselineRttMs: Int? = null
+        private set
+    var scale: Double = 1.0
+        private set
+    var calmStreak: Int = 0
+        private set
+
+    fun reset() {
+        baselineRttMs = null
+        scale = 1.0
+        calmStreak = 0
+    }
+
+    fun onRttSample(rttMs: Int): Double {
+        if (rttMs <= 0) return scale
+
+        val currentBaseline = baselineRttMs
+        val baseline = when {
+            currentBaseline == null -> rttMs.coerceIn(MIN_BASELINE_RTT_MS, MAX_INITIAL_BASELINE_RTT_MS)
+            rttMs < currentBaseline -> maxOf(MIN_BASELINE_RTT_MS, rttMs)
+            else -> currentBaseline
+        }
+        baselineRttMs = baseline
+
+        val excess = rttMs - baseline
+        when {
+            // Fast bufferbloat cut: drop aggressively before cloud VPS FIFO explodes
+            excess >= FAST_CUT_EXCESS_MS || rttMs >= FAST_CUT_ABSOLUTE_RTT_MS -> {
+                calmStreak = 0
+                scale = roundScale((scale * FAST_CUT_FACTOR).coerceAtLeast(MIN_SCALE))
+            }
+
+            // Moderate elevated RTT: hold current scale instead of probing into incipient queue
+            excess >= HOLD_EXCESS_MS || rttMs >= HOLD_ABSOLUTE_RTT_MS -> {
+                calmStreak = 0
+            }
+
+            // Calm link: gradually recover after 3 consecutive calm samples
+            else -> {
+                calmStreak = (calmStreak + 1).coerceAtMost(1_000_000)
+                if (calmStreak >= RECOVERY_CALM_STREAK && scale < 1.0) {
+                    scale = roundScale((scale + RECOVERY_STEP).coerceAtMost(1.0))
+                    calmStreak = 0
+                }
+            }
+        }
+        return scale
+    }
+
+    fun applyScale(routeMaxKbps: Int, scale: Double): Int =
+        (routeMaxKbps * scale).toInt().coerceIn(MIN_SCALED_KBPS, routeMaxKbps.coerceAtLeast(MIN_SCALED_KBPS))
+
+    private fun roundScale(value: Double): Double = round(value * 1_000_000.0) / 1_000_000.0
+
+    companion object {
+        const val MIN_BASELINE_RTT_MS = 10
+        const val MAX_INITIAL_BASELINE_RTT_MS = 120
+        const val FAST_CUT_EXCESS_MS = 65
+        const val FAST_CUT_ABSOLUTE_RTT_MS = 180
+        const val HOLD_EXCESS_MS = 35
+        const val HOLD_ABSOLUTE_RTT_MS = 140
+        const val FAST_CUT_FACTOR = 0.70
+        const val MIN_SCALE = 0.35
+        const val RECOVERY_CALM_STREAK = 3
+        const val RECOVERY_STEP = 0.10
+        const val MIN_SCALED_KBPS = 600
     }
 }
 
