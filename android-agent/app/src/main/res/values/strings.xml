@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">极控</string>
+    <string name="accessibility_service_label">VeloDeck 极控无障碍控制</string>
+    <string name="accessibility_service_description">VeloDeck 极控用于执行远程点击、滑动、双指缩放、系统按键、文本输入与自动解锁，实现 7×24 无人值守远程控制。</string>
+    <string name="notif_channel_name">VeloDeck 极控后台常驻服务</string>
+    <string name="notif_channel_desc">保持无人值守远程控制、中继重连与持久化录屏能力在线</string>
+    <string name="notif_active_channel_name">VeloDeck 极控远程控制安全提醒</string>
+    <string name="notif_active_channel_desc">正在被远程控制时显示高优先级提醒与一键断开按钮</string>
+</resources>

@@ -1,0 +1,7 @@
+packages:
+  - "packages/*"
+  - "server"
+  - "controller"
+
+allowBuilds:
+  esbuild: true

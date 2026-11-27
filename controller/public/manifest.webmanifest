@@ -1,0 +1,19 @@
+{
+  "name": "VeloDeck 极控",
+  "short_name": "极控",
+  "description": "VeloDeck 极控 — 免确认、7×24 长期稳定的远程手机控制工作台",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#F4F5F7",
+  "theme_color": "#111318",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

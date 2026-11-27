@@ -1,0 +1,116 @@
+# Pure-IP deployment (no domain / HTTPS certificate required).
+# Usage:
+#   cd server
+#   # Create .env with strong TURN_SECRET (`openssl rand -hex 32`)
+#   docker compose -f docker-compose.ip.yml up -d --build
+#
+# Required .env variables:
+#   TURN_SECRET=<random-hex-secret>
+# Optional .env variables:
+#   PUBLIC_IP=<your-vps-public-ip>
+#   TURN_URLS=turn:<your-vps-public-ip>:3478?transport=udp,turn:<your-vps-public-ip>:3478?transport=tcp
+#   JWT_SECRET=<random-hex-secret>
+#   REGISTRATION_MODE=first-user-then-invite
+#   REGISTRATION_INVITE_CODE=<optional-invite-code>
+#   ADMIN_TOKEN=<optional-admin-stats-token>
+
+services:
+  velodeck-server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 128
+    ports:
+      - "80:8080"
+      - "127.0.0.1:8080:8080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      STATIC_DIR: /app/controller/dist
+      DATA_DIR: /app/data
+      APK_PATH: /app/downloads/velodeck-agent.apk
+      TRUST_PROXY: "false"
+      REGISTRATION_MODE: ${REGISTRATION_MODE:-first-user-then-invite}
+      REGISTRATION_INVITE_CODE: ${REGISTRATION_INVITE_CODE:-}
+      ENABLE_LEGACY_TOKEN_AUTH: "false"
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      REQUIRE_AUTH_FOR_APK: ${REQUIRE_AUTH_FOR_APK:-false}
+      STUN_URLS: ${STUN_URLS:-stun:stun.miwifi.com:3478,stun:stun.chat.bilibili.com:3478}
+      PUBLIC_IP: ${PUBLIC_IP:-}
+      TURN_URLS: ${TURN_URLS:-}
+      TURN_SECRET: ${TURN_SECRET:?Set TURN_SECRET in .env}
+      TURN_TTL_SECONDS: ${TURN_TTL_SECONDS:-1800}
+      JWT_SECRET: ${JWT_SECRET:-}
+      MAX_FAILED_AUTH_PER_MIN: ${MAX_FAILED_AUTH_PER_MIN:-30}
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  velodeck-coturn:
+    image: coturn/coturn:4.6-alpine
+    restart: unless-stopped
+    # Host networking avoids NAT overhead across the wide UDP relay port range (49152-65535).
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+      - /var/lib/coturn
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 128
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      TURN_REALM: ${PUBLIC_IP:-velodeck.local}
+      TURN_SECRET: ${TURN_SECRET:?Set TURN_SECRET in .env}
+      PUBLIC_IP: ${PUBLIC_IP:-}
+    volumes:
+      - ./coturn.conf:/etc/coturn/turnserver.conf:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        cp /etc/coturn/turnserver.conf /tmp/turnserver.conf
+        printf '\nrealm=%s\nstatic-auth-secret=%s\n' "$$TURN_REALM" "$$TURN_SECRET" >> /tmp/turnserver.conf
+        LOCAL_IP="$$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($$i=="src") {print $$(i+1); exit}}' || true)"
+        if [ -n "$$LOCAL_IP" ]; then
+          printf 'listening-ip=%s\nrelay-ip=%s\n' "$$LOCAL_IP" "$$LOCAL_IP" >> /tmp/turnserver.conf
+          if [ -n "$$PUBLIC_IP" ]; then
+            printf 'external-ip=%s/%s\n' "$$PUBLIC_IP" "$$LOCAL_IP" >> /tmp/turnserver.conf
+          fi
+        elif [ -n "$$PUBLIC_IP" ]; then
+          printf 'external-ip=%s\n' "$$PUBLIC_IP" >> /tmp/turnserver.conf
+        fi
+        chmod 600 /tmp/turnserver.conf
+        unset TURN_SECRET
+        exec turnserver -c /tmp/turnserver.conf

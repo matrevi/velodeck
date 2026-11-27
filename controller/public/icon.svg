@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="vd-v-left" x1="112" y1="112" x2="272" y2="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#6366F1" />
+    </linearGradient>
+    <linearGradient id="vd-v-right" x1="400" y1="112" x2="240" y2="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#60A5FA" />
+      <stop offset="55%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#4F46E5" />
+    </linearGradient>
+    <linearGradient id="vd-deck" x1="176" y1="404" x2="336" y2="404" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#6366F1" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#111318" />
+  <rect x="14" y="14" width="484" height="484" rx="98" stroke="#242936" stroke-width="8" />
+  <path d="M104 114H186L256 262L326 114H408L284 364C278 376 268 382 256 382C244 382 234 376 228 364L104 114Z" fill="url(#vd-v-left)" />
+  <path d="M326 114H408L284 364C278 376 268 382 256 382V262L326 114Z" fill="url(#vd-v-right)" />
+  <rect x="176" y="402" width="160" height="22" rx="11" fill="url(#vd-deck)" />
+</svg>

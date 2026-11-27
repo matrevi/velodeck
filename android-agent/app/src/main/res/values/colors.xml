@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Flagship Native Daylight Surface Palette (ColorOS 16 / iOS / Tailscale Mobile Grade) -->
+    <color name="bg_root">#F2F4F7</color>
+    <color name="bg_card">#FFFFFF</color>
+    <color name="bg_card_elevated">#F6F8FA</color>
+    <color name="bg_icon_neutral">#F1F4F8</color>
+    <color name="bg_icon_blue">#EBF3FF</color>
+    <color name="bg_icon_green">#E9F9EF</color>
+    <color name="bg_icon_amber">#FEF5E7</color>
+    <color name="bg_icon_indigo">#EEF2FF</color>
+
+    <color name="stroke_subtle">#E8ECF2</color>
+    <color name="stroke_strong">#D4DBE5</color>
+    <color name="divider_hairline">#EEF1F6</color>
+
+    <color name="text_primary">#111827</color>
+    <color name="text_secondary">#4B5563</color>
+    <color name="text_muted">#808999</color>
+    <color name="text_on_accent">#FFFFFF</color>
+
+    <color name="accent_blue">#1668FF</color>
+    <color name="accent_blue_dark">#0F52D6</color>
+    <color name="accent_tint">#EEF4FF</color>
+    <color name="accent_tint_border">#CFE0FF</color>
+
+    <color name="status_ok">#15803D</color>
+    <color name="status_ok_dot">#16A34A</color>
+    <color name="status_ok_bg">#EAFBF0</color>
+    <color name="status_ok_border">#C6F2D6</color>
+
+    <color name="status_warn">#B45309</color>
+    <color name="status_warn_dot">#F59E0B</color>
+    <color name="status_warn_bg">#FFF7E6</color>
+    <color name="status_warn_border">#FDE2B3</color>
+
+    <color name="status_err">#DC2626</color>
+    <color name="status_err_dot">#EF4444</color>
+    <color name="status_err_bg">#FEF2F2</color>
+    <color name="status_err_border">#FECACA</color>
+
+    <color name="switch_track_off">#DDE2EA</color>
+    <color name="switch_thumb_off">#FFFFFF</color>
+</resources>

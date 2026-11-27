@@ -1,0 +1,134 @@
+services:
+  velodeck-server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 128
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      STATIC_DIR: /app/controller/dist
+      DATA_DIR: /app/data
+      APK_PATH: /app/downloads/velodeck-agent.apk
+      TRUST_PROXY: "true"
+      REGISTRATION_MODE: ${REGISTRATION_MODE:-first-user-then-invite}
+      REGISTRATION_INVITE_CODE: ${REGISTRATION_INVITE_CODE:-}
+      ENABLE_LEGACY_TOKEN_AUTH: ${ENABLE_LEGACY_TOKEN_AUTH:-false}
+      TURN_TTL_SECONDS: ${TURN_TTL_SECONDS:-1800}
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads:ro
+    expose:
+      - "8080"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - velodeck-net
+
+  velodeck-coturn:
+    image: coturn/coturn:4.6-alpine
+    restart: unless-stopped
+    # Host networking avoids NAT overhead across the wide UDP relay port range (49152-65535).
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/tmp
+      - /var/lib/coturn
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 128
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      DOMAIN: ${DOMAIN:-velodeck.example.com}
+      TURN_SECRET: ${TURN_SECRET:?Set TURN_SECRET in .env}
+      PUBLIC_IP: ${PUBLIC_IP:-}
+    volumes:
+      - ./coturn.conf:/etc/coturn/turnserver.conf:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        cp /etc/coturn/turnserver.conf /tmp/turnserver.conf
+        printf '\nrealm=%s\nstatic-auth-secret=%s\n' "$$DOMAIN" "$$TURN_SECRET" >> /tmp/turnserver.conf
+        LOCAL_IP="$$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($$i=="src") {print $$(i+1); exit}}' || true)"
+        if [ -n "$$LOCAL_IP" ]; then
+          printf 'listening-ip=%s\nrelay-ip=%s\n' "$$LOCAL_IP" "$$LOCAL_IP" >> /tmp/turnserver.conf
+          if [ -n "$$PUBLIC_IP" ]; then
+            printf 'external-ip=%s/%s\n' "$$PUBLIC_IP" "$$LOCAL_IP" >> /tmp/turnserver.conf
+          fi
+        elif [ -n "$$PUBLIC_IP" ]; then
+          printf 'external-ip=%s\n' "$$PUBLIC_IP" >> /tmp/turnserver.conf
+        fi
+        chmod 600 /tmp/turnserver.conf
+        unset TURN_SECRET
+        exec turnserver -c /tmp/turnserver.conf
+
+  velodeck-caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 128
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      velodeck-server:
+        condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - velodeck-net
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  velodeck-net:
+    driver: bridge

@@ -1,0 +1,41 @@
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+._*
+
+# Server runtime data & artifacts
+server/data/
+server/downloads/
+server/.env
+*.secret
+store.json
+store.json.bak
+audit.jsonl*
+*.apk
+
+# Android
+android-agent/.gradle/
+android-agent/build/
+android-agent/app/build/
+android-agent/local.properties
+android-agent/keystore.properties
+android-agent/*.jks
+android-agent/*.keystore
+android-agent/app/*.jks
+android-agent/app/*.keystore
+android-agent/*.iml
+android-agent/.idea/
+android-agent/app/src/main/assets/web/
+
+# Capacitor / iOS
+controller/ios/
+controller/android/
+controller/dist/
+
+# Coverage
+coverage/
