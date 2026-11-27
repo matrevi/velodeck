@@ -18,6 +18,7 @@ import {
   formatControlCode,
   formatControlCodeInput,
   getAndroidApkDownloadUrl,
+  getAndroidApkFileName,
   isValidControlCode,
   loadAccountSession,
   loadRecentCodes,
@@ -107,11 +108,53 @@ describe("detectDefaultApiBase & detectDefaultRelayWsUrl", () => {
     ).toBe(DEFAULT_CLOUD_WS_URL);
   });
 
-  it("builds Android APK download URL cleanly", () => {
+  it("builds versioned Android APK filenames and cache-busted download URLs cleanly", () => {
+    expect(getAndroidApkFileName()).toBe("velodeck-agent.apk");
+    expect(getAndroidApkFileName(null)).toBe("velodeck-agent.apk");
+    expect(getAndroidApkFileName({})).toBe("velodeck-agent.apk");
+    expect(getAndroidApkFileName({ version: "   " })).toBe("velodeck-agent.apk");
+    expect(getAndroidApkFileName({ version: "v" })).toBe("velodeck-agent.apk");
+    expect(getAndroidApkFileName({ version: "1.0.9" })).toBe("velodeck-agent-v1.0.9.apk");
+    expect(getAndroidApkFileName({ version: "v1.0.9" })).toBe("velodeck-agent-v1.0.9.apk");
+    expect(getAndroidApkFileName({ version: "  V1.0.9-rc.1 " })).toBe(
+      "velodeck-agent-v1.0.9-rc.1.apk",
+    );
+
+    // Backward-compatible default when serverInfo is omitted or empty
     expect(getAndroidApkDownloadUrl("")).toBe("/api/download/velodeck-agent.apk");
     expect(getAndroidApkDownloadUrl("http://203.0.113.10/")).toBe(
       "http://203.0.113.10/api/download/velodeck-agent.apk",
     );
+    expect(getAndroidApkDownloadUrl("", {})).toBe("/api/download/velodeck-agent.apk");
+
+    // Versioned filename without SHA
+    expect(getAndroidApkDownloadUrl("", { version: "1.0.9" })).toBe(
+      "/api/download/velodeck-agent-v1.0.9.apk",
+    );
+    expect(getAndroidApkDownloadUrl("http://203.0.113.10/", { version: "v1.0.9" })).toBe(
+      "http://203.0.113.10/api/download/velodeck-agent-v1.0.9.apk",
+    );
+
+    // Versioned filename + 12-char SHA query param
+    expect(
+      getAndroidApkDownloadUrl("", {
+        version: "1.0.9",
+        apkSha256: "abcdef0123456789fedcba9876543210",
+      }),
+    ).toBe("/api/download/velodeck-agent-v1.0.9.apk?sha=abcdef012345");
+    expect(
+      getAndroidApkDownloadUrl("http://203.0.113.10/", {
+        version: "v1.0.9",
+        apkSha256: "abcdef0123456789fedcba9876543210",
+      }),
+    ).toBe("http://203.0.113.10/api/download/velodeck-agent-v1.0.9.apk?sha=abcdef012345");
+
+    // SHA-only without version falls back to default filename with ?sha=
+    expect(
+      getAndroidApkDownloadUrl("", {
+        apkSha256: "abcdef0123456789fedcba9876543210",
+      }),
+    ).toBe("/api/download/velodeck-agent.apk?sha=abcdef012345");
   });
 });
 
@@ -333,12 +376,13 @@ describe("account session persistence", () => {
 
 describe("REST API clients", () => {
   it("fetchServerInfo parses APK SHA-256 and registration policy fields and fails gracefully", async () => {
-    const basicFetch = vi.fn(async () =>
-      new Response(JSON.stringify({ hasAndroidApk: true }), {
+    const basicFetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(init?.cache).toBe("no-store");
+      return new Response(JSON.stringify({ hasAndroidApk: true }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
-      }),
-    );
+      });
+    });
     await expect(fetchServerInfo("", basicFetch as unknown as typeof fetch)).resolves.toEqual({
       hasAndroidApk: true,
     });

@@ -208,6 +208,21 @@ export function App() {
     };
   }, [activeApiBase]);
 
+  // Re-fetch /api/info whenever WebSocket (re)connects so long-lived open tabs
+  // automatically pick up updated server version & APK SHA-256 after a server upgrade.
+  useEffect(() => {
+    if (clientState.socketStatus !== "connected") return;
+    let cancelled = false;
+    void fetchServerInfo(activeApiBase).then((info) => {
+      if (!cancelled) {
+        setServerInfo(info);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeApiBase, clientState.socketStatus]);
+
   // Boot: 1) QR/URL quick-connect params (with security check) -> 2) saved account session -> 3) LaunchView
   // StrictMode-safe: uses initialQuickRef parsed once on mount and reconnects whenever client is still idle.
   useEffect(() => {

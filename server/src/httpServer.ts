@@ -19,7 +19,8 @@ import type { ServerConfig } from "./config.js";
 import { extractClientIp, isLoopbackIp, VeloDeckHub } from "./hub.js";
 import { isValidDeviceId, VeloDeckStore, StoreError } from "./store.js";
 
-const SERVER_VERSION = "1.0.8";
+const SERVER_VERSION = "1.0.9";
+const VERSIONED_APK_DOWNLOAD_RE = /^\/api\/download\/velodeck-agent-v[0-9A-Za-z._-]+\.apk$/;
 const MAX_JSON_BODY_BYTES = 32 * 1024;
 const MAX_WS_PAYLOAD_BYTES = 2 * 1024 * 1024; // 2 MB
 
@@ -1121,7 +1122,8 @@ export function createVeloDeckServer(config: ServerConfig): VeloDeckServer {
 
     if (
       pathname === "/api/download/velodeck-agent.apk" ||
-      pathname === "/api/download/android"
+      pathname === "/api/download/android" ||
+      VERSIONED_APK_DOWNLOAD_RE.test(pathname)
     ) {
       if (method !== "GET" && method !== "HEAD") {
         sendJson(res, 405, { ok: false, error: "Method Not Allowed" }, headOnly, {
@@ -1169,9 +1171,10 @@ export function createVeloDeckServer(config: ServerConfig): VeloDeckServer {
         ...BASE_SECURITY_HEADERS,
         ...cors.headers,
         "Content-Type": "application/vnd.android.package-archive",
-        "Content-Disposition": 'attachment; filename="velodeck-agent.apk"',
+        "Content-Disposition": `attachment; filename="velodeck-agent-v${SERVER_VERSION}.apk"`,
         "Accept-Ranges": "bytes",
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        Pragma: "no-cache",
       };
       if (apkMeta.apkSha256) {
         baseDlHeaders["X-APK-SHA256"] = apkMeta.apkSha256;
@@ -1188,7 +1191,8 @@ export function createVeloDeckServer(config: ServerConfig): VeloDeckServer {
           ...BASE_SECURITY_HEADERS,
           ...cors.headers,
           ETag: etag,
-          "Cache-Control": "no-cache",
+          "Cache-Control": "no-store, no-cache, must-revalidate",
+          Pragma: "no-cache",
         });
         res.end();
         return;

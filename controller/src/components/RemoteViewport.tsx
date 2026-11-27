@@ -48,6 +48,7 @@ import { GestureRecognizer, clientPointToNormalized } from "../gestures/GestureM
 import {
   detectDefaultApiBase,
   getAndroidApkDownloadUrl,
+  getAndroidApkFileName,
   type ServerInfo,
 } from "../state/auth";
 import type { QualityPreset } from "../state/profiles";
@@ -848,7 +849,9 @@ export function RemoteViewport({
 
   async function handlePushLatestApk() {
     if (apkFetchState.active) return;
-    const downloadUrl = getAndroidApkDownloadUrl(resolvedApiBase);
+    const apkFileName = getAndroidApkFileName(serverInfo);
+    const baseDownloadUrl = getAndroidApkDownloadUrl(resolvedApiBase, serverInfo);
+    const downloadUrl = `${baseDownloadUrl}${baseDownloadUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
     const controller = new AbortController();
     apkAbortRef.current = controller;
     setApkFetchState({ active: true, loaded: 0, total: 0, error: null });
@@ -922,7 +925,7 @@ export function RemoteViewport({
     setApkFetchState({ active: false, loaded: 0, total: 0, error: null });
     try {
       await client.sendFileOverWebRtc(apkBytes, {
-        fileName: "velodeck-agent.apk",
+        fileName: apkFileName,
         mimeType: "application/vnd.android.package-archive",
         purpose: "apk_install",
         expectedSha256: headerSha,
@@ -2097,7 +2100,8 @@ const FileTransferSheetContent = memo(function FileTransferSheetContent({
       ft.status === "sending" ||
       ft.status === "verifying");
   const isBusy = isTransferActive || apkFetchState.active;
-  const apkDownloadUrl = getAndroidApkDownloadUrl(apiBase);
+  const apkDownloadUrl = getAndroidApkDownloadUrl(apiBase, serverInfo);
+  const apkFileName = getAndroidApkFileName(serverInfo);
 
   const transferPct =
     ft && ft.totalBytes > 0
@@ -2182,6 +2186,7 @@ const FileTransferSheetContent = memo(function FileTransferSheetContent({
             )}
             <a
               href={apkDownloadUrl}
+              download={apkFileName}
               target="_blank"
               rel="noreferrer"
               className="inline-flex h-7 items-center gap-1 rounded-md border border-[#2C313D] bg-[#191D26] px-2.5 text-[11px] font-medium text-zinc-200 hover:bg-[#232836]"
@@ -2203,7 +2208,7 @@ const FileTransferSheetContent = memo(function FileTransferSheetContent({
                 远程一键推送新版 Agent
               </div>
               <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">
-                从服务器拉取最新 velodeck-agent.apk 并经 WebRTC 直传到手机自动拉起安装
+                从服务器拉取最新 {apkFileName} 并经 WebRTC 直传到手机自动拉起安装
                 {serverInfo.version ? `（服务端 v${serverInfo.version}）` : ""}
               </p>
               {serverInfo.apkSha256 && (

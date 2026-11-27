@@ -1562,7 +1562,7 @@ test("Account-mode and 9-digit controlCode+password controller auth with strict 
   assert.equal(codeOtherErr.code, "UNAUTHORIZED");
 });
 
-test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/velodeck-agent.apk & /api/download/android streaming & optional auth", async (t) => {
+test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/velodeck-agent.apk, versioned .apk & /api/download/android streaming & optional auth", async (t) => {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "velodeck-apk-test-"));
   const apkPath = path.join(tempDir, "velodeck-agent.apk");
   const { server, baseUrl } = await startServer({ apkPath });
@@ -1576,7 +1576,7 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
   assert.equal(infoBefore.status, 200);
   assert.deepEqual(await infoBefore.json(), {
     ok: true,
-    version: "1.0.8",
+    version: "1.0.9",
     hasAndroidApk: false,
     apkSha256: null,
     registrationMode: "first-user-then-invite",
@@ -1597,7 +1597,7 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
   assert.equal(infoAfter.status, 200);
   assert.deepEqual(await infoAfter.json(), {
     ok: true,
-    version: "1.0.8",
+    version: "1.0.9",
     hasAndroidApk: true,
     apkSha256: expectedSha256,
     registrationMode: "first-user-then-invite",
@@ -1605,9 +1605,10 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
     requiresInviteCode: false,
   });
 
-  // Primary route + /api/download/android both serve velodeck-agent.apk and expose X-APK-SHA256 over CORS
+  // Primary route, versioned .apk route, and /api/download/android all serve versioned APK headers and expose X-APK-SHA256 over CORS
   for (const dlRoute of [
     "/api/download/velodeck-agent.apk",
+    "/api/download/velodeck-agent-v1.0.9.apk",
     "/api/download/android",
   ]) {
     const dlRes = await fetch(`${baseUrl}${dlRoute}`, {
@@ -1617,8 +1618,13 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
     assert.equal(dlRes.headers.get("content-type"), "application/vnd.android.package-archive");
     assert.equal(
       dlRes.headers.get("content-disposition"),
-      'attachment; filename="velodeck-agent.apk"',
+      'attachment; filename="velodeck-agent-v1.0.9.apk"',
     );
+    assert.equal(
+      dlRes.headers.get("cache-control"),
+      "no-store, no-cache, must-revalidate",
+    );
+    assert.equal(dlRes.headers.get("pragma"), "no-cache");
     assert.equal(dlRes.headers.get("content-length"), String(fakeApkBytes.byteLength));
     assert.equal(dlRes.headers.get("x-apk-sha256"), expectedSha256);
     assert.equal(
@@ -1628,6 +1634,10 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
     const receivedBytes = Buffer.from(await dlRes.arrayBuffer());
     assert.deepEqual(receivedBytes, fakeApkBytes);
   }
+
+  // Malformed versioned APK routes still 404
+  const badVersionedRes = await fetch(`${baseUrl}/api/download/velodeck-agent-v.apk`);
+  assert.equal(badVersionedRes.status, 404);
 
   // Verify requireAuthForApk=true enforces Bearer JWT
   const sAuth = await startServer({ apkPath, requireAuthForApk: true });
@@ -2989,6 +2999,12 @@ test("APK download supports .apk URL alias, Accept-Ranges, ETag, 206 Partial Con
   assert.equal(range1.headers.get("accept-ranges"), "bytes");
   assert.equal(range1.headers.get("content-range"), `bytes 0-9/${payload.byteLength}`);
   assert.equal(range1.headers.get("content-length"), "10");
+  assert.equal(
+    range1.headers.get("content-disposition"),
+    'attachment; filename="velodeck-agent-v1.0.9.apk"',
+  );
+  assert.equal(range1.headers.get("cache-control"), "no-store, no-cache, must-revalidate");
+  assert.equal(range1.headers.get("pragma"), "no-cache");
   assert.equal(await range1.text(), "0123456789");
 
   // Open-ended resume range on /api/download/android -> 206 Partial Content
@@ -3024,12 +3040,14 @@ test("APK download supports .apk URL alias, Accept-Ranges, ETag, 206 Partial Con
   assert.equal(oobRes.status, 416);
   assert.equal(oobRes.headers.get("content-range"), `bytes */${payload.byteLength}`);
 
-  // If-None-Match -> 304 Not Modified
+  // If-None-Match -> 304 Not Modified (with strict no-store headers)
   const notModRes = await fetch(`${baseUrl}/api/download/velodeck-agent.apk`, {
     headers: { "If-None-Match": expectedEtag },
   });
   assert.equal(notModRes.status, 304);
   assert.equal(notModRes.headers.get("etag"), expectedEtag);
+  assert.equal(notModRes.headers.get("cache-control"), "no-store, no-cache, must-revalidate");
+  assert.equal(notModRes.headers.get("pragma"), "no-cache");
 });
 
 test("coturn.conf avoids CIDR/wildcard denied-peer-ip, redundant lt-cred-mech, and invalid no-loopback-peers", async () => {

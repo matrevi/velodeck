@@ -27,6 +27,7 @@ import { formatControlCode, type DeviceSummary } from "@velodeck/protocol";
 import {
   dismissIosPwaBanner,
   getAndroidApkDownloadUrl,
+  getAndroidApkFileName,
   shouldShowIosPwaBanner,
   type SavedAccountSession,
   type ServerInfo,
@@ -185,7 +186,8 @@ export function DashboardView({
     : "";
   const activeMode = clientState.serverMode ?? activeProfile?.mode ?? "relay";
   const hasActiveConnection = isAccountMode || Boolean(activeProfile);
-  const apkUrl = getAndroidApkDownloadUrl(apiBase);
+  const apkUrl = getAndroidApkDownloadUrl(apiBase, serverInfo);
+  const apkFileName = getAndroidApkFileName(serverInfo);
   const hasAndroidApk = serverInfo.hasAndroidApk;
   const apkSha256 = serverInfo.apkSha256;
   const onlineCount = clientState.devices.filter((d) => d.online).length;
@@ -415,7 +417,7 @@ export function DashboardView({
               {isAccountMode && hasAndroidApk && (
                 <a
                   href={apkUrl}
-                  download="velodeck-agent.apk"
+                  download={apkFileName}
                   className="btn-primary inline-flex h-10 items-center gap-1.5 rounded-lg px-4 text-xs font-medium"
                 >
                   <Download className="h-4 w-4" />
@@ -682,7 +684,7 @@ export function DashboardView({
               <div className="flex flex-wrap items-center gap-3">
                 <a
                   href={apkUrl}
-                  download="velodeck-agent.apk"
+                  download={apkFileName}
                   className="inline-flex items-center gap-1.5 font-medium text-[#2563EB] hover:underline"
                 >
                   <Download className="h-3.5 w-3.5" />

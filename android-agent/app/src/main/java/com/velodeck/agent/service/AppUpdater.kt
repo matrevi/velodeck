@@ -77,6 +77,8 @@ class AppUpdater(
             .url("$base/api/info")
             .get()
             .header("Accept", "application/json")
+            .header("Cache-Control", "no-cache, no-store")
+            .header("Pragma", "no-cache")
             .build()
 
         val call = checkHttpClient.newCall(request)
@@ -138,17 +140,18 @@ class AppUpdater(
         }
 
         val requestBuilder = Request.Builder()
-            .url("$base/api/download/velodeck-agent.apk")
+            .url(buildDownloadUrl(base, expectedSha256))
             .get()
             .header("Accept", MIME_APK)
+            .header("Cache-Control", "no-cache, no-store")
+            .header("Pragma", "no-cache")
 
         authToken?.trim()?.takeIf { it.isNotEmpty() }?.let { token ->
             requestBuilder.header("Authorization", "Bearer $token")
         }
 
         val otaDir = File(context.cacheDir, OTA_DIR_NAME).apply { mkdirs() }
-        val partFile = File(otaDir, SELF_UPDATE_PART_FILE_NAME)
-        val finalFile = File(otaDir, SELF_UPDATE_APK_FILE_NAME)
+        val partFile = File(otaDir, "$SELF_UPDATE_FILE_PREFIX-${System.currentTimeMillis()}.apk.part")
         deleteQuietly(partFile)
 
         val call = downloadHttpClient.newCall(requestBuilder.build())
@@ -248,7 +251,9 @@ class AppUpdater(
                     return@withContext Result.failure(IOException("安装包 SHA-256 校验失败"))
                 }
 
+                val finalFile = File(otaDir, selfUpdateApkFileName(actualSha256))
                 moveFileAtomically(partFile, finalFile)
+                pruneStaleSelfUpdateFiles(otaDir, keepFileName = finalFile.name)
                 val finalTotal = if (totalBytes > 0L) totalBytes else downloadedBytes
                 onProgress(DownloadProgress(downloadedBytes, finalTotal, 100))
                 Result.success(finalFile)
@@ -311,7 +316,11 @@ class AppUpdater(
             )
             val installIntent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, MIME_APK)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP,
+                )
             }
             context.startActivity(installIntent)
             InstallLaunchResult.LAUNCHED
@@ -359,8 +368,7 @@ class AppUpdater(
 
     companion object {
         private const val OTA_DIR_NAME = "ota"
-        private const val SELF_UPDATE_PART_FILE_NAME = "velodeck-self-update.apk.part"
-        private const val SELF_UPDATE_APK_FILE_NAME = "velodeck-self-update.apk"
+        private const val SELF_UPDATE_FILE_PREFIX = "velodeck-self-update"
         private const val MIME_APK = "application/vnd.android.package-archive"
         private const val IO_BUFFER_BYTES = 32 * 1024
         private const val PROGRESS_THROTTLE_MS = 120L
@@ -401,14 +409,74 @@ class AppUpdater(
             return totalBytes <= 0L || downloadedBytes == totalBytes
         }
 
+        private fun normalizeValidHex(raw: String?): String? {
+            val trimmed = raw?.trim()?.lowercase(Locale.US).orEmpty()
+            if (trimmed.length < 12) return null
+            for (ch in trimmed) {
+                val isHex = (ch in '0'..'9') || (ch in 'a'..'f')
+                if (!isHex) return null
+            }
+            return trimmed
+        }
+
+        fun selfUpdateApkFileName(
+            sha256: String?,
+            fallbackSuffix: String = System.currentTimeMillis().toString(),
+        ): String {
+            val hex = normalizeValidHex(sha256)
+            if (hex != null) {
+                return "$SELF_UPDATE_FILE_PREFIX-${hex.take(12)}.apk"
+            }
+            val safe = fallbackSuffix
+                .filter { ch ->
+                    ch in 'a'..'z' || ch in 'A'..'Z' || ch in '0'..'9' || ch == '_' || ch == '-'
+                }
+                .take(48)
+                .ifEmpty { "latest" }
+            return "$SELF_UPDATE_FILE_PREFIX-$safe.apk"
+        }
+
+        internal fun buildDownloadUrl(
+            apiBaseUrl: String,
+            expectedSha256: String?,
+            nowMs: Long = System.currentTimeMillis(),
+        ): String {
+            val base = normalizeBaseUrl(apiBaseUrl)
+            val cleanExpected = normalizeValidHex(expectedSha256)
+            val query = if (cleanExpected != null) {
+                "sha=${cleanExpected.take(12)}"
+            } else {
+                "t=$nowMs"
+            }
+            return "$base/api/download/velodeck-agent.apk?$query"
+        }
+
+        internal fun pruneStaleSelfUpdateFiles(otaDir: File, keepFileName: String) {
+            try {
+                otaDir.listFiles()?.forEach { file ->
+                    if (!file.isFile || file.name == keepFileName) return@forEach
+                    val isStaleApk = file.name.startsWith(SELF_UPDATE_FILE_PREFIX) && file.name.endsWith(".apk")
+                    val isStalePart = file.name.endsWith(".part")
+                    if (isStaleApk || isStalePart) {
+                        file.delete()
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
         /**
-         * Checks whether `cache/ota/velodeck-self-update.apk` already exists on disk, has valid
+         * Checks whether `cache/ota/velodeck-self-update-<sha12>.apk` already exists on disk, has valid
          * ZIP/APK magic bytes, and matches [expectedSha256]. Allows returning from Android 11+
          * unknown-sources permission process restarts to install immediately without re-downloading.
          */
-        fun findVerifiedCachedApk(context: Context, expectedSha256: String?): File? {
-            val cachedFile = File(File(context.cacheDir, OTA_DIR_NAME), SELF_UPDATE_APK_FILE_NAME)
-            return findVerifiedCachedApkFile(cachedFile, expectedSha256)
+        fun findVerifiedCachedApk(context: Context, expectedSha256: String?): File? =
+            findVerifiedCachedApkInDir(File(context.cacheDir, OTA_DIR_NAME), expectedSha256)
+
+        internal fun findVerifiedCachedApkInDir(otaDir: File, expectedSha256: String?): File? {
+            val validHex = normalizeValidHex(expectedSha256) ?: return null
+            val cachedFile = File(otaDir, selfUpdateApkFileName(validHex))
+            return findVerifiedCachedApkFile(cachedFile, validHex)
         }
 
         internal fun findVerifiedCachedApkFile(apkFile: File, expectedSha256: String?): File? {

@@ -142,8 +142,27 @@ export function buildApiUrl(apiBase: string, endpointPath: string): string {
   return `${normalizedBase}${normalizedPath}`;
 }
 
-export function getAndroidApkDownloadUrl(apiBase: string): string {
-  return buildApiUrl(apiBase, "/api/download/velodeck-agent.apk");
+export function getAndroidApkFileName(
+  serverInfo?: Pick<ServerInfo, "version"> | null,
+): string {
+  const cleanVersion = (serverInfo?.version ?? "")
+    .trim()
+    .replace(/^v+/i, "")
+    .replace(/[^0-9A-Za-z._-]/g, "");
+  return cleanVersion ? `velodeck-agent-v${cleanVersion}.apk` : "velodeck-agent.apk";
+}
+
+export function getAndroidApkDownloadUrl(
+  apiBase: string,
+  serverInfo?: Pick<ServerInfo, "version" | "apkSha256"> | null,
+): string {
+  const fileName = getAndroidApkFileName(serverInfo);
+  const baseUrl = buildApiUrl(apiBase, `/api/download/${fileName}`);
+  const sha = serverInfo?.apkSha256?.trim();
+  if (sha) {
+    return `${baseUrl}?sha=${encodeURIComponent(sha.slice(0, 12))}`;
+  }
+  return baseUrl;
 }
 
 function extractApiError(payload: unknown, fallback: string): string {
@@ -231,6 +250,7 @@ export async function fetchServerInfo(
   try {
     const res = await fetchImpl(buildApiUrl(apiBase, "/api/info"), {
       method: "GET",
+      cache: "no-store",
       headers: { Accept: "application/json" },
     });
     if (!res.ok) {

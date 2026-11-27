@@ -161,6 +161,15 @@ object FileTransferUtils {
         }
         return String(out)
     }
+
+    fun otaApkFileNameForSha256(sha256: String): String {
+        val trimmed = sha256.trim().lowercase()
+        val isValidHex = trimmed.length >= 12 && trimmed.all { ch ->
+            (ch in '0'..'9') || (ch in 'a'..'f')
+        }
+        val prefix = if (isValidHex) trimmed.take(12) else "latest"
+        return "velodeck-ota-$prefix.apk"
+    }
 }
 
 /**
@@ -455,7 +464,8 @@ class FileTransferManager(context: Context) {
             return
         }
 
-        val apkFile = File(File(appContext.cacheDir, OTA_DIR_NAME).apply { mkdirs() }, OTA_APK_FILE_NAME)
+        val otaDir = File(appContext.cacheDir, OTA_DIR_NAME).apply { mkdirs() }
+        val apkFile = File(otaDir, FileTransferUtils.otaApkFileNameForSha256(actualSha256))
         try {
             moveOrCopyOverwrite(transfer.tempFile, apkFile)
         } catch (t: Throwable) {
@@ -464,6 +474,8 @@ class FileTransferManager(context: Context) {
             sendError(reply, transfer.transferId, "准备安装包失败: ${t.message ?: t.javaClass.simpleName}")
             return
         }
+        pruneStaleOtaApks(otaDir, keepFileName = apkFile.name)
+        val savedPath = "cache/$OTA_DIR_NAME/${apkFile.name}"
 
         if (!PowerHelper.isScreenOn(appContext)) {
             PowerHelper.wakeScreen(appContext)
@@ -485,14 +497,18 @@ class FileTransferManager(context: Context) {
                 )
                 val installIntent = Intent(Intent.ACTION_VIEW).apply {
                     setDataAndType(apkUri, MIME_APK)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    )
                 }
                 startActivitySafely(installIntent)
                 Log.i(TAG, "Launched system APK installer for transferId=${transfer.transferId}")
                 sendDone(
                     reply = reply,
                     transferId = transfer.transferId,
-                    savedPath = OTA_APK_SAVED_PATH,
+                    savedPath = savedPath,
                     sha256 = actualSha256,
                     installLaunched = true,
                     needsInstallPermission = false,
@@ -526,7 +542,7 @@ class FileTransferManager(context: Context) {
             sendDone(
                 reply = reply,
                 transferId = transfer.transferId,
-                savedPath = OTA_APK_SAVED_PATH,
+                savedPath = savedPath,
                 sha256 = actualSha256,
                 installLaunched = false,
                 needsInstallPermission = true,
@@ -772,9 +788,23 @@ class FileTransferManager(context: Context) {
     companion object {
         private const val TAG = "FileTransferManager"
         private const val OTA_DIR_NAME = "ota"
-        private const val OTA_APK_FILE_NAME = "velodeck-update.apk"
-        private const val OTA_APK_SAVED_PATH = "cache/ota/velodeck-update.apk"
+        private const val OTA_APK_PREFIX = "velodeck-ota-"
+        private const val LEGACY_OTA_APK_FILE_NAME = "velodeck-update.apk"
         private const val MIME_APK = "application/vnd.android.package-archive"
         private const val IO_BUFFER_BYTES = 64 * 1024
+
+        internal fun pruneStaleOtaApks(otaDir: File, keepFileName: String) {
+            try {
+                otaDir.listFiles()?.forEach { file ->
+                    if (!file.isFile || file.name == keepFileName) return@forEach
+                    val isStaleOta = (file.name.startsWith(OTA_APK_PREFIX) && file.name.endsWith(".apk")) ||
+                        file.name == LEGACY_OTA_APK_FILE_NAME
+                    if (isStaleOta) {
+                        file.delete()
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
     }
 }

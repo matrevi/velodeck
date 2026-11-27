@@ -26,6 +26,7 @@ import {
   dismissIosPwaBanner,
   formatControlCode,
   getAndroidApkDownloadUrl,
+  getAndroidApkFileName,
   loginAccount,
   registerAccount,
   sanitizeControlCodeInput,
@@ -126,7 +127,8 @@ export function LaunchView({
       : null;
 
   const isCodeReady = codeDigits.length === 9 && codePassword.trim().length > 0;
-  const apkUrl = getAndroidApkDownloadUrl(apiBase);
+  const apkUrl = getAndroidApkDownloadUrl(apiBase, serverInfo);
+  const apkFileName = getAndroidApkFileName(serverInfo);
   const hasAndroidApk = serverInfo.hasAndroidApk;
   const apkSha256 = serverInfo.apkSha256;
 
@@ -934,7 +936,7 @@ export function LaunchView({
                         <div className="flex flex-wrap items-center gap-2">
                           <a
                             href={apkUrl}
-                            download="velodeck-agent.apk"
+                            download={apkFileName}
                             className="btn-outline inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium text-[#111318]"
                           >
                             <Download className="h-3.5 w-3.5 text-[#2563EB]" />

@@ -3,11 +3,13 @@ package com.velodeck.agent
 import com.velodeck.agent.service.AppUpdater
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.nio.file.Files
 import java.security.MessageDigest
 
 class AppUpdaterTest {
@@ -133,6 +135,125 @@ class AppUpdaterTest {
         } finally {
             validFile.delete()
             badMagicFile.delete()
+        }
+    }
+
+    @Test
+    fun selfUpdateApkFileName_producesUniqueShaBoundNamesAndSanitizesFallback() {
+        val sha1 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        val sha2 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+
+        val name1 = AppUpdater.selfUpdateApkFileName(sha1)
+        val name2 = AppUpdater.selfUpdateApkFileName(sha2)
+        assertEquals("velodeck-self-update-e3b0c44298fc.apk", name1)
+        assertEquals("velodeck-self-update-2cf24dba5fb0.apk", name2)
+        assertNotEquals(name1, name2)
+
+        // Uppercase + surrounding whitespace normalizes to lowercase 12-char prefix
+        assertEquals(name1, AppUpdater.selfUpdateApkFileName("  ${sha1.uppercase()}  "))
+        // Exact 12-char hex string is accepted
+        assertEquals("velodeck-self-update-abcdef012345.apk", AppUpdater.selfUpdateApkFileName("ABCDEF012345"))
+
+        // Short (<12), non-hex, null, or blank SHA falls back to sanitized fallbackSuffix
+        assertEquals(
+            "velodeck-self-update-fb_1-2.apk",
+            AppUpdater.selfUpdateApkFileName("abcdef01234", fallbackSuffix = "fb_1-2"),
+        )
+        assertEquals(
+            "velodeck-self-update-1700000000000.apk",
+            AppUpdater.selfUpdateApkFileName("not-valid-hex-abcdef123456", fallbackSuffix = "1700000000000"),
+        )
+        assertEquals(
+            "velodeck-self-update-badpath123.apk",
+            AppUpdater.selfUpdateApkFileName(null, fallbackSuffix = "../bad/path!@#123"),
+        )
+        assertEquals(
+            "velodeck-self-update-latest.apk",
+            AppUpdater.selfUpdateApkFileName("   ", fallbackSuffix = "../..///!@#"),
+        )
+        assertEquals(
+            "velodeck-self-update-latest.apk",
+            AppUpdater.selfUpdateApkFileName(null, fallbackSuffix = "   "),
+        )
+
+        // Default fallbackSuffix produces a numeric timestamp suffix
+        val defaultName = AppUpdater.selfUpdateApkFileName(null)
+        assertTrue(
+            "Unexpected default name: $defaultName",
+            Regex("^velodeck-self-update-[0-9]+\\.apk$").matches(defaultName),
+        )
+    }
+
+    @Test
+    fun buildDownloadUrl_appendsCacheBustingQuery() {
+        val sha = "ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        assertEquals(
+            "https://relay.example.com/api/download/velodeck-agent.apk?sha=abcdef012345",
+            AppUpdater.buildDownloadUrl("https://relay.example.com/", sha, nowMs = 999L),
+        )
+        assertEquals(
+            "https://relay.example.com/api/download/velodeck-agent.apk?t=1700000000123",
+            AppUpdater.buildDownloadUrl("https://relay.example.com", null, nowMs = 1700000000123L),
+        )
+        assertEquals(
+            "https://relay.example.com/api/download/velodeck-agent.apk?t=1700000000456",
+            AppUpdater.buildDownloadUrl("https://relay.example.com", "invalid-sha", nowMs = 1700000000456L),
+        )
+    }
+
+    @Test
+    fun findVerifiedCachedApkInDir_matchesOnlyUniqueShaFilenameAndRejectsInvalidSha() {
+        val otaDir = Files.createTempDirectory("velodeck-ota-cache-test").toFile()
+        try {
+            val apkV108 = byteArrayOf(0x50, 0x4B, 0x03, 0x04, 0x01, 0x00, 0x08, 0x00)
+            val shaV108 = sha256Hex(apkV108)
+            val apkV109 = byteArrayOf(0x50, 0x4B, 0x03, 0x04, 0x01, 0x00, 0x09, 0x00)
+            val shaV109 = sha256Hex(apkV109)
+
+            // Legacy static filename with v1.0.9 bytes must NOT be matched by SHA-named lookup
+            val legacyFile = File(otaDir, "velodeck-self-update.apk").apply { writeBytes(apkV109) }
+            assertNull(AppUpdater.findVerifiedCachedApkInDir(otaDir, shaV109))
+            legacyFile.delete()
+
+            // Unique SHA-named file for v1.0.8 matches v1.0.8 but NOT v1.0.9
+            val v108File = File(otaDir, AppUpdater.selfUpdateApkFileName(shaV108)).apply { writeBytes(apkV108) }
+            assertEquals(v108File, AppUpdater.findVerifiedCachedApkInDir(otaDir, shaV108))
+            assertEquals(v108File, AppUpdater.findVerifiedCachedApkInDir(otaDir, shaV108.uppercase()))
+            assertNull(AppUpdater.findVerifiedCachedApkInDir(otaDir, shaV109))
+
+            // Invalid/null/blank/short SHA returns null early
+            assertNull(AppUpdater.findVerifiedCachedApkInDir(otaDir, null))
+            assertNull(AppUpdater.findVerifiedCachedApkInDir(otaDir, "   "))
+            assertNull(AppUpdater.findVerifiedCachedApkInDir(otaDir, "shorthex"))
+            assertNull(AppUpdater.findVerifiedCachedApkInDir(otaDir, "not-valid-hex-0123456789ab"))
+        } finally {
+            otaDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun pruneStaleSelfUpdateFiles_removesLegacyAndOldApksAndPartsOnly() {
+        val otaDir = Files.createTempDirectory("velodeck-ota-prune-test").toFile()
+        try {
+            val currentApk = File(otaDir, "velodeck-self-update-111122223333.apk").apply { writeText("new") }
+            val oldShaApk = File(otaDir, "velodeck-self-update-aaaabbbbcccc.apk").apply { writeText("old") }
+            val legacyApk = File(otaDir, "velodeck-self-update.apk").apply { writeText("legacy") }
+            val stalePart = File(otaDir, "velodeck-self-update-1700000000000.apk.part").apply { writeText("part") }
+            val legacyPart = File(otaDir, "velodeck-self-update.apk.part").apply { writeText("part2") }
+            val p2pOtaApk = File(otaDir, "velodeck-ota-dddddddddddd.apk").apply { writeText("p2p") }
+            val incomingTmp = File(otaDir, "incoming_t1.tmp").apply { writeText("tmp") }
+
+            AppUpdater.pruneStaleSelfUpdateFiles(otaDir, keepFileName = currentApk.name)
+
+            assertTrue(currentApk.exists())
+            assertFalse(oldShaApk.exists())
+            assertFalse(legacyApk.exists())
+            assertFalse(stalePart.exists())
+            assertFalse(legacyPart.exists())
+            assertTrue(p2pOtaApk.exists())
+            assertTrue(incomingTmp.exists())
+        } finally {
+            otaDir.deleteRecursively()
         }
     }
 

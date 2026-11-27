@@ -5,13 +5,17 @@ import com.velodeck.agent.protocol.DeviceSummary
 import com.velodeck.agent.protocol.PartialDeviceCapabilities
 import com.velodeck.agent.protocol.ProtocolCodec
 import com.velodeck.agent.protocol.WireMessage
+import com.velodeck.agent.transfer.FileTransferManager
 import com.velodeck.agent.transfer.FileTransferUtils
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.nio.file.Files
 import java.security.MessageDigest
 
 class FileTransferLogicTest {
@@ -247,5 +251,45 @@ class FileTransferLogicTest {
         assertFalse(telemetryWithoutJson.contains("p2pFileTransfer"))
         val decodedWithout = ProtocolCodec.parse(telemetryWithoutJson) as WireMessage.AgentTelemetry
         assertNull(decodedWithout.capabilities?.p2pFileTransfer)
+    }
+
+    @Test
+    fun otaApkFileNameForSha256_producesUniqueLowercaseHexNamesWithLatestFallback() {
+        val sha1 = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+        val sha2 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+
+        val file1 = FileTransferUtils.otaApkFileNameForSha256("  $sha1  ")
+        val file2 = FileTransferUtils.otaApkFileNameForSha256(sha2)
+        assertEquals("velodeck-ota-e3b0c44298fc.apk", file1)
+        assertEquals("velodeck-ota-2cf24dba5fb0.apk", file2)
+        assertNotEquals(file1, file2)
+
+        assertEquals("velodeck-ota-abcdef012345.apk", FileTransferUtils.otaApkFileNameForSha256("ABCDEF012345"))
+        assertEquals("velodeck-ota-latest.apk", FileTransferUtils.otaApkFileNameForSha256(""))
+        assertEquals("velodeck-ota-latest.apk", FileTransferUtils.otaApkFileNameForSha256("   "))
+        assertEquals("velodeck-ota-latest.apk", FileTransferUtils.otaApkFileNameForSha256("abcdef01234"))
+        assertEquals("velodeck-ota-latest.apk", FileTransferUtils.otaApkFileNameForSha256("zzzzzzzzzzzzzzzz"))
+    }
+
+    @Test
+    fun pruneStaleOtaApks_removesOldOtaAndLegacyFilesWhilePreservingCurrentAndUnrelated() {
+        val otaDir = Files.createTempDirectory("velodeck-p2p-ota-prune").toFile()
+        try {
+            val currentOta = File(otaDir, "velodeck-ota-2cf24dba5fb0.apk").apply { writeText("new") }
+            val oldOta = File(otaDir, "velodeck-ota-e3b0c44298fc.apk").apply { writeText("old") }
+            val legacyOta = File(otaDir, "velodeck-update.apk").apply { writeText("legacy") }
+            val selfUpdateApk = File(otaDir, "velodeck-self-update-111122223333.apk").apply { writeText("self") }
+            val incomingTmp = File(otaDir, "incoming_abc.tmp").apply { writeText("tmp") }
+
+            FileTransferManager.pruneStaleOtaApks(otaDir, keepFileName = currentOta.name)
+
+            assertTrue(currentOta.exists())
+            assertFalse(oldOta.exists())
+            assertFalse(legacyOta.exists())
+            assertTrue(selfUpdateApk.exists())
+            assertTrue(incomingTmp.exists())
+        } finally {
+            otaDir.deleteRecursively()
+        }
     }
 }
