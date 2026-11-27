@@ -1,6 +1,6 @@
 {
   "name": "velodeck-monorepo",
-  "version": "1.0.0",
+  "version": "1.0.9",
   "private": true,
   "packageManager": "pnpm@11.22.0",
   "scripts": {

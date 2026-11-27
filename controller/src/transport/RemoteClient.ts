@@ -1096,7 +1096,7 @@ export class RemoteClient {
     const fileDc = this.fileDataChannel;
     if (!fileDc || fileDc.readyState !== "open") {
       const msg =
-        "WebRTC P2P 文件通道未就绪（请确保处于 WebRTC 模式且手机端已升级至 v0.2.16+）";
+        "WebRTC P2P 文件通道未就绪（请确保处于 WebRTC 模式且手机端已升级至最新版 Agent）";
       this.setState({
         fileTransfer: {
           transferId: null,
@@ -1261,7 +1261,7 @@ export class RemoteClient {
     if (active.errorMessage) return finishError(active.errorMessage);
     if (acceptOutcome === "timeout") {
       this.trySendFileCancel(fileDc, transferId, "accept_timeout");
-      return finishError("等待手机端确认超时（请确认手机端已升级至 v0.2.16+）");
+      return finishError("等待手机端确认超时（请确认手机端已升级至最新版 Agent）");
     }
     if (acceptOutcome !== "accepted") {
       return finishError("WebRTC 连接已断开");

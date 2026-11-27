@@ -2160,15 +2160,15 @@ const FileTransferSheetContent = memo(function FileTransferSheetContent({
             <div className="space-y-1 leading-relaxed">
               {clientState.activeTransport !== "webrtc" ? (
                 <p>
-                  当前为 WS 帧流通道，P2P 文件直传需切换至 WebRTC 模式且手机端版本 ≥ v0.2.16。
+                  当前为 WS 帧流通道，P2P 文件直传需切换至 WebRTC 模式并确保手机端为最新版 Agent。
                 </p>
               ) : !isP2pSupported ? (
                 <p>
-                  手机端 Agent 版本较旧，暂不支持 P2P 文件通道。请先一次性升级至 v0.2.16+，之后即可全程远程一键推送升级。
+                  手机端 Agent 版本较旧，暂不支持 P2P 文件通道。请先一次性升级至最新版，之后即可全程远程一键推送升级。
                 </p>
               ) : (
                 <p>
-                  WebRTC 文件通道尚未就绪。请等待 WebRTC 连通，或确认手机端已升级至 v0.2.16+。
+                  WebRTC 文件通道尚未就绪。请等待 WebRTC 连通，或确认手机端已升级至最新版 Agent。
                 </p>
               )}
             </div>
