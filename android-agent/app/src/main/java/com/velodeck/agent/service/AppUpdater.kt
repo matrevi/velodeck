@@ -9,12 +9,14 @@ import androidx.core.content.FileProvider
 import com.velodeck.agent.BuildConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.net.ConnectException
@@ -77,8 +79,14 @@ class AppUpdater(
             .header("Accept", "application/json")
             .build()
 
+        val call = checkHttpClient.newCall(request)
+        val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { cause ->
+            if (cause != null) {
+                call.cancel()
+            }
+        }
         try {
-            checkHttpClient.newCall(request).execute().use { response ->
+            call.execute().use { response ->
                 val rawBody = response.body?.string().orEmpty()
                 parseRemoteUpdateInfo(response.code, rawBody).map { info ->
                     val remoteVersion = info.version.takeIf { it.isNotBlank() }
@@ -98,15 +106,22 @@ class AppUpdater(
         } catch (ce: CancellationException) {
             throw ce
         } catch (_: SocketTimeoutException) {
+            coroutineContext.ensureActive()
             Result.failure(IOException("检查更新超时，请检查网络连接"))
         } catch (_: UnknownHostException) {
+            coroutineContext.ensureActive()
             Result.failure(IOException("无法解析服务器地址，请检查网络或中继设置"))
         } catch (_: ConnectException) {
+            coroutineContext.ensureActive()
             Result.failure(IOException("无法连接到服务器 ($base)"))
         } catch (e: IOException) {
+            coroutineContext.ensureActive()
             Result.failure(IOException("检查更新失败：${e.message ?: "网络异常"}"))
         } catch (t: Throwable) {
+            coroutineContext.ensureActive()
             Result.failure(IllegalStateException("检查更新异常：${t.message ?: "未知错误"}"))
+        } finally {
+            cancelHandle?.dispose()
         }
     }
 
@@ -136,8 +151,14 @@ class AppUpdater(
         val finalFile = File(otaDir, SELF_UPDATE_APK_FILE_NAME)
         deleteQuietly(partFile)
 
+        val call = downloadHttpClient.newCall(requestBuilder.build())
+        val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { cause ->
+            if (cause != null) {
+                call.cancel()
+            }
+        }
         try {
-            downloadHttpClient.newCall(requestBuilder.build()).execute().use { response ->
+            call.execute().use { response ->
                 when (response.code) {
                     in 200..299 -> Unit
                     401, 403 -> return@withContext Result.failure(
@@ -160,6 +181,8 @@ class AppUpdater(
 
                 val digest = MessageDigest.getInstance("SHA-256")
                 val buffer = ByteArray(IO_BUFFER_BYTES)
+                val headerMagic = ByteArray(APK_ZIP_MAGIC.size)
+                var headerRead = 0
                 var downloadedBytes = 0L
                 var lastEmitMs = 0L
                 var lastEmitPercent = -1
@@ -173,6 +196,12 @@ class AppUpdater(
                             val read = input.read(buffer)
                             if (read == -1) break
                             if (read == 0) continue
+
+                            if (headerRead < headerMagic.size) {
+                                val toCopy = minOf(read, headerMagic.size - headerRead)
+                                System.arraycopy(buffer, 0, headerMagic, headerRead, toCopy)
+                                headerRead += toCopy
+                            }
 
                             output.write(buffer, 0, read)
                             digest.update(buffer, 0, read)
@@ -201,6 +230,18 @@ class AppUpdater(
                     return@withContext Result.failure(IOException("下载的安装包为空"))
                 }
 
+                if (!isCompleteDownload(downloadedBytes, totalBytes)) {
+                    deleteQuietly(partFile)
+                    return@withContext Result.failure(
+                        IOException("安装包下载不完整 ($downloadedBytes / $totalBytes 字节)"),
+                    )
+                }
+
+                if (!hasValidApkZipMagic(headerMagic, headerRead)) {
+                    deleteQuietly(partFile)
+                    return@withContext Result.failure(IOException("下载的文件不是有效的 Android 安装包 (APK)"))
+                }
+
                 val actualSha256 = digest.digest().joinToString("") { "%02x".format(it) }
                 if (targetSha256 != null && !actualSha256.equals(targetSha256, ignoreCase = true)) {
                     deleteQuietly(partFile)
@@ -217,19 +258,26 @@ class AppUpdater(
             throw ce
         } catch (_: SocketTimeoutException) {
             deleteQuietly(partFile)
+            coroutineContext.ensureActive()
             Result.failure(IOException("下载超时，请稍后重试"))
         } catch (_: UnknownHostException) {
             deleteQuietly(partFile)
+            coroutineContext.ensureActive()
             Result.failure(IOException("无法解析服务器地址，请检查网络"))
         } catch (_: ConnectException) {
             deleteQuietly(partFile)
+            coroutineContext.ensureActive()
             Result.failure(IOException("无法连接到服务器 ($base)"))
         } catch (e: IOException) {
             deleteQuietly(partFile)
+            coroutineContext.ensureActive()
             Result.failure(IOException(e.message ?: "下载安装包失败"))
         } catch (t: Throwable) {
             deleteQuietly(partFile)
+            coroutineContext.ensureActive()
             Result.failure(IllegalStateException("下载异常：${t.message ?: "未知错误"}"))
+        } finally {
+            cancelHandle?.dispose()
         }
     }
 
@@ -316,19 +364,81 @@ class AppUpdater(
         private const val MIME_APK = "application/vnd.android.package-archive"
         private const val IO_BUFFER_BYTES = 32 * 1024
         private const val PROGRESS_THROTTLE_MS = 120L
+        private val APK_ZIP_MAGIC = byteArrayOf(0x50, 0x4B, 0x03, 0x04)
 
-        private fun defaultCheckHttpClient(): OkHttpClient = OkHttpClient.Builder()
+        // Share a single companion OkHttpClient (dispatcher + connection pool) across Activity instances
+        private val baseHttpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(15, TimeUnit.SECONDS)
+                .writeTimeout(15, TimeUnit.SECONDS)
+                .build()
+        }
+
+        private fun defaultCheckHttpClient(): OkHttpClient = baseHttpClient.newBuilder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
             .build()
 
-        private fun defaultDownloadHttpClient(): OkHttpClient = OkHttpClient.Builder()
+        private fun defaultDownloadHttpClient(): OkHttpClient = baseHttpClient.newBuilder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
             .followRedirects(true)
             .build()
+
+        internal fun hasValidApkZipMagic(bytes: ByteArray, length: Int = bytes.size): Boolean {
+            if (length < APK_ZIP_MAGIC.size || bytes.size < APK_ZIP_MAGIC.size) return false
+            for (i in APK_ZIP_MAGIC.indices) {
+                if (bytes[i] != APK_ZIP_MAGIC[i]) return false
+            }
+            return true
+        }
+
+        internal fun isCompleteDownload(downloadedBytes: Long, totalBytes: Long): Boolean {
+            if (downloadedBytes <= 0L) return false
+            return totalBytes <= 0L || downloadedBytes == totalBytes
+        }
+
+        /**
+         * Checks whether `cache/ota/velodeck-self-update.apk` already exists on disk, has valid
+         * ZIP/APK magic bytes, and matches [expectedSha256]. Allows returning from Android 11+
+         * unknown-sources permission process restarts to install immediately without re-downloading.
+         */
+        fun findVerifiedCachedApk(context: Context, expectedSha256: String?): File? {
+            val cachedFile = File(File(context.cacheDir, OTA_DIR_NAME), SELF_UPDATE_APK_FILE_NAME)
+            return findVerifiedCachedApkFile(cachedFile, expectedSha256)
+        }
+
+        internal fun findVerifiedCachedApkFile(apkFile: File, expectedSha256: String?): File? {
+            val targetSha256 = expectedSha256?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            if (!apkFile.isFile || apkFile.length() < APK_ZIP_MAGIC.size.toLong()) return null
+            return try {
+                val digest = MessageDigest.getInstance("SHA-256")
+                val buffer = ByteArray(IO_BUFFER_BYTES)
+                val headerMagic = ByteArray(APK_ZIP_MAGIC.size)
+                var headerRead = 0
+                FileInputStream(apkFile).use { input ->
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        if (read == 0) continue
+                        if (headerRead < headerMagic.size) {
+                            val toCopy = minOf(read, headerMagic.size - headerRead)
+                            System.arraycopy(buffer, 0, headerMagic, headerRead, toCopy)
+                            headerRead += toCopy
+                        }
+                        digest.update(buffer, 0, read)
+                    }
+                }
+                if (!hasValidApkZipMagic(headerMagic, headerRead)) return null
+                val actualSha256 = digest.digest().joinToString("") { "%02x".format(it) }
+                if (actualSha256.equals(targetSha256, ignoreCase = true)) apkFile else null
+            } catch (_: Throwable) {
+                null
+            }
+        }
 
         fun normalizeBaseUrl(apiBaseUrl: String): String =
             apiBaseUrl.trim().trimEnd('/')

@@ -28,9 +28,26 @@ export function isWeakTurnSecret(secret: string): boolean {
   return WEAK_TURN_SECRETS.has(normalized);
 }
 
+function orderTurnUrls(urls: readonly string[]): string[] {
+  const rank = (url: string): number => {
+    const lower = url.toLowerCase();
+    if (lower.includes("transport=udp")) return 0;
+    if (lower.startsWith("turn:") && !lower.includes("transport=tcp")) return 1;
+    if (lower.includes("transport=tcp")) return 2;
+    if (lower.startsWith("turns:")) return 3;
+    return 4;
+  };
+  return [...urls]
+    .map((url, idx) => ({ url, idx, rank: rank(url) }))
+    .sort((a, b) => a.rank - b.rank || a.idx - b.idx)
+    .map((item) => item.url);
+}
+
 /**
  * Builds WebRTC ICE server entries for a client.
  * - Always includes configured STUN URLs (if any).
+ * - Emits each TURN URL as its own ordered entry (UDP first, then TCP/TLS)
+ *   for deterministic cross-browser relay priority.
  * - If TURN_URLS and TURN_SECRET are configured, generates ephemeral coturn
  *   REST HMAC-SHA1 credentials (draft-uberti-behave-turn-rest-00).
  * - Refuses to mint TURN credentials if TURN_SECRET is a known weak placeholder.
@@ -50,6 +67,7 @@ export function buildIceServers(
   }
 
   if (config.turnUrls.length > 0) {
+    const orderedTurnUrls = orderTurnUrls(config.turnUrls);
     if (config.turnSecret) {
       if (isWeakTurnSecret(config.turnSecret)) {
         console.warn(
@@ -64,18 +82,22 @@ export function buildIceServers(
           .update(username, "utf8")
           .digest("base64");
 
-        iceServers.push({
-          urls: [...config.turnUrls],
-          username,
-          credential,
-        });
+        for (const url of orderedTurnUrls) {
+          iceServers.push({
+            urls: [url],
+            username,
+            credential,
+          });
+        }
       }
     } else if (config.turnUsername && config.turnPassword) {
-      iceServers.push({
-        urls: [...config.turnUrls],
-        username: config.turnUsername,
-        credential: config.turnPassword,
-      });
+      for (const url of orderedTurnUrls) {
+        iceServers.push({
+          urls: [url],
+          username: config.turnUsername,
+          credential: config.turnPassword,
+        });
+      }
     }
   }
 

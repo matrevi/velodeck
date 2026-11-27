@@ -45,6 +45,8 @@ import java.io.IOException
 import java.net.URI
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.seconds
@@ -142,6 +144,10 @@ class DirectServer(
 ) {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val lifecycleExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "VeloDeck-DirectServer-Lifecycle").apply { isDaemon = true }
+    }
+    private val isShutdown = AtomicBoolean(false)
     private val rateLimiter = DirectAuthRateLimiter()
 
     private var server: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
@@ -229,10 +235,22 @@ class DirectServer(
     }
 
     fun start(port: Int) {
-        if (server != null && currentPort == port && _runningFlow.value) return
-        stop()
-
+        if (isShutdown.get()) return
         val safePort = port.coerceIn(1024, 65535)
+        try {
+            lifecycleExecutor.execute {
+                startServerLocked(safePort)
+            }
+        } catch (_: RejectedExecutionException) {
+        }
+    }
+
+    private fun startServerLocked(safePort: Int) {
+        if (isShutdown.get()) return
+        if (server != null && currentPort == safePort && _runningFlow.value) return
+        stopServerLocked("server_rebind")
+        if (isShutdown.get()) return
+
         try {
             val engine = embeddedServer(CIO, host = "0.0.0.0", port = safePort) {
                 install(WebSockets) {
@@ -303,6 +321,14 @@ class DirectServer(
             }
 
             engine.start(wait = false)
+            if (isShutdown.get()) {
+                try {
+                    engine.stop(gracePeriodMillis = 200L, timeoutMillis = 1_000L)
+                } catch (_: Throwable) {
+                }
+                _runningFlow.value = false
+                return
+            }
             server = engine
             currentPort = safePort
             _runningFlow.value = true
@@ -330,17 +356,25 @@ class DirectServer(
     }
 
     fun stop() {
-        revokeAllClients("server_stopped")
+        if (isShutdown.get()) return
+        try {
+            lifecycleExecutor.execute {
+                stopServerLocked("server_stopped")
+            }
+        } catch (_: RejectedExecutionException) {
+        }
+    }
+
+    private fun stopServerLocked(reason: String) {
+        revokeAllClients(reason)
         val s = server
         server = null
         currentPort = -1
         _runningFlow.value = false
         if (s != null) {
-            scope.launch(Dispatchers.IO) {
-                try {
-                    s.stop(gracePeriodMillis = 200L, timeoutMillis = 1_000L)
-                } catch (_: Throwable) {
-                }
+            try {
+                s.stop(gracePeriodMillis = 200L, timeoutMillis = 1_000L)
+            } catch (_: Throwable) {
             }
         }
     }
@@ -356,22 +390,16 @@ class DirectServer(
     }
 
     fun shutdown() {
+        if (!isShutdown.compareAndSet(false, true)) return
         revokeAllClients("server_shutdown")
-        val s = server
-        server = null
-        currentPort = -1
-        _runningFlow.value = false
-        scope.cancel()
-        if (s != null) {
-            // Run on Dispatchers.IO outside the cancelled scope so shutdown never blocks Main
-            // and never leaves the listening socket bound.
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    s.stop(gracePeriodMillis = 200L, timeoutMillis = 1_000L)
-                } catch (_: Throwable) {
-                }
+        try {
+            lifecycleExecutor.execute {
+                stopServerLocked("server_shutdown")
             }
+        } catch (_: RejectedExecutionException) {
         }
+        lifecycleExecutor.shutdown()
+        scope.cancel()
     }
 
     private suspend fun handleDirectWebSocket(ws: DefaultWebSocketServerSession) {

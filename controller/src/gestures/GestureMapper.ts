@@ -38,6 +38,7 @@ export interface GestureRecognizerOptions {
   tapMaxMs?: number;
   longPressMs?: number;
   quickFlickMaxMs?: number;
+  continuousDisplacementPx?: number;
   moveThrottleMs?: number;
   pinchMinDelta?: number;
   dragMode?: GestureDragMode;
@@ -170,6 +171,7 @@ export class GestureRecognizer {
   private readonly moveThresholdPx: number;
   private readonly longPressMs: number;
   private readonly quickFlickMaxMs: number;
+  private readonly continuousDisplacementPx: number;
   private readonly moveThrottleMs: number;
   private readonly pinchMinDelta: number;
   private readonly dragMode: GestureDragMode;
@@ -184,10 +186,11 @@ export class GestureRecognizer {
 
   constructor(options: GestureRecognizerOptions) {
     this.onCommand = options.onCommand;
-    this.moveThresholdPx = options.moveThresholdPx ?? 12;
+    this.moveThresholdPx = options.moveThresholdPx ?? 6;
     this.longPressMs = options.longPressMs ?? 450;
-    this.quickFlickMaxMs = options.quickFlickMaxMs ?? 115;
-    this.moveThrottleMs = options.moveThrottleMs ?? 20;
+    this.quickFlickMaxMs = options.quickFlickMaxMs ?? 45;
+    this.continuousDisplacementPx = options.continuousDisplacementPx ?? 28;
+    this.moveThrottleMs = options.moveThrottleMs ?? 14;
     this.pinchMinDelta = options.pinchMinDelta ?? 0.015;
     this.dragMode = options.dragMode ?? "auto";
   }
@@ -288,7 +291,9 @@ export class GestureRecognizer {
     }
 
     const shouldUseContinuous =
-      this.dragMode === "continuous" || elapsed > this.quickFlickMaxMs;
+      this.dragMode === "continuous" ||
+      elapsed > this.quickFlickMaxMs ||
+      displacement > this.continuousDisplacementPx;
 
     if (shouldUseContinuous) {
       if (!pointer.continuousStarted) {
@@ -296,28 +301,13 @@ export class GestureRecognizer {
         pointer.lastMoveSentAt = now;
         this.clearTrailingMoveTimer();
 
-        // Smooth transition from quick-flick window into live continuous drag:
-        // cap the initial touch_down -> touch_move jump distance so Android never
-        // experiences a giant initial teleport spike after quickFlickMaxMs elapses.
-        let downX = pointer.startNorm.x;
-        let downY = pointer.startNorm.y;
-        if (this.dragMode === "auto") {
-          const dx = norm.x - pointer.startNorm.x;
-          const dy = norm.y - pointer.startNorm.y;
-          const normDist = Math.hypot(dx, dy);
-          const maxInitialStep = 0.06;
-          if (normDist > maxInitialStep) {
-            const ratio = maxInitialStep / normDist;
-            downX = roundNorm(norm.x - dx * ratio);
-            downY = roundNorm(norm.y - dy * ratio);
-          }
-        }
-
+        // Start live drag at the actual pointer-down coordinates and immediately move
+        // to the current position so on-screen content tracks 1:1 with zero dead offset.
         this.onCommand({
           action: "touch_down",
           pointerId: pointer.pointerId,
-          x: downX,
-          y: downY,
+          x: pointer.startNorm.x,
+          y: pointer.startNorm.y,
         });
         pointer.lastSentNorm = norm;
         this.onCommand({

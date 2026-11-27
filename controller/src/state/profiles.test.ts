@@ -6,6 +6,7 @@ import {
   assessQuickConnectSecurity,
   deleteProfile,
   detectDefaultWsUrl,
+  getOrCreateClientId,
   importQuickConnectProfile,
   isAllowedDirectUrl,
   isPrivateHost,
@@ -351,5 +352,54 @@ describe("profile CRUD and quick-connect upsert", () => {
 
     const afterDelete = deleteProfile(updated.profiles, created.saved.id);
     expect(afterDelete).toEqual([]);
+  });
+
+  it("persists per-tab clientId in sessionStorage (not localStorage) to prevent multi-tab kick storms", () => {
+    const makeStore = () => {
+      const data = new Map<string, string>();
+      return {
+        getItem: (k: string) => data.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          data.set(k, v);
+        },
+        removeItem: (k: string) => {
+          data.delete(k);
+        },
+        clear: () => {
+          data.clear();
+        },
+        key: (index: number) => Array.from(data.keys())[index] ?? null,
+        get length() {
+          return data.size;
+        },
+      } as Storage;
+    };
+
+    const sessionStore = makeStore();
+    const localStore = makeStore();
+    localStore.setItem(CLIENT_ID_STORAGE_KEY, "ctrl-from-local");
+
+    vi.stubGlobal("window", {
+      sessionStorage: sessionStore,
+      localStorage: localStore,
+    });
+    try {
+      const id1 = getOrCreateClientId();
+      const id2 = getOrCreateClientId();
+      expect(id1).toMatch(/^ctrl-/);
+      expect(id1).toBe(id2);
+      expect(id1).not.toBe("ctrl-from-local");
+      expect(sessionStore.getItem(CLIENT_ID_STORAGE_KEY)).toBe(id1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    // Explicit storage arg continues to work in isolation
+    const customTabA = makeStore();
+    const customTabB = makeStore();
+    const tabAId = getOrCreateClientId(customTabA);
+    const tabBId = getOrCreateClientId(customTabB);
+    expect(tabAId).not.toBe(tabBId);
+    expect(getOrCreateClientId(customTabA)).toBe(tabAId);
   });
 });

@@ -72,6 +72,8 @@ class VeloDeckAccessibilityService : AccessibilityService() {
     private val lastAutoClickMs = AtomicLong(0L)
     private val clipboardOpSeq = AtomicLong(0L)
     private var blackCurtainView: View? = null
+    private var lastAppliedOverlayMode: DisplayOverlayMode? = null
+    private var lastAppliedForcePortrait: Boolean? = null
     private var blackCurtainTapCount = 0
     private var blackCurtainLastTapMs = 0L
     private var blackCurtainEmergencyDismiss: (() -> Unit)? = null
@@ -109,6 +111,8 @@ class VeloDeckAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         hideBlackCurtain()
+        lastAppliedOverlayMode = null
+        lastAppliedForcePortrait = null
         liveStrokeReleaseJob?.cancel()
         liveStrokeReleaseJob = null
         liveStroke = null
@@ -156,73 +160,101 @@ class VeloDeckAccessibilityService : AccessibilityService() {
         val runUpdate: () -> Boolean = {
             try {
                 blackCurtainEmergencyDismiss = onEmergencyDismiss
-                val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-                val keepAwake = shouldKeepScreenOn(mode)
-                var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                if (keepAwake) {
-                    flags = flags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-                }
-                val touchPassthrough = mode != DisplayOverlayMode.PURE_BLACK_IDLE
-                if (touchPassthrough) {
-                    flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                }
-                val size = overlayDimensionForMode(mode)
-                val lp = WindowManager.LayoutParams(
-                    size,
-                    size,
-                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                    flags,
-                    PixelFormat.TRANSLUCENT,
-                ).apply {
-                    gravity = Gravity.TOP or Gravity.START
-                    screenOrientation = overlayScreenOrientation(forcePortrait)
-                    screenBrightness = when (mode) {
-                        DisplayOverlayMode.KEEP_AWAKE_ONLY -> WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
-                        DisplayOverlayMode.STEALTH_DIM -> 0.001f
-                        DisplayOverlayMode.PURE_BLACK_IDLE -> 0.001f
-                        DisplayOverlayMode.OFF -> WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
-                    }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        layoutInDisplayCutoutMode =
-                            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                    }
-                }
-
-                val bgColor = if (mode == DisplayOverlayMode.PURE_BLACK_IDLE) {
-                    Color.BLACK
-                } else {
-                    Color.TRANSPARENT
-                }
                 val existing = blackCurtainView
-                if (existing != null && existing.isAttachedToWindow) {
-                    existing.keepScreenOn = keepAwake
-                    existing.setBackgroundColor(bgColor)
-                    existing.invalidate()
-                    wm.updateViewLayout(existing, lp)
+                if (isOverlayStateUnchanged(
+                        hasAttachedOverlay = existing != null,
+                        lastMode = lastAppliedOverlayMode,
+                        lastForcePortrait = lastAppliedForcePortrait,
+                        nextMode = mode,
+                        nextForcePortrait = forcePortrait,
+                    )
+                ) {
+                    true
                 } else {
-                    val v = View(this).apply {
-                        setBackgroundColor(bgColor)
-                        keepScreenOn = keepAwake
-                        setOnClickListener {
-                            val now = SystemClock.elapsedRealtime()
-                            if (now - blackCurtainLastTapMs < 1_500L) {
-                                blackCurtainTapCount += 1
-                            } else {
-                                blackCurtainTapCount = 1
-                            }
-                            blackCurtainLastTapMs = now
-                            if (blackCurtainTapCount >= 5) {
-                                blackCurtainTapCount = 0
-                                blackCurtainEmergencyDismiss?.invoke()
-                            }
+                    val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                    val keepAwake = shouldKeepScreenOn(mode)
+                    var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                    if (keepAwake) {
+                        flags = flags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    }
+                    val touchPassthrough = mode != DisplayOverlayMode.PURE_BLACK_IDLE
+                    if (touchPassthrough) {
+                        flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    }
+                    val size = overlayDimensionForMode(mode)
+                    val lp = WindowManager.LayoutParams(
+                        size,
+                        size,
+                        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                        flags,
+                        PixelFormat.TRANSLUCENT,
+                    ).apply {
+                        gravity = Gravity.TOP or Gravity.START
+                        screenOrientation = overlayScreenOrientation(forcePortrait)
+                        screenBrightness = when (mode) {
+                            DisplayOverlayMode.KEEP_AWAKE_ONLY -> WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                            DisplayOverlayMode.STEALTH_DIM -> 0.001f
+                            DisplayOverlayMode.PURE_BLACK_IDLE -> 0.001f
+                            DisplayOverlayMode.OFF -> WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            layoutInDisplayCutoutMode =
+                                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
                         }
                     }
-                    wm.addView(v, lp)
-                    blackCurtainView = v
+
+                    val bgColor = if (mode == DisplayOverlayMode.PURE_BLACK_IDLE) {
+                        Color.BLACK
+                    } else {
+                        Color.TRANSPARENT
+                    }
+
+                    var updatedExisting = false
+                    if (existing != null) {
+                        existing.keepScreenOn = keepAwake
+                        existing.setBackgroundColor(bgColor)
+                        existing.invalidate()
+                        try {
+                            wm.updateViewLayout(existing, lp)
+                            updatedExisting = true
+                        } catch (_: IllegalArgumentException) {
+                            try {
+                                wm.removeViewImmediate(existing)
+                            } catch (_: Throwable) {
+                            }
+                            blackCurtainView = null
+                            lastAppliedOverlayMode = null
+                            lastAppliedForcePortrait = null
+                        }
+                    }
+
+                    if (!updatedExisting) {
+                        val v = View(this).apply {
+                            setBackgroundColor(bgColor)
+                            keepScreenOn = keepAwake
+                            setOnClickListener {
+                                val now = SystemClock.elapsedRealtime()
+                                if (now - blackCurtainLastTapMs < 1_500L) {
+                                    blackCurtainTapCount += 1
+                                } else {
+                                    blackCurtainTapCount = 1
+                                }
+                                blackCurtainLastTapMs = now
+                                if (blackCurtainTapCount >= 5) {
+                                    blackCurtainTapCount = 0
+                                    blackCurtainEmergencyDismiss?.invoke()
+                                }
+                            }
+                        }
+                        wm.addView(v, lp)
+                        blackCurtainView = v
+                    }
+                    lastAppliedOverlayMode = mode
+                    lastAppliedForcePortrait = forcePortrait
+                    true
                 }
-                true
             } catch (t: Throwable) {
                 Log.w(TAG, "Failed to update accessibility display overlay (mode=$mode, forcePortrait=$forcePortrait)", t)
                 false
@@ -246,14 +278,14 @@ class VeloDeckAccessibilityService : AccessibilityService() {
         val runRemove = {
             val view = blackCurtainView
             blackCurtainView = null
+            lastAppliedOverlayMode = null
+            lastAppliedForcePortrait = null
             blackCurtainTapCount = 0
             blackCurtainEmergencyDismiss = null
             if (view != null) {
                 try {
                     val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-                    if (view.isAttachedToWindow) {
-                        wm.removeViewImmediate(view)
-                    }
+                    wm.removeViewImmediate(view)
                 } catch (_: Throwable) {
                 }
             }
@@ -377,7 +409,11 @@ class VeloDeckAccessibilityService : AccessibilityService() {
         }
     }
 
-    suspend fun executeCommand(command: ControlCommand, configuredPin: String? = null): Pair<Boolean, String?> {
+    suspend fun executeCommand(
+        command: ControlCommand,
+        configuredPin: String? = null,
+        eventUptimeMs: Long = SystemClock.uptimeMillis(),
+    ): Pair<Boolean, String?> {
         return when (command) {
             is ControlCommand.Tap -> {
                 val (w, h) = getScreenSize()
@@ -411,7 +447,7 @@ class VeloDeckAccessibilityService : AccessibilityService() {
                 val (w, h) = getScreenSize()
                 val px = toPxX(command.x, w)
                 val py = toPxY(command.y, h)
-                val ok = handleLiveTouchDown(command.pointerId, px, py)
+                val ok = handleLiveTouchDown(command.pointerId, px, py, eventUptimeMs)
                 ok to if (ok) null else "Live touch down failed"
             }
 
@@ -419,7 +455,7 @@ class VeloDeckAccessibilityService : AccessibilityService() {
                 val (w, h) = getScreenSize()
                 val px = toPxX(command.x, w)
                 val py = toPxY(command.y, h)
-                val ok = handleLiveTouchMove(command.pointerId, px, py)
+                val ok = handleLiveTouchMove(command.pointerId, px, py, eventUptimeMs)
                 ok to if (ok) null else "Live touch move failed"
             }
 
@@ -494,7 +530,12 @@ class VeloDeckAccessibilityService : AccessibilityService() {
         }
     }
 
-    private suspend fun handleLiveTouchDown(pointerId: Int, x: Float, y: Float): Boolean {
+    private suspend fun handleLiveTouchDown(
+        pointerId: Int,
+        x: Float,
+        y: Float,
+        arrivalTs: Long = SystemClock.uptimeMillis(),
+    ): Boolean {
         return liveTouchMutex.withLock {
             // Release any stale unfinished stroke first
             releaseLiveStrokeLocked()
@@ -503,15 +544,19 @@ class VeloDeckAccessibilityService : AccessibilityService() {
             val desc = GestureDescription.Builder().addStroke(stroke).build()
             val ok = dispatchGestureAwait(desc)
             if (ok) {
-                val now = SystemClock.uptimeMillis()
-                liveStroke = LiveStrokeState(pointerId, stroke, x, y, now)
-                scheduleLiveStrokeSafetyReleaseLocked(pointerId, now)
+                liveStroke = LiveStrokeState(pointerId, stroke, x, y, arrivalTs)
+                scheduleLiveStrokeSafetyReleaseLocked(pointerId, arrivalTs)
             }
             ok
         }
     }
 
-    private suspend fun handleLiveTouchMove(pointerId: Int, x: Float, y: Float): Boolean {
+    private suspend fun handleLiveTouchMove(
+        pointerId: Int,
+        x: Float,
+        y: Float,
+        arrivalTs: Long = SystemClock.uptimeMillis(),
+    ): Boolean {
         return liveTouchMutex.withLock {
             val cur = liveStroke
             if (cur == null || cur.pointerId != pointerId) {
@@ -519,8 +564,9 @@ class VeloDeckAccessibilityService : AccessibilityService() {
             }
             val dist = hypot((x - cur.lastX).toDouble(), (y - cur.lastY).toDouble())
             if (dist < 2.0) return@withLock true
-            val now = SystemClock.uptimeMillis()
-            val segDur = (now - cur.lastTs).coerceIn(LIVE_MOVE_MIN_DURATION_MS, LIVE_MOVE_MAX_DURATION_MS)
+            // Use arrivalTs captured BEFORE dispatchGestureAwait so segDur reflects true
+            // pointer cadence instead of saturating at LIVE_MOVE_MAX_DURATION_MS after IPC return.
+            val segDur = (arrivalTs - cur.lastTs).coerceIn(LIVE_MOVE_MIN_DURATION_MS, LIVE_MOVE_MAX_DURATION_MS)
             val path = Path().apply {
                 moveTo(cur.lastX, cur.lastY)
                 lineTo(x, y)
@@ -532,8 +578,8 @@ class VeloDeckAccessibilityService : AccessibilityService() {
                 cur.stroke = nextStroke
                 cur.lastX = x
                 cur.lastY = y
-                cur.lastTs = now
-                scheduleLiveStrokeSafetyReleaseLocked(pointerId, now)
+                cur.lastTs = arrivalTs
+                scheduleLiveStrokeSafetyReleaseLocked(pointerId, arrivalTs)
             } else {
                 cancelLiveStrokeSafetyReleaseLocked()
                 liveStroke = null
@@ -550,13 +596,16 @@ class VeloDeckAccessibilityService : AccessibilityService() {
             if (cur == null || cur.pointerId != pointerId) {
                 return@withLock true
             }
+            val dist = hypot((x - cur.lastX).toDouble(), (y - cur.lastY).toDouble())
+            val hasFinalDelta = dist >= 1.5
             val path = Path().apply {
                 moveTo(cur.lastX, cur.lastY)
-                if (hypot((x - cur.lastX).toDouble(), (y - cur.lastY).toDouble()) >= 1.5) {
+                if (hasFinalDelta) {
                     lineTo(x, y)
                 }
             }
-            val endStroke = cur.stroke.continueStroke(path, 0L, LIVE_TOUCH_HOLD_MS, false)
+            val releaseDur = if (hasFinalDelta) LIVE_TOUCH_HOLD_MS else LIVE_TOUCH_RELEASE_STATIONARY_MS
+            val endStroke = cur.stroke.continueStroke(path, 0L, releaseDur, false)
             val desc = GestureDescription.Builder().addStroke(endStroke).build()
             dispatchGestureAwait(desc)
         }
@@ -1181,9 +1230,10 @@ class VeloDeckAccessibilityService : AccessibilityService() {
         private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
         private const val CLIPBOARD_CLEANUP_DELAY_MS = 300L
         private const val TAP_DURATION_MS = 25L
-        private const val LIVE_TOUCH_HOLD_MS = 10L
-        private const val LIVE_MOVE_MIN_DURATION_MS = 12L
-        private const val LIVE_MOVE_MAX_DURATION_MS = 24L
+        private const val LIVE_TOUCH_HOLD_MS = 6L
+        private const val LIVE_TOUCH_RELEASE_STATIONARY_MS = 2L
+        private const val LIVE_MOVE_MIN_DURATION_MS = 8L
+        private const val LIVE_MOVE_MAX_DURATION_MS = 16L
         private const val LIVE_STROKE_SAFETY_TIMEOUT_MS = 4_000L
         const val MAX_AUTO_ACCEPT_WINDOW_MS = 4_000L
 
@@ -1250,6 +1300,20 @@ class VeloDeckAccessibilityService : AccessibilityService() {
          */
         internal fun shouldAttachOverlay(mode: DisplayOverlayMode, forcePortrait: Boolean): Boolean =
             mode != DisplayOverlayMode.OFF || forcePortrait
+
+        /**
+         * Returns true when an overlay window is already tracked and both [nextMode] and
+         * [nextForcePortrait] match the last applied state, allowing redundant updates to short-circuit.
+         */
+        internal fun isOverlayStateUnchanged(
+            hasAttachedOverlay: Boolean,
+            lastMode: DisplayOverlayMode?,
+            lastForcePortrait: Boolean?,
+            nextMode: DisplayOverlayMode,
+            nextForcePortrait: Boolean,
+        ): Boolean = hasAttachedOverlay &&
+            lastMode == nextMode &&
+            lastForcePortrait == nextForcePortrait
 
         /**
          * Only non-[DisplayOverlayMode.OFF] modes hold `FLAG_KEEP_SCREEN_ON`; idle portrait lock

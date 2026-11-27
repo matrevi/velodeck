@@ -1,5 +1,6 @@
 package com.velodeck.agent.capture
 
+import android.annotation.SuppressLint
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -31,13 +32,19 @@ import kotlin.math.ceil
  * exhaustively verify PTS clamping, Annex-B SPS detection, bitrate clamping, and PLI throttling.
  */
 internal object LowLatencyEncoderMath {
-    const val MIN_FRAME_DELTA_NS = 8_000_000L          // 8ms (125fps burst ceiling)
-    const val MAX_FRAME_DELTA_NS = 16_666_667L         // 16.67ms (60fps motion ceiling -> prevents CBR bursts)
-    const val STATIC_SETTLE_RAW_DELTA_NS = 180_000_000L // >= 180ms real pause -> user stopped scrolling to read
-    const val STATIC_SETTLE_DELTA_NS = 24_000_000L     // 24ms gentle refinement budget so static text sharpens cleanly
-    const val DEFAULT_FRAME_DELTA_NS = 16_666_667L     // 60fps nominal step
+    const val MIN_FRAME_DELTA_NS = 8_000_000L            // 8ms (125fps burst ceiling & consecutive idle step)
+    const val MAX_FRAME_DELTA_NS = 1_000_000_000L / 60   // 16.67ms (60fps default motion ceiling -> prevents CBR bursts)
+    const val STATIC_SETTLE_RAW_DELTA_NS = 180_000_000L  // >= 180ms real pause -> user stopped scrolling to read
+    const val STATIC_SETTLE_DELTA_NS = 20_000_000L       // 20ms one-shot refinement budget right after motion stops
+    const val DEFAULT_FRAME_DELTA_NS = 1_000_000_000L / 60 // 60fps nominal step
+    const val IDLE_RESUME_RAW_DELTA_NS = 300_000_000L    // >= 300ms gap after idle triggers VBV leaky-bucket re-arm
+    const val VBV_REARM_BITRATE_NUMERATOR = 75           // Briefly clamp bitrate to 75% on idle->motion resume
+    const val VBV_REARM_BITRATE_DENOMINATOR = 100
+    const val VBV_REARM_RESTORE_MS = 250L                // Restore 100% target bitrate after 250ms or 10 frames
+    const val VBV_REARM_RESTORE_FRAMES = 10
+    const val MAX_IN_FLIGHT_FRAMES = 3                   // <= 50ms worst-case encoder input queue depth at 60fps
     const val MIN_CAPTURE_MONOTONIC_STEP_NS = 1_000_000L // 1ms minimum monotonic advance for synthetic/jitter frames
-    const val MIN_BITRATE_BPS = 400_000
+    const val MIN_BITRATE_BPS = 300_000
     const val MAX_BITRATE_BPS = 12_000_000
     const val MIN_KEYFRAME_INTERVAL_MS = 350L
     const val BITRATE_UPDATE_MIN_INTERVAL_MS = 150L
@@ -46,9 +53,14 @@ internal object LowLatencyEncoderMath {
     const val OPERATING_RATE_FPS = 120
     const val AVC_LEVEL_42_MAX_FS_MB = 8_704L
     const val AVC_LEVEL_42_MAX_MBPS = 522_240L
-    const val QP_MIN = 12
-    const val QP_I_MAX = 34
-    const val QP_P_MAX = 38
+    const val AVC_LEVEL_51_MAX_MBPS = 983_040L
+    const val QP_MIN = 20
+    const val QP_I_MAX = 42
+    const val QP_P_MAX = 46
+    const val STATIC_PUMP_STARTUP_WINDOW_MS = 3_000L
+    const val STATIC_PUMP_POST_MOTION_SETTLE_MS = 1_000L
+    const val STATIC_PUMP_FAST_INTERVAL_MS = 250L
+    const val STATIC_PUMP_IDLE_INTERVAL_MS = 1_500L
 
     /**
      * Normalizes a `SurfaceTexture` capture timestamp into a strictly monotonic `CLOCK_MONOTONIC`
@@ -83,47 +95,92 @@ internal object LowLatencyEncoderMath {
     }
 
     /**
+     * Scales the maximum motion codec PTS step to match the active encoder frame rate (`24..60 fps`)
+     * so 30fps ECO streams receive `33.33ms` nominal budget instead of `16.67ms` PTS starvation.
+     */
+    fun maxFrameDeltaNsForFps(targetFps: Int): Long =
+        1_000_000_000L / targetFps.coerceIn(24, 60)
+
+    /**
      * Computes the next clamped monotonic codec PTS (in nanoseconds) given the previous real frame
      * timestamp, the current real frame timestamp, and the previous codec PTS.
      *
-     * During active motion (`rawDeltaNs < 180ms`), `dt` is clamped to `[8ms, 16.67ms]` matching
-     * `KEY_FRAME_RATE=60` so Qualcomm CBR never accumulates idle-gap monster keyframes. When the
-     * screen settles (`rawDeltaNs >= 180ms`), a bounded `24ms` step gives the refinement frame extra
-     * bit budget to sharpen fine text immediately without risking CBR bursts.
+     * - During active motion (`rawDeltaNs < 180ms`), `dt` is clamped to
+     *   `[8ms, 1_000_000_000L / targetFps.coerceIn(24, 60)]` so Qualcomm CBR matches [targetFps]
+     *   without idle-gap bursts or 30fps ECO starvation.
+     * - When motion stops (`rawDeltaNs >= 180ms`), allows at most ONE `20ms` settle step
+     *   ([consecutiveIdleGaps] == 0) to sharpen static text; all subsequent consecutive idle frames
+     *   use `MIN_FRAME_DELTA_NS` (`8ms`) so repeated static frames never accumulate surplus VBV credit.
      */
     fun nextClampedCodecPtsNs(
         previousRealTsNs: Long,
         currentRealTsNs: Long,
         previousCodecPtsNs: Long,
+        targetFps: Int = 60,
+        consecutiveIdleGaps: Int = 0,
     ): Long {
+        val maxDeltaNs = maxFrameDeltaNsForFps(targetFps)
         if (previousRealTsNs == Long.MIN_VALUE) {
-            return DEFAULT_FRAME_DELTA_NS
+            return maxDeltaNs
         }
         val rawDeltaNs = currentRealTsNs - previousRealTsNs
         val clampedDeltaNs = when {
             rawDeltaNs <= 0L -> MIN_FRAME_DELTA_NS
-            rawDeltaNs >= STATIC_SETTLE_RAW_DELTA_NS -> STATIC_SETTLE_DELTA_NS
-            else -> rawDeltaNs.coerceIn(MIN_FRAME_DELTA_NS, MAX_FRAME_DELTA_NS)
+            rawDeltaNs >= STATIC_SETTLE_RAW_DELTA_NS -> {
+                if (consecutiveIdleGaps == 0) STATIC_SETTLE_DELTA_NS else MIN_FRAME_DELTA_NS
+            }
+            else -> rawDeltaNs.coerceIn(MIN_FRAME_DELTA_NS, maxDeltaNs)
         }
         return previousCodecPtsNs + clampedDeltaNs
+    }
+
+    /**
+     * Computes the brief 75% VBV re-arm bitrate sent on idle->motion resume so `c2.qti.avc.encoder`
+     * re-clamps its leaky-bucket fullness instead of emitting a 150 KB surplus burst.
+     */
+    fun computeVbvRearmBitrateBps(
+        currentBitrateBps: Int,
+        lastAppliedCodecBitrateBps: Int = -1,
+    ): Int {
+        val base = ((currentBitrateBps.toLong() * VBV_REARM_BITRATE_NUMERATOR) / VBV_REARM_BITRATE_DENOMINATOR)
+            .toInt()
+            .coerceIn(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
+        return if (base == lastAppliedCodecBitrateBps && base > MIN_BITRATE_BPS) {
+            (base - 1_000).coerceAtLeast(MIN_BITRATE_BPS)
+        } else {
+            base
+        }
+    }
+
+    /**
+     * Determines the static-frame keepalive interval: `250ms` during the first 3s startup and
+     * ~1s post-motion settle window, backing off to `1500ms` once idle to prevent VBV-draining spam.
+     */
+    fun computeStaticPumpIntervalMs(
+        sessionAgeMs: Long,
+        sinceLastRealFrameMs: Long,
+    ): Long = when {
+        sessionAgeMs < STATIC_PUMP_STARTUP_WINDOW_MS -> STATIC_PUMP_FAST_INTERVAL_MS
+        sinceLastRealFrameMs < STATIC_PUMP_POST_MOTION_SETTLE_MS -> STATIC_PUMP_FAST_INTERVAL_MS
+        else -> STATIC_PUMP_IDLE_INTERVAL_MS
     }
 
     fun minBitrateForResolution(width: Int, height: Int): Int {
         val shortEdge = minOf(width, height)
         return when {
-            shortEdge >= 1080 -> 1_200_000
-            shortEdge >= 800 -> 900_000
-            shortEdge >= 720 -> 700_000
+            shortEdge >= 1080 -> 500_000
+            shortEdge >= 800 -> 400_000
+            shortEdge >= 720 -> 350_000
             else -> MIN_BITRATE_BPS
         }
     }
 
     /**
-     * WAN/TURN-friendly minimum bitrate floor (`20%` of preset max, clamped to `[500, 1500] kbps`)
+     * WAN/TURN-friendly minimum bitrate floor (`15%` of preset max, clamped to `[300, 600] kbps`)
      * shared by SDP `x-google-min-bitrate` and `RtpParameters` `encoding.minBitrateBps`.
      */
     fun computeSdpMinBitrateKbps(presetMaxKbps: Int): Int =
-        ((presetMaxKbps * 20) / 100).coerceIn(500, 1_500)
+        ((presetMaxKbps * 15) / 100).coerceIn(300, 600)
 
     /**
      * Brisk initial bitrate (`55%` of preset max, clamped to `[1200, 4000] kbps`) for SDP
@@ -135,20 +192,68 @@ internal object LowLatencyEncoderMath {
     /**
      * Selects the H.264 AVC codec level matching the target resolution and VPU operating rate.
      *
-     * 20:9 HD (`1080x2414` = 10,268 macroblocks > Level 4.2 MaxFS 8,704) and 20:9 BALANCED
-     * (`900x2012` at 120fps operating rate = 861,840 MB/s > Level 4.2 MaxMBPS 522,240) require
-     * `AVCLevel51` (MaxFS 36,864, MaxMBPS 983,040) so Tier 1/2 HAL validation never rejects
-     * `KEY_LATENCY = 1` + `KEY_OPERATING_RATE`.
+     * - 20:9 HD (`1080x2414` = 10,268 MBs * 120fps = 1,232,160 MB/s > Level 5.1 MaxMBPS 983,040)
+     *   requires `AVCLevel52` so strict Codec2 HALs never reject `KEY_LATENCY = 1` + `KEY_OPERATING_RATE`.
+     * - 20:9 BALANCED (`900x2012` * 120 = 861,840 MB/s) and 16:9 1080p (`1080x1920` * 120 = 979,200 MB/s)
+     *   require `AVCLevel51`.
+     * - 720p and ECO fit within `AVCLevel42`.
      */
     fun selectAvcLevel(width: Int, height: Int, targetFps: Int): Int {
         val mbW = ((width.coerceAtLeast(16) + 15) / 16).toLong()
         val mbH = ((height.coerceAtLeast(16) + 15) / 16).toLong()
         val mbPerFrame = mbW * mbH
         val effectiveRate = maxOf(targetFps, OPERATING_RATE_FPS).toLong()
-        return if (mbPerFrame > AVC_LEVEL_42_MAX_FS_MB || mbPerFrame * effectiveRate > AVC_LEVEL_42_MAX_MBPS) {
-            MediaCodecInfo.CodecProfileLevel.AVCLevel51
+        val mbPerSec = mbPerFrame * effectiveRate
+        return when {
+            mbPerSec > AVC_LEVEL_51_MAX_MBPS -> MediaCodecInfo.CodecProfileLevel.AVCLevel52
+            mbPerFrame > AVC_LEVEL_42_MAX_FS_MB || mbPerSec > AVC_LEVEL_42_MAX_MBPS ->
+                MediaCodecInfo.CodecProfileLevel.AVCLevel51
+            else -> MediaCodecInfo.CodecProfileLevel.AVCLevel42
+        }
+    }
+
+    /**
+     * Selects the optimal H.264 profile supported by the hardware encoder for zero-reorder streaming.
+     *
+     * On API 27+ (`Build.VERSION_CODES.O_MR1`), prefers `AVCProfileConstrainedHigh` over plain
+     * `AVCProfileHigh` when High profile is requested (avoids 2-4 frame decoder DPB reorder lag!),
+     * falling back to `AVCProfileHigh`, `AVCProfileConstrainedBaseline`, or `AVCProfileBaseline`.
+     */
+    @SuppressLint("InlinedApi")
+    fun selectAvcProfile(
+        useHighProfile: Boolean,
+        supportedProfiles: Set<Int>,
+        sdkInt: Int = Build.VERSION.SDK_INT,
+    ): Int {
+        val supportsApi27Constrained = sdkInt >= Build.VERSION_CODES.O_MR1
+        val constrainedHigh = if (supportsApi27Constrained) {
+            MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedHigh
         } else {
-            MediaCodecInfo.CodecProfileLevel.AVCLevel42
+            -1
+        }
+        val constrainedBaseline = if (supportsApi27Constrained) {
+            MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedBaseline
+        } else {
+            -1
+        }
+        val high = MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
+        val baseline = MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
+
+        if (useHighProfile) {
+            if (supportedProfiles.isEmpty()) return high
+            return when {
+                constrainedHigh > 0 && constrainedHigh in supportedProfiles -> constrainedHigh
+                high in supportedProfiles -> high
+                constrainedBaseline > 0 && constrainedBaseline in supportedProfiles -> constrainedBaseline
+                baseline in supportedProfiles -> baseline
+                else -> high
+            }
+        }
+        if (supportedProfiles.isEmpty()) return baseline
+        return when {
+            constrainedBaseline > 0 && constrainedBaseline in supportedProfiles -> constrainedBaseline
+            baseline in supportedProfiles -> baseline
+            else -> baseline
         }
     }
 
@@ -267,6 +372,25 @@ class LowLatencyH264Encoder(
     private val onReleased: ((LowLatencyH264Encoder) -> Unit)? = null,
 ) : VideoEncoder {
 
+    private enum class ConfigTier(
+        val label: String,
+        val includeCbrAndCoreLowLatency: Boolean,
+        val includeAggressiveLowLatency: Boolean,
+        val includeProfileAndLevel: Boolean,
+        val includeQpBounds: Boolean,
+    ) {
+        TIER_1("1", true, true, true, true),
+        TIER_2("2", true, true, true, false),
+        TIER_2B("2b", true, true, false, false),
+        TIER_3("3", true, false, false, false),
+        TIER_4("4", false, false, false, false),
+    }
+
+    private data class ConfiguredCodec(
+        val tier: ConfigTier,
+        val profile: Int,
+    )
+
     private data class FrameMeta(
         val codecPtsUs: Long,
         val captureTimeNs: Long,
@@ -296,15 +420,21 @@ class LowLatencyH264Encoder(
     @Volatile
     private var height: Int = 0
 
+    @Volatile
     private var targetFps: Int = 60
 
     @Volatile
     private var currentBitrateBps: Int = 2_400_000
 
+    private var lastAppliedCodecBitrateBps: Int = 2_400_000
     private var lastBitrateUpdateElapsedMs: Long = 0L
 
     private var lastRealTimestampNs: Long = Long.MIN_VALUE
     private var lastCodecPtsNs: Long = 0L
+    private var consecutiveIdleGaps: Int = 0
+    private var vbvRearmActive: Boolean = false
+    private var vbvRearmStartElapsedMs: Long = 0L
+    private var vbvRearmFramesRemaining: Int = 0
     private var lastKeyframeRequestElapsedMs: Long = 0L
 
     @Volatile
@@ -359,9 +489,14 @@ class LowLatencyH264Encoder(
             requestedBps = rawInitialBps.coerceAtLeast(floorInitialBps),
             minFloorBps = floorInitialBps,
         )
+        lastAppliedCodecBitrateBps = currentBitrateBps
         lastBitrateUpdateElapsedMs = SystemClock.elapsedRealtime()
         lastRealTimestampNs = Long.MIN_VALUE
         lastCodecPtsNs = 0L
+        consecutiveIdleGaps = 0
+        vbvRearmActive = false
+        vbvRearmStartElapsedMs = 0L
+        vbvRearmFramesRemaining = 0
         lastKeyframeRequestElapsedMs = 0L
         hasSentAnyKeyframe = false
         cachedConfigBytes = null
@@ -386,8 +521,8 @@ class LowLatencyH264Encoder(
             return VideoCodecStatus.FALLBACK_SOFTWARE
         }
 
-        val configuredTier = configureCodecWithFallbacks(mediaCodec)
-        if (configuredTier < 0) {
+        val configured = configureCodecWithFallbacks(mediaCodec)
+        if (configured == null) {
             try {
                 mediaCodec.release()
             } catch (_: Throwable) {
@@ -423,7 +558,7 @@ class LowLatencyH264Encoder(
             }
             Log.i(
                 TAG,
-                "Initialized $codecName (tier=$configuredTier, profile=${if (useHighProfile) "High" else "Baseline"}, " +
+                "Initialized $codecName (tier=${configured.tier.label}, profile=${profileLabel(configured)}, " +
                     "${encWidth}x${encHeight}@${targetFps}fps, bitrate=${currentBitrateBps / 1000}kbps, " +
                     "intraRefresh=$supportsIntraRefresh) inputFormat=$inputFmt",
             )
@@ -463,8 +598,11 @@ class LowLatencyH264Encoder(
     /**
      * Tiered configuration guarantees full industrial low-latency features on Snapdragon/Dimensity/Exynos
      * flagship chips while safely degrading on older or stricter HALs without ever failing startup.
+     *
+     * Profile/level fallback (Tier 2b) is split from low-latency fallback (Tier 3) so strict HALs
+     * NEVER lose `KEY_LATENCY = 1` (+67ms) just because of a profile or AVC level mismatch.
      */
-    private fun configureCodecWithFallbacks(mediaCodec: MediaCodec): Int {
+    private fun configureCodecWithFallbacks(mediaCodec: MediaCodec): ConfiguredCodec? {
         val supportedLevelsByProfile: Map<Int, List<Int>> = try {
             val caps = mediaCodec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
             caps.profileLevels
@@ -473,25 +611,30 @@ class LowLatencyH264Encoder(
         } catch (_: Throwable) {
             emptyMap()
         }
-        val tiers = listOf(1, 2, 3, 4)
-        for (tier in tiers) {
-            val format = buildMediaFormat(tier, supportedLevelsByProfile)
+        val targetProfile = LowLatencyEncoderMath.selectAvcProfile(
+            useHighProfile = useHighProfile,
+            supportedProfiles = supportedLevelsByProfile.keys,
+            sdkInt = Build.VERSION.SDK_INT,
+        )
+        for (tier in ConfigTier.values()) {
+            val format = buildMediaFormat(tier, targetProfile, supportedLevelsByProfile)
             try {
                 mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                return tier
+                return ConfiguredCodec(tier, targetProfile)
             } catch (t: Throwable) {
-                Log.w(TAG, "MediaCodec configure tier=$tier rejected by $codecName (${t.message}); trying fallback")
+                Log.w(TAG, "MediaCodec configure tier=${tier.label} rejected by $codecName (${t.message}); trying fallback")
                 try {
                     mediaCodec.reset()
                 } catch (_: Throwable) {
                 }
             }
         }
-        return -1
+        return null
     }
 
     private fun buildMediaFormat(
-        tier: Int,
+        tier: ConfigTier,
+        targetProfile: Int,
         supportedLevelsByProfile: Map<Int, List<Int>>,
     ): MediaFormat {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
@@ -503,7 +646,7 @@ class LowLatencyH264Encoder(
         format.setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, KEY_FRAME_INTERVAL_SEC)
 
-        if (tier <= 3) {
+        if (tier.includeCbrAndCoreLowLatency) {
             format.setInteger(
                 MediaFormat.KEY_BITRATE_MODE,
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR,
@@ -518,7 +661,7 @@ class LowLatencyH264Encoder(
             }
         }
 
-        if (tier <= 2) {
+        if (tier.includeAggressiveLowLatency) {
             // Override Qualcomm RequestedPipelineDelayTuningHelper hardcoded algo.delay=4 default
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 format.setInteger(MediaFormat.KEY_LATENCY, 1)
@@ -528,13 +671,14 @@ class LowLatencyH264Encoder(
             if (supportsIntraRefresh) {
                 format.setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, INTRA_REFRESH_FRAMES)
             }
-            // Constrained High (CABAC + 8x8 DCT + 0 B-frames) gives ~30% sharper text at same bitrate;
-            // falls back to Constrained Baseline if browser negotiated 42e0* or HAL rejects High.
-            val targetProfile = if (useHighProfile) {
-                MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
-            } else {
-                MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
+            if (isQualcommCodec(codecName)) {
+                format.setInteger("vendor.qti-ext-enc-low-latency.enable", 1)
             }
+        }
+
+        if (tier.includeProfileAndLevel) {
+            // Prefer Constrained High (API 27+) -> High -> Constrained Baseline -> Baseline so
+            // CABAC + 8x8 DCT text sharpness is preserved without 2-4 frame decoder DPB reorder lag.
             format.setInteger(MediaFormat.KEY_PROFILE, targetProfile)
             val desiredLevel = LowLatencyEncoderMath.selectAvcLevel(width, height, targetFps)
             val resolvedLevel = LowLatencyEncoderMath.resolveSupportedAvcLevel(
@@ -544,15 +688,11 @@ class LowLatencyH264Encoder(
             if (resolvedLevel != null) {
                 format.setInteger(MediaFormat.KEY_LEVEL, resolvedLevel)
             }
-            if (isQualcommCodec(codecName)) {
-                format.setInteger("vendor.qti-ext-enc-low-latency.enable", 1)
-            }
         }
 
-        if (tier == 1 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Cap worst-case quantization parameter on Android 12+ so hardware CBR can stay within
-            // target bitrate during full-screen motion without triggering FrameDropper FPS stalls,
-            // while still preventing blurry QP 45-51 mush (Tier 2 drops these cleanly if HAL rejects).
+        if (tier.includeQpBounds && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Bounded Android 12+ QP window [20..42/46] prevents QP-12 VBV explosions on idle->motion
+            // while giving hardware CBR enough headroom to avoid QP-38 FrameDropper spirals.
             format.setInteger(MediaFormat.KEY_VIDEO_QP_I_MIN, QP_MIN)
             format.setInteger(MediaFormat.KEY_VIDEO_QP_I_MAX, QP_I_MAX)
             format.setInteger(MediaFormat.KEY_VIDEO_QP_P_MIN, QP_MIN)
@@ -560,6 +700,19 @@ class LowLatencyH264Encoder(
         }
 
         return format
+    }
+
+    private fun profileLabel(configured: ConfiguredCodec): String {
+        if (!configured.tier.includeProfileAndLevel) return "Auto"
+        return when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 &&
+                configured.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedHigh -> "ConstrainedHigh"
+            configured.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileHigh -> "High"
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 &&
+                configured.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedBaseline -> "ConstrainedBaseline"
+            configured.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline -> "Baseline"
+            else -> "Profile(${configured.profile})"
+        }
     }
 
     override fun encode(
@@ -641,15 +794,70 @@ class LowLatencyH264Encoder(
             }
         }
 
-        // Compute strictly clamped monotonic codec PTS (eliminates idle-gap CBR spikes!)
+        // Compute strictly clamped monotonic codec PTS (eliminates idle-gap CBR & VBV-credit spikes!)
+        val hadPreviousFrame = lastRealTimestampNs != Long.MIN_VALUE
+        val rawDeltaNs = if (hadPreviousFrame) frame.timestampNs - lastRealTimestampNs else 0L
+        val wasIdle = consecutiveIdleGaps > 0
+        val isIdleGap = hadPreviousFrame && rawDeltaNs >= LowLatencyEncoderMath.STATIC_SETTLE_RAW_DELTA_NS
+
         val codecPtsNs = LowLatencyEncoderMath.nextClampedCodecPtsNs(
             previousRealTsNs = lastRealTimestampNs,
             currentRealTsNs = frame.timestampNs,
             previousCodecPtsNs = lastCodecPtsNs,
+            targetFps = targetFps,
+            consecutiveIdleGaps = consecutiveIdleGaps,
         )
+        if (isIdleGap) {
+            consecutiveIdleGaps = (consecutiveIdleGaps + 1).coerceAtMost(1_000)
+        } else {
+            consecutiveIdleGaps = 0
+        }
         lastRealTimestampNs = frame.timestampNs
         lastCodecPtsNs = codecPtsNs
         val codecPtsUs = codecPtsNs / 1_000L
+
+        // VBV re-arm on idle->motion resume: briefly nudge bitrate to 75% on the first frame after
+        // an idle gap so c2.qti.avc.encoder re-clamps its empty leaky bucket instead of dumping a
+        // 150 KB surplus burst, then smoothly restore 100% after ~250ms / 10 frames.
+        val shouldRearmVbv = hadPreviousFrame && wasIdle && (
+            rawDeltaNs >= LowLatencyEncoderMath.IDLE_RESUME_RAW_DELTA_NS ||
+                (!isIdleGap && !vbvRearmActive)
+            )
+        if (shouldRearmVbv) {
+            val nudgedBps = LowLatencyEncoderMath.computeVbvRearmBitrateBps(
+                currentBitrateBps = currentBitrateBps,
+                lastAppliedCodecBitrateBps = lastAppliedCodecBitrateBps,
+            )
+            try {
+                val params = Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, nudgedBps)
+                }
+                currentCodec.setParameters(params)
+                lastAppliedCodecBitrateBps = nudgedBps
+                vbvRearmActive = true
+                vbvRearmStartElapsedMs = nowMs
+                vbvRearmFramesRemaining = LowLatencyEncoderMath.VBV_REARM_RESTORE_FRAMES
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to re-arm VBV bitrate on idle resume", t)
+            }
+        } else if (vbvRearmActive) {
+            vbvRearmFramesRemaining--
+            if (vbvRearmFramesRemaining <= 0 ||
+                (nowMs - vbvRearmStartElapsedMs) >= LowLatencyEncoderMath.VBV_REARM_RESTORE_MS
+            ) {
+                val restoreBps = currentBitrateBps
+                try {
+                    val params = Bundle().apply {
+                        putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, restoreBps)
+                    }
+                    currentCodec.setParameters(params)
+                    lastAppliedCodecBitrateBps = restoreBps
+                    vbvRearmActive = false
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Failed to restore bitrate after VBV re-arm", t)
+                }
+            }
+        }
 
         val meta = FrameMeta(
             codecPtsUs = codecPtsUs,
@@ -687,7 +895,8 @@ class LowLatencyH264Encoder(
     }
 
     override fun setRates(rcParameters: VideoEncoder.RateControlParameters): VideoCodecStatus {
-        val fps = ceil(rcParameters.framerateFps).toInt().coerceIn(24, 60)
+        val rawFps = ceil(rcParameters.framerateFps).toInt()
+        val fps = if (rawFps >= 24) rawFps.coerceIn(24, 60) else rawFps
         return setRateAllocation(rcParameters.bitrate, fps)
     }
 
@@ -697,6 +906,11 @@ class LowLatencyH264Encoder(
     ): VideoCodecStatus {
         val activeCodec = codec ?: return VideoCodecStatus.OK
         if (!running) return VideoCodecStatus.OK
+
+        // Track live target FPS (ECO 30fps <-> BALANCED/HD 60fps) so PTS clamping & reinit match
+        if (framerate >= 24) {
+            targetFps = framerate.coerceIn(24, 60)
+        }
 
         val requestedBps = allocation.sum
         if (requestedBps <= 0) return VideoCodecStatus.OK
@@ -712,12 +926,18 @@ class LowLatencyH264Encoder(
             return VideoCodecStatus.OK
         }
 
+        val codecBps = if (vbvRearmActive) {
+            LowLatencyEncoderMath.computeVbvRearmBitrateBps(clampedBps)
+        } else {
+            clampedBps
+        }
         return try {
             val params = Bundle().apply {
-                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, clampedBps)
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, codecBps)
             }
             activeCodec.setParameters(params)
             currentBitrateBps = clampedBps
+            lastAppliedCodecBitrateBps = codecBps
             lastBitrateUpdateElapsedMs = nowMs
             VideoCodecStatus.OK
         } catch (t: Throwable) {
@@ -796,6 +1016,10 @@ class LowLatencyH264Encoder(
 
         synchronized(metaLock) { pendingMeta.clear() }
         forceNextSyncFrame.set(false)
+        consecutiveIdleGaps = 0
+        vbvRearmActive = false
+        vbvRearmStartElapsedMs = 0L
+        vbvRearmFramesRemaining = 0
         cachedConfigBytes = null
         directBufferPool.clear()
     }
@@ -1068,7 +1292,7 @@ class LowLatencyH264Encoder(
         private const val KEY_FRAME_INTERVAL_SEC = 60
         private const val OPERATING_RATE_FPS = LowLatencyEncoderMath.OPERATING_RATE_FPS
         private const val INTRA_REFRESH_FRAMES = 120
-        private const val MAX_IN_FLIGHT_FRAMES = 6
+        private const val MAX_IN_FLIGHT_FRAMES = LowLatencyEncoderMath.MAX_IN_FLIGHT_FRAMES
         private const val MAX_PENDING_META = 24
         private const val STALE_IN_FLIGHT_NS = 500_000_000L
         private const val BUFFER_POOL_SIZE = 8

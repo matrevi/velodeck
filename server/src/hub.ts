@@ -28,7 +28,7 @@ import {
   type UserProfile,
   type WireMessage,
 } from "@velodeck/protocol";
-import { AuditLogger } from "./audit.js";
+import { AuditLogger, type AuditEvent } from "./audit.js";
 import {
   hashPassword,
   loadOrCreateJwtSecret,
@@ -1719,14 +1719,9 @@ export class VeloDeckHub {
 
     if (ownerChanged && previousOwnerUserId) {
       rotatedDetails.push(unbindOwner ? "owner_unbound" : "owner_changed");
-      for (const ctrl of Array.from(this.controllers)) {
-        if (ctrl.authType === "account" && ctrl.userId === previousOwnerUserId) {
-          this.controllers.delete(ctrl);
-          this.endSessionsForController(ctrl, endReason);
-          this.removeOutOfBandForController(ctrl);
-          this.closeReplacedConnection(ctrl, 4001, "CREDENTIALS_CHANGED");
-        }
-      }
+      // Only sessions targeting this deviceId were terminated above and offlineSnapshot was broadcast;
+      // keep previousOwnerUserId's account WebSocket open so other bound devices & active sessions are untouched.
+      this.removeOutOfBandForDevice(deviceId);
       if (unbindOwner) {
         this.audit.log({
           event: "device.unbind",
@@ -2472,6 +2467,21 @@ export class VeloDeckHub {
       }
     }
 
+    if (cmd.action === "quality") {
+      if (!isValidStreamQuality(cmd.quality)) {
+        this.sendError(
+          conn.ws,
+          "INVALID_MESSAGE",
+          "quality must contain positive finite numbers",
+          {
+            sessionId: msg.sessionId,
+            deviceId: msg.deviceId,
+          },
+        );
+        return;
+      }
+    }
+
     // Allow sessionless wake / unlock / black_screen / force_portrait commands from an authorized controller
     if (!isNonEmptyString(msg.sessionId)) {
       if (conn.role !== "controller") {
@@ -2533,9 +2543,24 @@ export class VeloDeckHub {
         }
       }
 
-      // Audit wake / unlock (strictly NEVER log PIN!)
+      // Audit sessionless control actions explicitly (strictly NEVER log PIN!)
+      let sessionlessAuditEvent: AuditEvent;
+      switch (action) {
+        case "wake":
+          sessionlessAuditEvent = "control.wake";
+          break;
+        case "unlock":
+          sessionlessAuditEvent = "control.unlock";
+          break;
+        case "black_screen":
+          sessionlessAuditEvent = "control.black_screen";
+          break;
+        case "force_portrait":
+          sessionlessAuditEvent = "control.force_portrait";
+          break;
+      }
       this.audit.log({
-        event: action === "wake" ? "control.wake" : "control.unlock",
+        event: sessionlessAuditEvent,
         ip: conn.ip,
         ok: true,
         userId: conn.userId,
@@ -2578,9 +2603,26 @@ export class VeloDeckHub {
       return;
     }
 
-    if (cmd.action === "wake" || cmd.action === "unlock") {
+    let inSessionAuditEvent: AuditEvent | null = null;
+    switch (cmd.action) {
+      case "wake":
+        inSessionAuditEvent = "control.wake";
+        break;
+      case "unlock":
+        inSessionAuditEvent = "control.unlock";
+        break;
+      case "black_screen":
+        inSessionAuditEvent = "control.black_screen";
+        break;
+      case "force_portrait":
+        inSessionAuditEvent = "control.force_portrait";
+        break;
+      default:
+        break;
+    }
+    if (inSessionAuditEvent) {
       this.audit.log({
-        event: cmd.action === "wake" ? "control.wake" : "control.unlock",
+        event: inSessionAuditEvent,
         ip: conn.ip,
         ok: true,
         userId: conn.userId,

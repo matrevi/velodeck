@@ -1,9 +1,11 @@
 package com.velodeck.agent
 
 import android.media.MediaCodecInfo
+import android.os.Build
 import com.velodeck.agent.capture.DisplayScaleMath
 import com.velodeck.agent.capture.LowLatencyEncoderMath
 import com.velodeck.agent.capture.LowLatencyH264EncoderFactory
+import com.velodeck.agent.capture.WebRtcSessionManager
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -14,48 +16,100 @@ import org.junit.Test
 class LowLatencyEncoderLogicTest {
 
     @Test
-    fun `nextClampedCodecPtsNs clamps motion to 16_67ms and grants 24ms static-settle refinement`() {
-        assertEquals(16_666_667L, LowLatencyEncoderMath.MAX_FRAME_DELTA_NS)
-        assertEquals(24_000_000L, LowLatencyEncoderMath.STATIC_SETTLE_DELTA_NS)
+    fun `nextClampedCodecPtsNs clamps motion by targetFps and caps repeated idle VBV credit`() {
+        assertEquals(1_000_000_000L / 60, LowLatencyEncoderMath.MAX_FRAME_DELTA_NS)
+        assertEquals(20_000_000L, LowLatencyEncoderMath.STATIC_SETTLE_DELTA_NS)
+        assertEquals(3, LowLatencyEncoderMath.MAX_IN_FLIGHT_FRAMES)
+        assertEquals(33_333_333L, LowLatencyEncoderMath.maxFrameDeltaNsForFps(30))
+        assertEquals(16_666_666L, LowLatencyEncoderMath.maxFrameDeltaNsForFps(60))
 
         val pts0 = LowLatencyEncoderMath.nextClampedCodecPtsNs(
             previousRealTsNs = Long.MIN_VALUE,
             currentRealTsNs = 1_000_000_000L,
             previousCodecPtsNs = 0L,
+            targetFps = 60,
+            consecutiveIdleGaps = 0,
         )
         assertEquals(LowLatencyEncoderMath.DEFAULT_FRAME_DELTA_NS, pts0)
 
-        // Simulate 2.5-second idle screen gap -> bounded 24ms refinement step (still prevents CBR monster IDR!)
-        val ptsAfterIdle = LowLatencyEncoderMath.nextClampedCodecPtsNs(
+        // First idle gap (>= 180ms right after motion stops) -> grants at most ONE 20ms settle step
+        val ptsFirstIdle = LowLatencyEncoderMath.nextClampedCodecPtsNs(
             previousRealTsNs = 1_000_000_000L,
-            currentRealTsNs = 3_500_000_000L,
+            currentRealTsNs = 1_250_000_000L,
             previousCodecPtsNs = pts0,
+            targetFps = 60,
+            consecutiveIdleGaps = 0,
         )
-        assertEquals(pts0 + 24_000_000L, ptsAfterIdle)
+        assertEquals(pts0 + 20_000_000L, ptsFirstIdle)
 
-        // Active 60fps scrolling (~16.67ms delta) passes through untouched
+        // Subsequent consecutive idle frames (>= 180ms) MUST use MIN_FRAME_DELTA_NS (8ms) — never keep crediting 20ms into VBV!
+        val ptsSecondIdle = LowLatencyEncoderMath.nextClampedCodecPtsNs(
+            previousRealTsNs = 1_250_000_000L,
+            currentRealTsNs = 2_750_000_000L,
+            previousCodecPtsNs = ptsFirstIdle,
+            targetFps = 60,
+            consecutiveIdleGaps = 1,
+        )
+        assertEquals(ptsFirstIdle + LowLatencyEncoderMath.MIN_FRAME_DELTA_NS, ptsSecondIdle)
+
+        val ptsThirdIdle = LowLatencyEncoderMath.nextClampedCodecPtsNs(
+            previousRealTsNs = 2_750_000_000L,
+            currentRealTsNs = 4_250_000_000L,
+            previousCodecPtsNs = ptsSecondIdle,
+            targetFps = 60,
+            consecutiveIdleGaps = 2,
+        )
+        assertEquals(ptsSecondIdle + LowLatencyEncoderMath.MIN_FRAME_DELTA_NS, ptsThirdIdle)
+
+        // Active 60fps scrolling (~16.666ms delta) passes through cleanly
         val ptsScrolling = LowLatencyEncoderMath.nextClampedCodecPtsNs(
-            previousRealTsNs = 3_500_000_000L,
-            currentRealTsNs = 3_516_666_667L,
-            previousCodecPtsNs = ptsAfterIdle,
+            previousRealTsNs = 4_250_000_000L,
+            currentRealTsNs = 4_266_666_666L,
+            previousCodecPtsNs = ptsThirdIdle,
+            targetFps = 60,
+            consecutiveIdleGaps = 0,
         )
-        assertEquals(ptsAfterIdle + 16_666_667L, ptsScrolling)
+        assertEquals(ptsThirdIdle + 16_666_666L, ptsScrolling)
 
-        // 30fps motion (33ms < 180ms settle threshold) clamps to 16.67ms
-        val pts30fps = LowLatencyEncoderMath.nextClampedCodecPtsNs(
-            previousRealTsNs = 3_516_666_667L,
-            currentRealTsNs = 3_550_000_000L,
+        // 30fps motion under 60fps target clamps to 16.666ms
+        val pts30fpsAt60Target = LowLatencyEncoderMath.nextClampedCodecPtsNs(
+            previousRealTsNs = 4_266_666_666L,
+            currentRealTsNs = 4_300_000_000L,
             previousCodecPtsNs = ptsScrolling,
+            targetFps = 60,
+            consecutiveIdleGaps = 0,
         )
-        assertEquals(ptsScrolling + 16_666_667L, pts30fps)
+        assertEquals(ptsScrolling + 16_666_666L, pts30fpsAt60Target)
+
+        // 30fps ECO target scales MAX_FRAME_DELTA_NS to 33.333ms so ECO never gets 16.67ms PTS starvation!
+        val pts30fpsEco = LowLatencyEncoderMath.nextClampedCodecPtsNs(
+            previousRealTsNs = 4_300_000_000L,
+            currentRealTsNs = 4_333_333_333L,
+            previousCodecPtsNs = pts30fpsAt60Target,
+            targetFps = 30,
+            consecutiveIdleGaps = 0,
+        )
+        assertEquals(pts30fpsAt60Target + 33_333_333L, pts30fpsEco)
 
         // Duplicate / backwards timestamp clamps cleanly to MIN_FRAME_DELTA_NS (8ms)
         val ptsDup = LowLatencyEncoderMath.nextClampedCodecPtsNs(
-            previousRealTsNs = 3_550_000_000L,
-            currentRealTsNs = 3_550_000_000L,
-            previousCodecPtsNs = pts30fps,
+            previousRealTsNs = 4_333_333_333L,
+            currentRealTsNs = 4_333_333_333L,
+            previousCodecPtsNs = pts30fpsEco,
+            targetFps = 60,
+            consecutiveIdleGaps = 0,
         )
-        assertEquals(pts30fps + LowLatencyEncoderMath.MIN_FRAME_DELTA_NS, ptsDup)
+        assertEquals(pts30fpsEco + LowLatencyEncoderMath.MIN_FRAME_DELTA_NS, ptsDup)
+
+        // VBV re-arm bitrate helper nudges to 75% and guarantees distinct value on repeated re-arm
+        assertEquals(3_000_000, LowLatencyEncoderMath.computeVbvRearmBitrateBps(4_000_000))
+        assertEquals(2_999_000, LowLatencyEncoderMath.computeVbvRearmBitrateBps(4_000_000, 3_000_000))
+        assertEquals(LowLatencyEncoderMath.MIN_BITRATE_BPS, LowLatencyEncoderMath.computeVbvRearmBitrateBps(300_000))
+
+        // Static frame pump backs off to 1500ms after 3s startup and 1s post-motion settle
+        assertEquals(250L, LowLatencyEncoderMath.computeStaticPumpIntervalMs(sessionAgeMs = 1_500L, sinceLastRealFrameMs = 5_000L))
+        assertEquals(250L, LowLatencyEncoderMath.computeStaticPumpIntervalMs(sessionAgeMs = 10_000L, sinceLastRealFrameMs = 600L))
+        assertEquals(1_500L, LowLatencyEncoderMath.computeStaticPumpIntervalMs(sessionAgeMs = 10_000L, sinceLastRealFrameMs = 1_200L))
     }
 
     @Test
@@ -132,37 +186,38 @@ class LowLatencyEncoderLogicTest {
     fun `bitrate clamping, WAN-TURN floors, QP bounds, and tightened 150ms 3-percent threshold guard behave correctly`() {
         assertEquals(150L, LowLatencyEncoderMath.BITRATE_UPDATE_MIN_INTERVAL_MS)
         assertEquals(0.03, LowLatencyEncoderMath.BITRATE_CHANGE_THRESHOLD_RATIO, 1e-9)
-        assertEquals(400_000, LowLatencyEncoderMath.MIN_BITRATE_BPS)
+        assertEquals(300_000, LowLatencyEncoderMath.MIN_BITRATE_BPS)
         assertEquals(LowLatencyEncoderMath.MIN_BITRATE_BPS, LowLatencyEncoderMath.clampBitrateBps(100_000))
         assertEquals(LowLatencyEncoderMath.MAX_BITRATE_BPS, LowLatencyEncoderMath.clampBitrateBps(25_000_000))
 
         // WAN/TURN-friendly per-resolution floors
-        assertEquals(400_000, LowLatencyEncoderMath.minBitrateForResolution(540, 1206))
-        assertEquals(700_000, LowLatencyEncoderMath.minBitrateForResolution(720, 1610))
-        assertEquals(900_000, LowLatencyEncoderMath.minBitrateForResolution(900, 2012))
-        assertEquals(1_200_000, LowLatencyEncoderMath.minBitrateForResolution(2414, 1080))
+        assertEquals(300_000, LowLatencyEncoderMath.minBitrateForResolution(540, 1206))
+        assertEquals(350_000, LowLatencyEncoderMath.minBitrateForResolution(720, 1610))
+        assertEquals(400_000, LowLatencyEncoderMath.minBitrateForResolution(900, 2012))
+        assertEquals(500_000, LowLatencyEncoderMath.minBitrateForResolution(2414, 1080))
         assertEquals(
-            700_000,
-            LowLatencyEncoderMath.clampBitrateBps(500_000, LowLatencyEncoderMath.minBitrateForResolution(720, 1610)),
+            350_000,
+            LowLatencyEncoderMath.clampBitrateBps(200_000, LowLatencyEncoderMath.minBitrateForResolution(720, 1610)),
         )
         assertEquals(
-            900_000,
-            LowLatencyEncoderMath.clampBitrateBps(600_000, LowLatencyEncoderMath.minBitrateForResolution(900, 2012)),
+            400_000,
+            LowLatencyEncoderMath.clampBitrateBps(320_000, LowLatencyEncoderMath.minBitrateForResolution(900, 2012)),
         )
         assertEquals(
-            1_200_000,
-            LowLatencyEncoderMath.clampBitrateBps(800_000, LowLatencyEncoderMath.minBitrateForResolution(1080, 2414)),
+            500_000,
+            LowLatencyEncoderMath.clampBitrateBps(420_000, LowLatencyEncoderMath.minBitrateForResolution(1080, 2414)),
         )
 
-        // Relaxed Android 12+ QP caps prevent CBR FrameDropper stalls during full-screen motion
-        assertEquals(12, LowLatencyEncoderMath.QP_MIN)
-        assertEquals(34, LowLatencyEncoderMath.QP_I_MAX)
-        assertEquals(38, LowLatencyEncoderMath.QP_P_MAX)
+        // Bounded Android 12+ QP caps prevent QP-12 VBV explosions and QP-38 FrameDropper spirals
+        assertEquals(20, LowLatencyEncoderMath.QP_MIN)
+        assertEquals(42, LowLatencyEncoderMath.QP_I_MAX)
+        assertEquals(46, LowLatencyEncoderMath.QP_P_MAX)
 
-        // Adaptive SDP/sender min (20% clamped 500..1500 kbps) and start (55% clamped 1200..4000 kbps)
-        assertEquals(500, LowLatencyEncoderMath.computeSdpMinBitrateKbps(1_600))   // ECO
-        assertEquals(900, LowLatencyEncoderMath.computeSdpMinBitrateKbps(4_500))   // BALANCED
-        assertEquals(1_500, LowLatencyEncoderMath.computeSdpMinBitrateKbps(7_500)) // HD
+        // Adaptive SDP/sender min (15% clamped 300..600 kbps) and start (55% clamped 1200..4000 kbps)
+        assertEquals(300, LowLatencyEncoderMath.computeSdpMinBitrateKbps(1_600))   // ECO
+        assertEquals(360, LowLatencyEncoderMath.computeSdpMinBitrateKbps(2_400))   // 720p
+        assertEquals(600, LowLatencyEncoderMath.computeSdpMinBitrateKbps(4_500))   // BALANCED
+        assertEquals(600, LowLatencyEncoderMath.computeSdpMinBitrateKbps(7_500))   // HD
         assertEquals(1_200, LowLatencyEncoderMath.computeSdpStartBitrateKbps(1_600))
         assertEquals(2_475, LowLatencyEncoderMath.computeSdpStartBitrateKbps(4_500))
         assertEquals(4_000, LowLatencyEncoderMath.computeSdpStartBitrateKbps(7_500))
@@ -297,7 +352,9 @@ class LowLatencyEncoderLogicTest {
     }
 
     @Test
-    fun `selectAvcLevel and resolveSupportedAvcLevel pick Level 5_1 for 20-9 HD and Balanced`() {
+    fun `selectAvcLevel, selectAvcProfile, and resolveSupportedAvcLevel pick Level 5_2 for 1080x2414 and prefer Constrained High`() {
+        assertEquals(983_040L, LowLatencyEncoderMath.AVC_LEVEL_51_MAX_MBPS)
+
         // 720p (1280x720 = 3,600 MBs, *120 = 432,000 <= 522,240) and ECO 540x1206 fit Level 4.2
         assertEquals(
             MediaCodecInfo.CodecProfileLevel.AVCLevel42,
@@ -308,7 +365,7 @@ class LowLatencyEncoderLogicTest {
             LowLatencyEncoderMath.selectAvcLevel(540, 1206, 30),
         )
 
-        // 900x2012 (7,182 MBs, *120 = 861,840 > Level 4.2 MaxMBPS 522,240) requires Level 5.1
+        // 900x2012 (7,182 MBs * 120 = 861,840) and 1080x1920 (8,160 MBs * 120 = 979,200 <= 983,040) fit Level 5.1
         assertEquals(
             MediaCodecInfo.CodecProfileLevel.AVCLevel51,
             LowLatencyEncoderMath.selectAvcLevel(900, 2012, 60),
@@ -317,22 +374,74 @@ class LowLatencyEncoderLogicTest {
             MediaCodecInfo.CodecProfileLevel.AVCLevel51,
             LowLatencyEncoderMath.selectAvcLevel(2012, 900, 60),
         )
-
-        // 1080x2414 (10,268 MBs > Level 4.2 MaxFS 8,704) requires Level 5.1 in portrait & landscape
         assertEquals(
             MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+            LowLatencyEncoderMath.selectAvcLevel(1080, 1920, 60),
+        )
+
+        // 1080x2414 (10,268 MBs * 120fps = 1,232,160 > Level 5.1 MaxMBPS 983,040) requires Level 5.2 in portrait & landscape
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel52,
             LowLatencyEncoderMath.selectAvcLevel(1080, 2414, 60),
         )
         assertEquals(
-            MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+            MediaCodecInfo.CodecProfileLevel.AVCLevel52,
             LowLatencyEncoderMath.selectAvcLevel(2414, 1080, 60),
+        )
+
+        // Constrained High preference on API 27+ avoids 2-4 frame decoder DPB reorder lag
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedHigh,
+            LowLatencyEncoderMath.selectAvcProfile(
+                useHighProfile = true,
+                supportedProfiles = setOf(
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline,
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileHigh,
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedHigh,
+                ),
+                sdkInt = Build.VERSION_CODES.O_MR1,
+            ),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCProfileHigh,
+            LowLatencyEncoderMath.selectAvcProfile(
+                useHighProfile = true,
+                supportedProfiles = setOf(
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline,
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileHigh,
+                ),
+                sdkInt = Build.VERSION_CODES.O_MR1,
+            ),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedBaseline,
+            LowLatencyEncoderMath.selectAvcProfile(
+                useHighProfile = true,
+                supportedProfiles = setOf(
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline,
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedBaseline,
+                ),
+                sdkInt = Build.VERSION_CODES.O_MR1,
+            ),
+        )
+        // API 26 falls back cleanly to plain High / Baseline
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCProfileHigh,
+            LowLatencyEncoderMath.selectAvcProfile(
+                useHighProfile = true,
+                supportedProfiles = setOf(
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileHigh,
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedHigh,
+                ),
+                sdkInt = Build.VERSION_CODES.O,
+            ),
         )
 
         // Capability resolution against CodecCapabilities.profileLevels
         assertEquals(
-            MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+            MediaCodecInfo.CodecProfileLevel.AVCLevel52,
             LowLatencyEncoderMath.resolveSupportedAvcLevel(
-                desiredLevel = MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+                desiredLevel = MediaCodecInfo.CodecProfileLevel.AVCLevel52,
                 supportedLevelsForProfile = listOf(MediaCodecInfo.CodecProfileLevel.AVCLevel52),
             ),
         )
@@ -364,6 +473,73 @@ class LowLatencyEncoderLogicTest {
                 supportedLevelsForProfile = emptyList(),
             ),
         )
+    }
+
+    @Test
+    fun `injectSdpBitrateHints replaces existing b=AS after c= without inserting duplicates`() {
+        val sdpWithExistingAs = listOf(
+            "v=0",
+            "o=- 123 2 IN IP4 127.0.0.1",
+            "s=-",
+            "t=0 0",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+            "c=IN IP4 0.0.0.0",
+            "b=AS:64",
+            "a=rtpmap:111 opus/48000/2",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97",
+            "c=IN IP4 0.0.0.0",
+            "b=AS:2000",
+            "a=rtpmap:96 H264/90000",
+            "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f",
+            "a=rtpmap:97 rtx/90000",
+            "a=fmtp:97 apt=96",
+        ).joinToString("\r\n")
+
+        val injectedOnce = WebRtcSessionManager.injectSdpBitrateHints(
+            sdp = sdpWithExistingAs,
+            minKbps = 600,
+            startKbps = 2_475,
+            sessionCeilingKbps = 10_000,
+        )
+        val videoSectionOnce = injectedOnce.substringAfter("m=video ")
+        val videoAsLinesOnce = videoSectionOnce.split("\r\n").filter { it.startsWith("b=AS:") }
+        assertEquals(listOf("b=AS:10000"), videoAsLinesOnce)
+        assertTrue(injectedOnce.contains("b=AS:64\r\n"))
+        assertTrue(
+            injectedOnce.contains(
+                "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640c1f;" +
+                    "x-google-min-bitrate=600;x-google-start-bitrate=2475;x-google-max-bitrate=10000",
+            ),
+        )
+        assertFalse(injectedOnce.contains("a=fmtp:97 apt=96;x-google-min-bitrate"))
+
+        // Idempotency: re-running injectSdpBitrateHints never creates a second b=AS: line
+        val injectedTwice = WebRtcSessionManager.injectSdpBitrateHints(
+            sdp = injectedOnce,
+            minKbps = 600,
+            startKbps = 2_475,
+            sessionCeilingKbps = 10_000,
+        )
+        val videoAsLinesTwice = injectedTwice.substringAfter("m=video ").split("\r\n").filter { it.startsWith("b=AS:") }
+        assertEquals(listOf("b=AS:10000"), videoAsLinesTwice)
+
+        // When b=AS: is absent, inserts exactly one b=AS: right after c=
+        val sdpWithoutAs = listOf(
+            "v=0",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96",
+            "c=IN IP4 0.0.0.0",
+            "a=fmtp:96 packetization-mode=1",
+        ).joinToString("\r\n")
+        val injectedFresh = WebRtcSessionManager.injectSdpBitrateHints(
+            sdp = sdpWithoutAs,
+            minKbps = 300,
+            startKbps = 1_200,
+            sessionCeilingKbps = 10_000,
+        )
+        val freshLines = injectedFresh.split("\r\n")
+        assertEquals(1, freshLines.count { it.startsWith("b=AS:") })
+        assertEquals("c=IN IP4 0.0.0.0", freshLines[2])
+        assertEquals("b=AS:10000", freshLines[3])
     }
 
     @Test

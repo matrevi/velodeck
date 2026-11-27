@@ -67,6 +67,7 @@ interface RemoteViewportProps {
   clientState: RemoteClientState;
   device: DeviceSummary | null;
   apiBase?: string;
+  authToken?: string;
   serverInfo?: ServerInfo;
   onExit: () => void;
 }
@@ -84,9 +85,8 @@ type VideoElementWithRVFC = HTMLVideoElement & {
   cancelVideoFrameCallback?: (handle: number) => void;
 };
 
-const WHEEL_SWIPE_DURATION_MS = 80;
-const WHEEL_SWIPE_COOLDOWN_MS = WHEEL_SWIPE_DURATION_MS + 35; // >= durationMs + 35ms
-const WHEEL_DISPATCH_DELAY_MS = 20;
+const WHEEL_SWIPE_DURATION_MS = 65;
+const WHEEL_SWIPE_COOLDOWN_MS = 80;
 const KEYBOARD_TEXT_DEBOUNCE_MS = 100;
 
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -103,6 +103,7 @@ export function RemoteViewport({
   clientState,
   device,
   apiBase,
+  authToken,
   serverInfo,
   onExit,
 }: RemoteViewportProps) {
@@ -224,11 +225,28 @@ export function RemoteViewport({
     setHasCanvasFrame(false);
   }, [clientState.sessionId]);
 
+  // Reset stuck drag overlay if user cancels drag outside window or window loses focus
+  useEffect(() => {
+    const resetDragOverlay = () => {
+      dragCounterRef.current = 0;
+      setIsDraggingFile(false);
+    };
+    window.addEventListener("dragend", resetDragOverlay);
+    window.addEventListener("blur", resetDragOverlay);
+    window.addEventListener("drop", resetDragOverlay);
+    return () => {
+      window.removeEventListener("dragend", resetDragOverlay);
+      window.removeEventListener("blur", resetDragOverlay);
+      window.removeEventListener("drop", resetDragOverlay);
+    };
+  }, []);
+
   // Attach WebRTC MediaStream + observe first decoded video frame via rVFC when available (P0-2)
   useEffect(() => {
     const videoEl = videoRef.current as VideoElementWithRVFC | null;
     if (!videoEl) return;
 
+    let cancelled = false;
     let rvfcHandle: number | null = null;
     if (clientState.mediaStream) {
       videoEl.srcObject = clientState.mediaStream;
@@ -237,18 +255,23 @@ export function RemoteViewport({
       if (videoEl.readyState >= 2 && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
         markVideoFrameReady();
       } else if (typeof videoEl.requestVideoFrameCallback === "function") {
-        rvfcHandle = videoEl.requestVideoFrameCallback(() => {
+        const onFrame = () => {
           rvfcHandle = null;
+          if (cancelled) return;
           if (videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
             markVideoFrameReady();
+          } else if (typeof videoEl.requestVideoFrameCallback === "function") {
+            rvfcHandle = videoEl.requestVideoFrameCallback(onFrame);
           }
-        });
+        };
+        rvfcHandle = videoEl.requestVideoFrameCallback(onFrame);
       }
     } else {
       videoEl.srcObject = null;
     }
 
     return () => {
+      cancelled = true;
       if (
         rvfcHandle !== null &&
         typeof videoEl.cancelVideoFrameCallback === "function"
@@ -672,13 +695,7 @@ export function RemoteViewport({
     acc.dx += e.deltaX * modeScale;
     acc.dy += e.deltaY * modeScale;
 
-    if (acc.timer !== null) return;
-
-    const elapsedSinceLast = Date.now() - acc.lastDispatchedAt;
-    const remainingCooldown = Math.max(0, WHEEL_SWIPE_COOLDOWN_MS - elapsedSinceLast);
-    const delayMs = Math.max(WHEEL_DISPATCH_DELAY_MS, remainingCooldown);
-
-    acc.timer = window.setTimeout(() => {
+    const dispatchWheelSwipe = () => {
       const dx = acc.dx;
       const dy = acc.dy;
       const cx = acc.x;
@@ -709,7 +726,22 @@ export function RemoteViewport({
         },
         targetDeviceId,
       );
-    }, delayMs);
+    };
+
+    if (acc.timer !== null) return;
+
+    const elapsedSinceLast = Date.now() - acc.lastDispatchedAt;
+    const remainingCooldown = Math.max(0, WHEEL_SWIPE_COOLDOWN_MS - elapsedSinceLast);
+    if (remainingCooldown === 0) {
+      if (Math.abs(acc.dy) >= 4 || Math.abs(acc.dx) >= 4) {
+        dispatchWheelSwipe();
+        return;
+      }
+      acc.timer = window.setTimeout(dispatchWheelSwipe, 16);
+      return;
+    }
+
+    acc.timer = window.setTimeout(dispatchWheelSwipe, remainingCooldown);
   }
 
   const handleToggleDock = useCallback(() => {
@@ -822,14 +854,25 @@ export function RemoteViewport({
     setApkFetchState({ active: true, loaded: 0, total: 0, error: null });
 
     let apkBytes: Uint8Array;
+    let headerSha: string | undefined;
     try {
+      const bearerToken =
+        authToken ?? (clientState.authType === "account" ? client.getAuthToken() : null);
+      const headers: Record<string, string> = {};
+      if (bearerToken) {
+        headers.Authorization = `Bearer ${bearerToken}`;
+      }
       const res = await fetch(downloadUrl, {
         method: "GET",
+        cache: "no-store",
+        headers: Object.keys(headers).length > 0 ? headers : undefined,
         signal: controller.signal,
       });
       if (!res.ok) {
         throw new Error(`拉取服务器最新 APK 失败 (HTTP ${res.status})`);
       }
+      const rawHeaderSha = res.headers.get("x-apk-sha256")?.trim().toLowerCase() || "";
+      headerSha = /^[0-9a-f]{64}$/.test(rawHeaderSha) ? rawHeaderSha : undefined;
       const headerLen = Number(res.headers.get("content-length") ?? "0");
       const total = Number.isFinite(headerLen) && headerLen > 0 ? headerLen : 0;
 
@@ -882,7 +925,7 @@ export function RemoteViewport({
         fileName: "velodeck-agent.apk",
         mimeType: "application/vnd.android.package-archive",
         purpose: "apk_install",
-        expectedSha256: serverInfo?.apkSha256,
+        expectedSha256: headerSha,
       });
     } catch {
       // RemoteClient already records error state and surfaces toast notice
@@ -931,8 +974,7 @@ export function RemoteViewport({
     const file = e.dataTransfer.files?.[0];
     if (!file) return;
     setActivePanel("files");
-    const isApk = file.name.toLowerCase().endsWith(".apk");
-    void handleSendLocalFile(file, isApk ? "apk_install" : "file");
+    void handleSendLocalFile(file);
   }
 
   const activeFileTransfer = clientState.fileTransfer;
@@ -1013,6 +1055,12 @@ export function RemoteViewport({
           disablePictureInPicture
           disableRemotePlayback
           style={{ willChange: "transform" }}
+          onLoadedMetadata={(e) => {
+            const el = e.currentTarget;
+            if (el.videoWidth > 0 && el.videoHeight > 0) {
+              markVideoFrameReady();
+            }
+          }}
           onLoadedData={(e) => {
             const el = e.currentTarget;
             if (el.videoWidth > 0 && el.videoHeight > 0) {
@@ -1020,6 +1068,12 @@ export function RemoteViewport({
             }
           }}
           onPlaying={(e) => {
+            const el = e.currentTarget;
+            if (el.videoWidth > 0 && el.videoHeight > 0) {
+              markVideoFrameReady();
+            }
+          }}
+          onResize={(e) => {
             const el = e.currentTarget;
             if (el.videoWidth > 0 && el.videoHeight > 0) {
               markVideoFrameReady();
@@ -1054,7 +1108,9 @@ export function RemoteViewport({
               <FileUp className="h-6 w-6" />
             </div>
             <p className="text-sm font-semibold text-white">
-              松手即通过 WebRTC P2P 直传到手机（.apk 将自动拉起安装）
+              {autoInstallApk
+                ? "松手即通过 WebRTC P2P 直传到手机（.apk 将自动拉起安装）"
+                : "松手即通过 WebRTC P2P 直传到手机"}
             </p>
             <p className="mt-1.5 text-xs text-zinc-400">
               {isFileChannelReady
@@ -1606,7 +1662,7 @@ export function RemoteViewport({
 
             <div>
               <p className="mb-2 text-xs font-medium text-zinc-400">硬件按键</p>
-              <div className="grid grid-cols-4 gap-1.5">
+              <div className="grid grid-cols-3 gap-1.5">
                 <DockButton
                   icon={<Moon className={`h-4 w-4 ${device?.blackScreenActive ? "text-indigo-300" : "text-indigo-400"}`} />}
                   label={device?.blackScreenActive ? "关闭伪装黑屏" : "伪装黑屏"}
@@ -1863,7 +1919,7 @@ const WebRtcTelemetryStrip = memo(function WebRtcTelemetryStrip({
         : "border-[#262B37] bg-[#14171F] text-zinc-300";
 
   const iceTone =
-    telemetry.icePair === "TURN Relay"
+    telemetry.icePair?.startsWith("TURN")
       ? "border-amber-500/35 bg-amber-500/15 text-amber-300"
       : "border-emerald-500/30 bg-emerald-500/10 text-emerald-300";
 

@@ -1,6 +1,7 @@
 package com.velodeck.agent.network
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import com.velodeck.agent.capture.EncodedJpegFrame
 import com.velodeck.agent.capture.ScreenCaptureManager
@@ -74,6 +75,7 @@ class SessionCoordinator(
             val msg: WireMessage.ControlCmd,
             val sink: SessionSink?,
             val viaDataChannel: Boolean,
+            val receivedUptimeMs: Long = SystemClock.uptimeMillis(),
         ) : ControlDispatch
 
         data object CancelActiveTouch : ControlDispatch
@@ -438,18 +440,21 @@ class SessionCoordinator(
 
     /**
      * Single sequential consumer for all touch/gesture commands so packet arrival order is
-     * strictly preserved (`TouchUp` can never overtake `TouchDown`) and backlogged consecutive
-     * `TouchMove` packets for the same pointer are coalesced to the latest coordinate.
+     * strictly preserved (`TouchUp` can never overtake `TouchDown`), out-of-order `TouchMove`
+     * packets are rejected by monotonic `seq`, and backlogged consecutive `TouchMove` packets
+     * for the same pointer are coalesced to the highest `seq`.
      */
     private fun startTouchActor() {
         scope.launch {
             var pendingNext: ControlDispatch? = null
+            val lastTouchMoveSeqByPointer = mutableMapOf<Int, Int>()
             while (true) {
                 val first = pendingNext ?: touchChannel.receiveCatching().getOrNull() ?: break
                 pendingNext = null
 
                 when (first) {
                     is ControlDispatch.CancelActiveTouch -> {
+                        lastTouchMoveSeqByPointer.clear()
                         try {
                             VeloDeckAccessibilityService.instance?.cancelActiveTouch()
                         } catch (ce: CancellationException) {
@@ -460,28 +465,62 @@ class SessionCoordinator(
                     }
 
                     is ControlDispatch.Command -> {
-                        var current = first
+                        var current: ControlDispatch.Command = first
+                        var skipExecution = false
                         val firstCmd = first.msg.command
-                        if (firstCmd is ControlCommand.TouchMove) {
-                            val pointerId = firstCmd.pointerId
-                            val sessionId = first.msg.sessionId
-                            while (true) {
-                                val next = touchChannel.tryReceive().getOrNull() ?: break
-                                if (next is ControlDispatch.Command &&
-                                    next.msg.sessionId == sessionId &&
-                                    next.msg.command is ControlCommand.TouchMove &&
-                                    next.msg.command.pointerId == pointerId
-                                ) {
-                                    current = next
+                        when (firstCmd) {
+                            is ControlCommand.TouchDown -> {
+                                lastTouchMoveSeqByPointer.clear()
+                            }
+
+                            is ControlCommand.TouchUp -> {
+                                lastTouchMoveSeqByPointer.remove(firstCmd.pointerId)
+                            }
+
+                            is ControlCommand.Pinch -> {
+                                lastTouchMoveSeqByPointer.clear()
+                            }
+
+                            is ControlCommand.TouchMove -> {
+                                val pointerId = firstCmd.pointerId
+                                val sessionId = first.msg.sessionId
+                                while (true) {
+                                    val next = touchChannel.tryReceive().getOrNull() ?: break
+                                    if (next is ControlDispatch.Command &&
+                                        next.msg.sessionId == sessionId &&
+                                        next.msg.command is ControlCommand.TouchMove &&
+                                        next.msg.command.pointerId == pointerId
+                                    ) {
+                                        if (shouldPreferCoalescedTouchMove(current.msg.seq, next.msg.seq)) {
+                                            current = next
+                                        }
+                                    } else {
+                                        pendingNext = next
+                                        break
+                                    }
+                                }
+                                val lastSeq = lastTouchMoveSeqByPointer[pointerId]
+                                if (!shouldAcceptTouchMoveSeq(lastSeq, current.msg.seq)) {
+                                    skipExecution = true
                                 } else {
-                                    pendingNext = next
-                                    break
+                                    current.msg.seq?.let { seq ->
+                                        lastTouchMoveSeqByPointer[pointerId] = seq
+                                    }
                                 }
                             }
+
+                            else -> Unit
                         }
-                        if (current.msg.sessionId.isBlank() || sessions.containsKey(current.msg.sessionId)) {
+                        if (!skipExecution &&
+                            (current.msg.sessionId.isBlank() || sessions.containsKey(current.msg.sessionId))
+                        ) {
                             try {
-                                executeControlCommand(current.msg, current.sink, current.viaDataChannel)
+                                executeControlCommand(
+                                    msg = current.msg,
+                                    sink = current.sink,
+                                    viaDataChannel = current.viaDataChannel,
+                                    receivedUptimeMs = current.receivedUptimeMs,
+                                )
                             } catch (ce: CancellationException) {
                                 throw ce
                             } catch (t: Throwable) {
@@ -499,12 +538,13 @@ class SessionCoordinator(
         sink: SessionSink?,
         viaDataChannel: Boolean,
     ) {
+        val receivedUptimeMs = SystemClock.uptimeMillis()
         if (isGestureCommand(msg.command)) {
-            touchChannel.trySend(ControlDispatch.Command(msg, sink, viaDataChannel))
+            touchChannel.trySend(ControlDispatch.Command(msg, sink, viaDataChannel, receivedUptimeMs))
             return
         }
         scope.launch {
-            executeControlCommand(msg, sink, viaDataChannel)
+            executeControlCommand(msg, sink, viaDataChannel, receivedUptimeMs)
         }
     }
 
@@ -512,6 +552,7 @@ class SessionCoordinator(
         msg: WireMessage.ControlCmd,
         sink: SessionSink?,
         viaDataChannel: Boolean,
+        receivedUptimeMs: Long = SystemClock.uptimeMillis(),
     ) {
         val deviceId = configStore.current.deviceId
         val cmd = msg.command
@@ -560,9 +601,17 @@ class SessionCoordinator(
                     if (cmd is ControlCommand.Key && cmd.key == RemoteKey.LOCK) {
                         onRemoteLockRequested?.invoke()
                     }
-                    a11y.executeCommand(cmd, configuredPin = configStore.current.unlockPin)
+                    a11y.executeCommand(
+                        command = cmd,
+                        configuredPin = configStore.current.unlockPin,
+                        eventUptimeMs = receivedUptimeMs,
+                    )
                 }
             }
+        }
+
+        if (!shouldSendControlAck(cmd, ok)) {
+            return
         }
 
         val ack = WireMessage.ControlAck(
@@ -793,6 +842,33 @@ class SessionCoordinator(
             IceServerConfig(urls = listOf("stun:stun.miwifi.com:3478")),
             IceServerConfig(urls = listOf("stun:stun.chat.bilibili.com:3478")),
         )
+
+        /**
+         * Returns `true` when a `TouchMove` command's sequence number strictly advances past the
+         * last executed `TouchMove` for the same pointer (or when either side omits `seq`).
+         */
+        internal fun shouldAcceptTouchMoveSeq(lastSeq: Int?, candidateSeq: Int?): Boolean {
+            if (candidateSeq == null || lastSeq == null) return true
+            return candidateSeq > lastSeq
+        }
+
+        /**
+         * During consecutive `TouchMove` coalescing, always keep the move with the highest `seq`
+         * so out-of-order delayed packets can never overwrite newer coordinates.
+         */
+        internal fun shouldPreferCoalescedTouchMove(currentSeq: Int?, nextSeq: Int?): Boolean {
+            if (nextSeq == null) return currentSeq == null
+            if (currentSeq == null) return true
+            return nextSeq > currentSeq
+        }
+
+        /**
+         * Suppresses successful `TouchMove` ACKs to avoid flooding SCTP/rtcExecutor with ~50 JSON
+         * ACKs/sec while preserving error ACKs and ACKs for all discrete commands.
+         */
+        internal fun shouldSendControlAck(cmd: ControlCommand, ok: Boolean): Boolean {
+            return !(ok && cmd is ControlCommand.TouchMove)
+        }
 
         /**
          * Detects lightweight DataChannel `dc.ping` keepalive frames so they can be ignored

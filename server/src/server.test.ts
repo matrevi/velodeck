@@ -238,7 +238,7 @@ async function startServer(
   };
 }
 
-test("buildIceServers generates RFC coturn HMAC-SHA1 ephemeral credentials, static fallback, and rejects weak TURN_SECRET", () => {
+test("buildIceServers emits per-URL ordered TURN entries (UDP first, then TCP/TLS), HMAC-SHA1 credentials, static fallback, and rejects weak TURN_SECRET", () => {
   const nowMs = 1_750_000_000_000;
   const ttl = 1800;
   const secret = "coturn-shared-secret-xyz-strong-01";
@@ -247,7 +247,11 @@ test("buildIceServers generates RFC coturn HMAC-SHA1 ephemeral credentials, stat
   const ephemeral = buildIceServers(
     {
       stunUrls: ["stun:stun.example.com:3478"],
-      turnUrls: ["turn:turn.example.com:3478?transport=udp", "turns:turn.example.com:5349"],
+      turnUrls: [
+        "turns:turn.example.com:5349",
+        "turn:turn.example.com:3478?transport=tcp",
+        "turn:turn.example.com:3478?transport=udp",
+      ],
       turnSecret: secret,
       turnUsername: "ignored-static",
       turnPassword: "ignored-password",
@@ -257,11 +261,9 @@ test("buildIceServers generates RFC coturn HMAC-SHA1 ephemeral credentials, stat
     nowMs,
   );
 
-  assert.equal(ephemeral.length, 2);
+  assert.equal(ephemeral.length, 4);
   assert.deepEqual(ephemeral[0], { urls: ["stun:stun.example.com:3478"] });
 
-  const turnEntry = ephemeral[1];
-  assert.ok(turnEntry);
   const expectedExpiry = Math.floor(nowMs / 1000) + ttl;
   const expectedUsername = `${expectedExpiry}:${clientId}`;
   const expectedCredential = crypto
@@ -269,18 +271,30 @@ test("buildIceServers generates RFC coturn HMAC-SHA1 ephemeral credentials, stat
     .update(expectedUsername, "utf8")
     .digest("base64");
 
-  assert.deepEqual(turnEntry.urls, [
-    "turn:turn.example.com:3478?transport=udp",
-    "turns:turn.example.com:5349",
-  ]);
-  assert.equal(turnEntry.username, expectedUsername);
-  assert.equal(turnEntry.credential, expectedCredential);
+  assert.deepEqual(ephemeral[1], {
+    urls: ["turn:turn.example.com:3478?transport=udp"],
+    username: expectedUsername,
+    credential: expectedCredential,
+  });
+  assert.deepEqual(ephemeral[2], {
+    urls: ["turn:turn.example.com:3478?transport=tcp"],
+    username: expectedUsername,
+    credential: expectedCredential,
+  });
+  assert.deepEqual(ephemeral[3], {
+    urls: ["turns:turn.example.com:5349"],
+    username: expectedUsername,
+    credential: expectedCredential,
+  });
 
   // Static fallback when turnSecret is omitted
   const staticIce = buildIceServers(
     {
       stunUrls: ["stun:stun.example.com:3478"],
-      turnUrls: ["turn:turn.example.com:3478"],
+      turnUrls: [
+        "turn:turn.example.com:3478?transport=tcp",
+        "turn:turn.example.com:3478?transport=udp",
+      ],
       turnUsername: "static-user",
       turnPassword: "static-pass",
       turnTtlSeconds: ttl,
@@ -289,9 +303,14 @@ test("buildIceServers generates RFC coturn HMAC-SHA1 ephemeral credentials, stat
     nowMs,
   );
 
-  assert.equal(staticIce.length, 2);
+  assert.equal(staticIce.length, 3);
   assert.deepEqual(staticIce[1], {
-    urls: ["turn:turn.example.com:3478"],
+    urls: ["turn:turn.example.com:3478?transport=udp"],
+    username: "static-user",
+    credential: "static-pass",
+  });
+  assert.deepEqual(staticIce[2], {
+    urls: ["turn:turn.example.com:3478?transport=tcp"],
     username: "static-user",
     credential: "static-pass",
   });
@@ -1500,7 +1519,7 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
   assert.equal(infoBefore.status, 200);
   assert.deepEqual(await infoBefore.json(), {
     ok: true,
-    version: "1.0.4",
+    version: "1.0.5",
     hasAndroidApk: false,
     apkSha256: null,
     registrationMode: "first-user-then-invite",
@@ -1521,7 +1540,7 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
   assert.equal(infoAfter.status, 200);
   assert.deepEqual(await infoAfter.json(), {
     ok: true,
-    version: "1.0.4",
+    version: "1.0.5",
     hasAndroidApk: true,
     apkSha256: expectedSha256,
     registrationMode: "first-user-then-invite",
@@ -1529,12 +1548,14 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
     requiresInviteCode: false,
   });
 
-  // Primary route + /api/download/android both serve velodeck-agent.apk
+  // Primary route + /api/download/android both serve velodeck-agent.apk and expose X-APK-SHA256 over CORS
   for (const dlRoute of [
     "/api/download/velodeck-agent.apk",
     "/api/download/android",
   ]) {
-    const dlRes = await fetch(`${baseUrl}${dlRoute}`);
+    const dlRes = await fetch(`${baseUrl}${dlRoute}`, {
+      headers: { Origin: baseUrl },
+    });
     assert.equal(dlRes.status, 200);
     assert.equal(dlRes.headers.get("content-type"), "application/vnd.android.package-archive");
     assert.equal(
@@ -1543,6 +1564,10 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
     );
     assert.equal(dlRes.headers.get("content-length"), String(fakeApkBytes.byteLength));
     assert.equal(dlRes.headers.get("x-apk-sha256"), expectedSha256);
+    assert.equal(
+      dlRes.headers.get("access-control-expose-headers"),
+      "X-APK-SHA256, Content-Length, Content-Range, ETag",
+    );
     const receivedBytes = Buffer.from(await dlRes.arrayBuffer());
     assert.deepEqual(receivedBytes, fakeApkBytes);
   }
@@ -1733,7 +1758,7 @@ test("[P0-4] Changing controlPassword immediately closes (4001) existing code-au
   assert.equal(authedNew.type, "controller.authed");
 });
 
-test("[P1-1] Agent unbindOwner=true clears owner, kicks old owner session, and closes old owner socket", async (t) => {
+test("[P1-1] Agent unbindOwner=true clears owner, kicks ONLY that device's session & notifies offline, without killing other devices' sessions or closing the account socket", async (t) => {
   const { server, baseUrl, wsUrl } = await startServer();
   t.after(() => server.close());
 
@@ -1746,7 +1771,10 @@ test("[P1-1] Agent unbindOwner=true clears owner, kicks old owner session, and c
   ).json()) as { token: string };
 
   const agent1 = await TestWsClient.connect(wsUrl);
-  t.after(() => agent1.close());
+  const agentKeep = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent1.close(), agentKeep.close()]);
+  });
   agent1.sendJson(
     makeAgentRegister({
       deviceId: "dev-unbind-me",
@@ -1758,6 +1786,17 @@ test("[P1-1] Agent unbindOwner=true clears owner, kicks old owner session, and c
   const reg1 = await agent1.nextJson<AgentRegisteredMessage>();
   assert.equal(reg1.ownerUsername, "boundowner");
 
+  agentKeep.sendJson(
+    makeAgentRegister({
+      deviceId: "dev-keep-me",
+      deviceSecret: "keep-secret-2",
+      authToken: reg.token,
+      controlPassword: "device-pass-456",
+    }),
+  );
+  const regKeep = await agentKeep.nextJson<AgentRegisteredMessage>();
+  assert.equal(regKeep.ownerUsername, "boundowner");
+
   const ownerCtrl = await TestWsClient.connect(wsUrl);
   t.after(() => ownerCtrl.close());
   ownerCtrl.sendJson({
@@ -1766,8 +1805,9 @@ test("[P1-1] Agent unbindOwner=true clears owner, kicks old owner session, and c
     clientId: "ctrl-owner-1",
   });
   const ownerAuthed = await ownerCtrl.nextJson<ControllerAuthedMessage>();
-  assert.equal(ownerAuthed.devices.length, 1);
+  assert.equal(ownerAuthed.devices.length, 2);
 
+  // Start sessions on BOTH devices
   ownerCtrl.sendJson({
     type: "session.request",
     sessionId: "sess-owner-1",
@@ -1776,9 +1816,18 @@ test("[P1-1] Agent unbindOwner=true clears owner, kicks old owner session, and c
     quality: QUALITY_PRESETS.eco,
   } satisfies SessionRequestMessage);
   await agent1.nextJson<SessionRequestMessage>();
-  assert.equal(server.hub.getStats().activeSessions, 1);
 
-  // Agent reconnects with unbindOwner: true (authenticated by deviceSecret)
+  ownerCtrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-owner-keep",
+    deviceId: "dev-keep-me",
+    preferredTransport: "ws-jpeg",
+    quality: QUALITY_PRESETS.eco,
+  } satisfies SessionRequestMessage);
+  await agentKeep.nextJson<SessionRequestMessage>();
+  assert.equal(server.hub.getStats().activeSessions, 2);
+
+  // Agent 1 reconnects with unbindOwner: true (authenticated by deviceSecret)
   const agent2 = await TestWsClient.connect(wsUrl);
   t.after(() => agent2.close());
   agent2.sendJson(
@@ -1791,24 +1840,63 @@ test("[P1-1] Agent unbindOwner=true clears owner, kicks old owner session, and c
     }),
   );
 
-  const [reg2, ownerClose] = await Promise.all([
+  const [reg2, ctrlMsg1, ctrlMsg2] = await Promise.all([
     agent2.nextJson<AgentRegisteredMessage>(),
-    ownerCtrl.waitForClose(),
+    ownerCtrl.nextJson(),
+    ownerCtrl.nextJson(),
   ]);
 
   assert.equal(reg2.type, "agent.registered");
   assert.equal(reg2.ownerUsername, undefined);
-  assert.equal(ownerClose.code, 4001);
-  assert.equal(ownerClose.reason, "CREDENTIALS_CHANGED");
-  assert.equal(server.hub.getStats().activeSessions, 0);
 
-  // Former owner's /api/auth/me shows 0 devices
+  const received = [ctrlMsg1, ctrlMsg2];
+  const ended = received.find((m) => m.type === "session.end") as SessionEndMessage | undefined;
+  const offline = received.find((m) => m.type === "device.status") as
+    | DeviceStatusMessage
+    | undefined;
+  assert.ok(ended, "expected session.end for unbound device");
+  assert.equal(ended.sessionId, "sess-owner-1");
+  assert.equal(ended.deviceId, "dev-unbind-me");
+  assert.equal(ended.reason, "device_unbound");
+  assert.ok(offline, "expected offline device.status for unbound device");
+  assert.equal(offline.device.deviceId, "dev-unbind-me");
+  assert.equal(offline.device.online, false);
+
+  // Only dev-unbind-me's session ended; account WS stays OPEN and dev-keep-me's session stays alive!
+  assert.equal(server.hub.getStats().activeSessions, 1);
+  assert.equal(server.hub.getStats().controllersConnected, 1);
+
+  // Former owner can NO LONGER access dev-unbind-me (UNAUTHORIZED)
+  ownerCtrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-owner-retry",
+    deviceId: "dev-unbind-me",
+    preferredTransport: "ws-jpeg",
+    quality: QUALITY_PRESETS.eco,
+  } satisfies SessionRequestMessage);
+  const deniedErr = await ownerCtrl.nextJson<ErrorMessage>();
+  assert.equal(deniedErr.code, "UNAUTHORIZED");
+
+  // Meanwhile, existing session on dev-keep-me continues working uninterrupted!
+  ownerCtrl.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-owner-keep",
+    deviceId: "dev-keep-me",
+    seq: 5,
+    command: { action: "tap", x: 0.5, y: 0.5 },
+  } satisfies ControlCmdMessage);
+  const forwardedKeep = await agentKeep.nextJson<ControlCmdMessage>();
+  assert.equal(forwardedKeep.sessionId, "sess-owner-keep");
+  assert.equal(forwardedKeep.deviceId, "dev-keep-me");
+
+  // Former owner's /api/auth/me shows ONLY dev-keep-me
   const meAfter = (await (
     await fetch(`${baseUrl}/api/auth/me`, {
       headers: { Authorization: `Bearer ${reg.token}` },
     })
-  ).json()) as { devices: unknown[] };
-  assert.equal(meAfter.devices.length, 0);
+  ).json()) as { devices: Array<{ deviceId: string }> };
+  assert.equal(meAfter.devices.length, 1);
+  assert.equal(meAfter.devices[0]?.deviceId, "dev-keep-me");
 });
 
 test("[P0-5] Per-controlCode progressive lockout blocks brute-force across different IPs and legacy scrypt hashes remain readable", async (t) => {
@@ -2429,19 +2517,20 @@ test("[P0-1] Per-session fresh TURN HMAC credentials injected into session.reque
   } satisfies SessionRequestMessage);
 
   const fwdReq = await agent.nextJson<SessionRequestMessage>();
-  assert.ok(Array.isArray(fwdReq.iceServers) && fwdReq.iceServers.length === 2);
-  const agentTurn = fwdReq.iceServers[1];
-  assert.ok(agentTurn?.username && agentTurn.credential);
-  assert.match(agentTurn.username, /^\d+:agent-dev-fresh-turn$/);
+  assert.ok(Array.isArray(fwdReq.iceServers) && fwdReq.iceServers.length === 3);
+  const agentTurnUdp = fwdReq.iceServers[1];
+  const agentTurnTcp = fwdReq.iceServers[2];
+  assert.ok(agentTurnUdp?.username && agentTurnUdp.credential);
+  assert.match(agentTurnUdp.username, /^\d+:agent-dev-fresh-turn$/);
   const expectedAgentCred = crypto
     .createHmac("sha1", turnSecret)
-    .update(agentTurn.username, "utf8")
+    .update(agentTurnUdp.username, "utf8")
     .digest("base64");
-  assert.equal(agentTurn.credential, expectedAgentCred);
-  assert.deepEqual(agentTurn.urls, [
-    "turn:203.0.113.10:3478?transport=udp",
-    "turn:203.0.113.10:3478?transport=tcp",
-  ]);
+  assert.equal(agentTurnUdp.credential, expectedAgentCred);
+  assert.deepEqual(agentTurnUdp.urls, ["turn:203.0.113.10:3478?transport=udp"]);
+  assert.deepEqual(agentTurnTcp?.urls, ["turn:203.0.113.10:3478?transport=tcp"]);
+  assert.equal(agentTurnTcp?.username, agentTurnUdp.username);
+  assert.equal(agentTurnTcp?.credential, expectedAgentCred);
 
   // session.ready should carry fresh controller TURN credentials
   agent.sendJson({
@@ -2455,7 +2544,7 @@ test("[P0-1] Per-session fresh TURN HMAC credentials injected into session.reque
   } satisfies SessionReadyMessage);
 
   const fwdReady = await ctrl.nextJson<SessionReadyMessage>();
-  assert.ok(Array.isArray(fwdReady.iceServers) && fwdReady.iceServers.length === 2);
+  assert.ok(Array.isArray(fwdReady.iceServers) && fwdReady.iceServers.length === 3);
   const ctrlTurn = fwdReady.iceServers[1];
   assert.ok(ctrlTurn?.username && ctrlTurn.credential);
   assert.match(ctrlTurn.username, /^\d+:ctrl-ctrl-fresh-01$/);
@@ -2464,6 +2553,8 @@ test("[P0-1] Per-session fresh TURN HMAC credentials injected into session.reque
     .update(ctrlTurn.username, "utf8")
     .digest("base64");
   assert.equal(ctrlTurn.credential, expectedCtrlCred);
+  assert.deepEqual(ctrlTurn.urls, ["turn:203.0.113.10:3478?transport=udp"]);
+  assert.deepEqual(fwdReady.iceServers[2]?.urls, ["turn:203.0.113.10:3478?transport=tcp"]);
 
   // Invalid session.request parameters are rejected before storing/forwarding
   ctrl.sendJson({
@@ -2880,15 +2971,27 @@ test("APK download supports .apk URL alias, Accept-Ranges, ETag, 206 Partial Con
   assert.equal(notModRes.headers.get("etag"), expectedEtag);
 });
 
-test("coturn.conf never uses CIDR notation or wildcard denied-peer-ip=:: that blocks all IPv4/IPv6 peers", async () => {
+test("coturn.conf avoids CIDR/wildcard denied-peer-ip, redundant lt-cred-mech, and invalid no-loopback-peers", async () => {
   const coturnConfPath = path.resolve(
     path.dirname(new URL(import.meta.url).pathname),
     "../coturn.conf",
   );
   const raw = await fsp.readFile(coturnConfPath, "utf8");
-  const deniedLines = raw
+  const activeLines = raw
     .split(/\r?\n/)
     .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+  assert.equal(
+    activeLines.includes("lt-cred-mech"),
+    false,
+    "lt-cred-mech is redundant/conflicting with use-auth-secret",
+  );
+  assert.equal(
+    activeLines.includes("no-loopback-peers"),
+    false,
+    "no-loopback-peers is invalid in coturn 4.6 config",
+  );
+  const deniedLines = activeLines
     .filter((line) => line.startsWith("denied-peer-ip="))
     .map((line) => line.slice("denied-peer-ip=".length).trim());
 
@@ -3123,4 +3226,124 @@ test("forcePortraitActive propagates on register/telemetry/clone and force_portr
   assert.equal(inSessionCmd.type, "control.cmd");
   assert.equal(inSessionCmd.sessionId, "sess-portrait-1");
   assert.deepEqual(inSessionCmd.command, { action: "force_portrait", enabled: false });
+});
+
+test("black_screen and force_portrait log distinct audit events (never control.unlock), quality commands are validated, and TURN_SECRET without TURN_URLS warns", async (t) => {
+  // 1. loadConfig warns when TURN_SECRET is set with empty TURN_URLS and no PUBLIC_IP
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(" "));
+  };
+  try {
+    const cfg = loadConfig({ TURN_SECRET: "strong-turn-secret-without-urls-12345" });
+    assert.deepEqual(cfg.turnUrls, []);
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.ok(
+    warnings.some((w) => w.includes("TURN_SECRET") && w.includes("TURN_URLS")),
+    `expected startup warning for TURN_SECRET without TURN_URLS, got: ${warnings.join(" | ")}`,
+  );
+
+  // 2. Verify audit events for black_screen & force_portrait + quality validation
+  const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "velodeck-audit-ctrl-test-"));
+  const { server, baseUrl, wsUrl } = await startServer({ dataDir });
+  t.after(async () => {
+    await server.close();
+    await fsp.rm(dataDir, { recursive: true, force: true });
+  });
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "audit_ctrl_user", password: "audit-password-123" }),
+  });
+  const { token } = (await regRes.json()) as { token: string };
+
+  const agent = await TestWsClient.connect(wsUrl);
+  const ctrl = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent.close(), ctrl.close()]);
+  });
+
+  agent.sendJson(
+    makeAgentRegister({
+      deviceId: "dev-audit-01",
+      deviceSecret: "audit-secret-01",
+      authToken: token,
+    }),
+  );
+  await agent.nextJson<AgentRegisteredMessage>();
+
+  ctrl.sendJson({ type: "controller.auth", authToken: token, clientId: "ctrl-audit-1" });
+  await ctrl.nextJson<ControllerAuthedMessage>();
+
+  // Sessionless black_screen and force_portrait
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "dev-audit-01",
+    seq: 1,
+    command: { action: "black_screen", enabled: true },
+  } satisfies ControlCmdMessage);
+  await agent.nextJson<ControlCmdMessage>();
+
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "dev-audit-01",
+    seq: 2,
+    command: { action: "force_portrait", enabled: true },
+  } satisfies ControlCmdMessage);
+  await agent.nextJson<ControlCmdMessage>();
+
+  // In-session quality validation
+  ctrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-quality-01",
+    deviceId: "dev-audit-01",
+    preferredTransport: "webrtc",
+    quality: QUALITY_PRESETS.balanced,
+  } satisfies SessionRequestMessage);
+  await agent.nextJson<SessionRequestMessage>();
+
+  // Invalid quality -> rejected with INVALID_MESSAGE
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-quality-01",
+    deviceId: "dev-audit-01",
+    seq: 3,
+    command: {
+      action: "quality",
+      quality: { maxWidth: 0, fps: -10, bitrateKbps: 1000, jpegQuality: 70 },
+    },
+  } satisfies ControlCmdMessage);
+  const badQualityErr = await ctrl.nextJson<ErrorMessage>();
+  assert.equal(badQualityErr.code, "INVALID_MESSAGE");
+
+  // Valid quality -> forwarded cleanly
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-quality-01",
+    deviceId: "dev-audit-01",
+    seq: 4,
+    command: { action: "quality", quality: QUALITY_PRESETS.hd },
+  } satisfies ControlCmdMessage);
+  const forwardedQuality = await agent.nextJson<ControlCmdMessage>();
+  assert.deepEqual(forwardedQuality.command, {
+    action: "quality",
+    quality: QUALITY_PRESETS.hd,
+  });
+
+  // Verify audit.jsonl records exact control.black_screen & control.force_portrait (zero control.unlock!)
+  await server.hub.audit.flush();
+  const auditLines = (await fsp.readFile(path.join(dataDir, "audit.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { event: string });
+  const events = auditLines.map((e) => e.event);
+  assert.ok(events.includes("control.black_screen"), `expected control.black_screen in ${events.join(",")}`);
+  assert.ok(events.includes("control.force_portrait"), `expected control.force_portrait in ${events.join(",")}`);
+  assert.equal(events.includes("control.unlock"), false, "black_screen/force_portrait must NEVER be logged as control.unlock");
 });

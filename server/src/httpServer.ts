@@ -19,7 +19,7 @@ import type { ServerConfig } from "./config.js";
 import { extractClientIp, isLoopbackIp, VeloDeckHub } from "./hub.js";
 import { isValidDeviceId, VeloDeckStore, StoreError } from "./store.js";
 
-const SERVER_VERSION = "1.0.4";
+const SERVER_VERSION = "1.0.5";
 const MAX_JSON_BODY_BYTES = 32 * 1024;
 const MAX_WS_PAYLOAD_BYTES = 2 * 1024 * 1024; // 2 MB
 
@@ -200,6 +200,7 @@ function buildApiCorsHeaders(
         "Access-Control-Allow-Origin": origin.trim(),
         "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Token",
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Expose-Headers": "X-APK-SHA256, Content-Length, Content-Range, ETag",
         Vary: "Origin",
       },
       originAllowed: true,

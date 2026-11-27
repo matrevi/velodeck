@@ -99,4 +99,32 @@ class RelayClientStartLogicTest {
             ),
         )
     }
+
+    @Test
+    fun heartbeatWatchdog_evaluatesMonotonicElapsedThresholdAccurately() {
+        assertFalse(
+            RelayClient.isHeartbeatTimedOut(
+                nowElapsedMs = 100_000L,
+                lastActivityElapsedMs = 100_000L,
+            ),
+        )
+        assertFalse(
+            RelayClient.isHeartbeatTimedOut(
+                nowElapsedMs = 115_000L,
+                lastActivityElapsedMs = 100_000L,
+            ),
+        )
+        assertFalse(
+            RelayClient.isHeartbeatTimedOut(
+                nowElapsedMs = 135_000L,
+                lastActivityElapsedMs = 100_000L,
+            ),
+        )
+        assertTrue(
+            RelayClient.isHeartbeatTimedOut(
+                nowElapsedMs = 135_001L,
+                lastActivityElapsedMs = 100_000L,
+            ),
+        )
+    }
 }

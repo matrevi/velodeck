@@ -172,7 +172,7 @@ describe("GestureRecognizer", () => {
     recognizer.dispose();
   });
 
-  it("classifies a quick flick past 12px as a clean swipe", () => {
+  it("classifies a quick flick within 45ms and <=28px intermediate move as a clean swipe", () => {
     const commands: ControlCommand[] = [];
     const recognizer = new GestureRecognizer({
       onCommand: (cmd) => commands.push(cmd),
@@ -190,20 +190,20 @@ describe("GestureRecognizer", () => {
     recognizer.onPointerMove({
       pointerId: 1,
       clientX: 200,
-      clientY: 400,
+      clientY: 580,
       containerRect: container,
       contentW,
       contentH,
-      timestampMs: 1060,
+      timestampMs: 1020,
     });
     recognizer.onPointerUp({
       pointerId: 1,
       clientX: 200,
-      clientY: 200,
+      clientY: 400,
       containerRect: container,
       contentW,
       contentH,
-      timestampMs: 1140,
+      timestampMs: 1040,
     });
 
     expect(commands).toEqual([
@@ -212,8 +212,8 @@ describe("GestureRecognizer", () => {
         x1: 0.5,
         y1: 0.75,
         x2: 0.5,
-        y2: 0.25,
-        durationMs: 140,
+        y2: 0.5,
+        durationMs: 60,
       },
     ]);
     recognizer.dispose();
@@ -501,7 +501,7 @@ describe("GestureRecognizer", () => {
     recognizer.dispose();
   });
 
-  it("smoothly transitions from quick-flick window (>115ms) into continuous drag without a giant teleport spike", () => {
+  it("enters live continuous drag immediately when displacement exceeds 28px before 45ms and tracks 1:1 from startNorm", () => {
     const commands: ControlCommand[] = [];
     const recognizer = new GestureRecognizer({
       onCommand: (cmd) => commands.push(cmd),
@@ -517,41 +517,103 @@ describe("GestureRecognizer", () => {
       contentH,
       timestampMs: 0,
     });
-    // Still inside 115ms quick-flick window -> no touch_down yet
+    // Small move (16px: past 6px threshold, <= 28px, inside 45ms) -> still waiting in short flick window
     recognizer.onPointerMove({
       pointerId: 9,
       clientX: 200,
-      clientY: 480, // norm y = 0.6
+      clientY: 624, // norm y = 0.78
       containerRect: container,
       contentW,
       contentH,
-      timestampMs: 80,
+      timestampMs: 15,
     });
     expect(commands).toHaveLength(0);
 
-    // Crosses 115ms window far from start (0.8 -> 0.4) -> touch_down anchored smoothly near 0.4
+    // Displacement exceeds 28px (40px total) at 25ms -> enters continuous live drag IMMEDIATELY without waiting 45ms,
+    // anchored at exact startNorm (0.5, 0.8) with zero offset clamp!
     recognizer.onPointerMove({
       pointerId: 9,
       clientX: 200,
-      clientY: 320, // norm y = 0.4
+      clientY: 600, // norm y = 0.75
       containerRect: container,
       contentW,
       contentH,
-      timestampMs: 120,
+      timestampMs: 25,
     });
 
+    expect(commands).toEqual([
+      { action: "touch_down", pointerId: 9, x: 0.5, y: 0.8 },
+      { action: "touch_move", pointerId: 9, x: 0.5, y: 0.75 },
+    ]);
+
+    // Default moveThrottleMs is 14ms: +10ms throttled, +14ms emitted
+    recognizer.onPointerMove({
+      pointerId: 9,
+      clientX: 200,
+      clientY: 560, // norm y = 0.7
+      containerRect: container,
+      contentW,
+      contentH,
+      timestampMs: 35,
+    });
     expect(commands).toHaveLength(2);
-    const downCmd = commands[0];
-    const moveCmd = commands[1];
-    expect(downCmd?.action).toBe("touch_down");
-    expect(moveCmd?.action).toBe("touch_move");
-    if (downCmd?.action === "touch_down" && moveCmd?.action === "touch_move") {
-      expect(moveCmd.x).toBe(0.5);
-      expect(moveCmd.y).toBe(0.4);
-      const jump = Math.hypot(moveCmd.x - downCmd.x, moveCmd.y - downCmd.y);
-      expect(jump).toBeLessThanOrEqual(0.065);
-      expect(downCmd.y).toBeCloseTo(0.46, 2);
-    }
+
+    recognizer.onPointerMove({
+      pointerId: 9,
+      clientX: 200,
+      clientY: 520, // norm y = 0.65
+      containerRect: container,
+      contentW,
+      contentH,
+      timestampMs: 39,
+    });
+    expect(commands).toHaveLength(3);
+    expect(commands[2]).toEqual({ action: "touch_move", pointerId: 9, x: 0.5, y: 0.65 });
+
+    recognizer.dispose();
+  });
+
+  it("transitions into 1:1 continuous drag after 45ms even for small displacements (>6px, <=28px)", () => {
+    const commands: ControlCommand[] = [];
+    const recognizer = new GestureRecognizer({
+      onCommand: (cmd) => commands.push(cmd),
+      dragMode: "auto",
+    });
+
+    recognizer.onPointerDown({
+      pointerId: 10,
+      clientX: 200,
+      clientY: 640, // norm y = 0.8
+      containerRect: container,
+      contentW,
+      contentH,
+      timestampMs: 0,
+    });
+    recognizer.onPointerMove({
+      pointerId: 10,
+      clientX: 200,
+      clientY: 632, // 8px (>= 6px threshold, <= 28px)
+      containerRect: container,
+      contentW,
+      contentH,
+      timestampMs: 30,
+    });
+    expect(commands).toHaveLength(0);
+
+    recognizer.onPointerMove({
+      pointerId: 10,
+      clientX: 200,
+      clientY: 620, // 20px (<= 28px), elapsed = 50ms > 45ms
+      containerRect: container,
+      contentW,
+      contentH,
+      timestampMs: 50,
+    });
+
+    expect(commands).toEqual([
+      { action: "touch_down", pointerId: 10, x: 0.5, y: 0.8 },
+      { action: "touch_move", pointerId: 10, x: 0.5, y: 0.775 },
+    ]);
 
     recognizer.dispose();
   });

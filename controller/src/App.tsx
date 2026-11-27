@@ -671,6 +671,9 @@ export function App() {
           clientState={clientState}
           device={activeDevice}
           apiBase={activeApiBase}
+          authToken={
+            clientState.authType === "account" ? savedAccount?.authToken : undefined
+          }
           serverInfo={serverInfo}
           onExit={handleExitViewport}
         />

@@ -56,4 +56,16 @@ describe("sha256 utility", () => {
     const expected = createHash("sha256").update(bytes).digest("hex");
     await expect(computeSha256Hex(bytes)).resolves.toBe(expected);
   });
+
+  it("yields to the event loop every 2 MB in the pure-JS fallback while producing exact digests", async () => {
+    vi.stubGlobal("crypto", {});
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const big = new Uint8Array(2 * 1024 * 1024 + 512);
+    for (let i = 0; i < big.length; i += 4096) {
+      big[i] = (i * 13 + 5) & 0xff;
+    }
+    const expected = createHash("sha256").update(big).digest("hex");
+    await expect(computeSha256Hex(big)).resolves.toBe(expected);
+    expect(setTimeoutSpy).toHaveBeenCalled();
+  });
 });

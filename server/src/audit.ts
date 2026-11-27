@@ -29,7 +29,9 @@ export type AuditEvent =
   | "session.start"
   | "session.end"
   | "control.wake"
-  | "control.unlock";
+  | "control.unlock"
+  | "control.black_screen"
+  | "control.force_portrait";
 
 export interface AuditRecordInput {
   event: AuditEvent;

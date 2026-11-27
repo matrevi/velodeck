@@ -72,6 +72,20 @@ function getSafeStorage(storage?: Storage): Storage | null {
   return null;
 }
 
+function getSafeSessionStorage(storage?: Storage): Storage | null {
+  if (storage) return storage;
+  try {
+    if (typeof window !== "undefined" && window.sessionStorage) {
+      return window.sessionStorage;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+let inMemoryClientId: string | null = null;
+
 export function generateId(prefix = "prof"): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return `${prefix}-${crypto.randomUUID().slice(0, 12)}`;
@@ -593,7 +607,7 @@ export function importQuickConnectProfile(
 }
 
 export function getOrCreateClientId(storage?: Storage): string {
-  const store = getSafeStorage(storage);
+  const store = getSafeSessionStorage(storage);
   if (store) {
     try {
       const existing = store.getItem(CLIENT_ID_STORAGE_KEY);
@@ -601,15 +615,22 @@ export function getOrCreateClientId(storage?: Storage): string {
     } catch {
       // Ignore
     }
+  } else if (inMemoryClientId) {
+    return inMemoryClientId;
   }
 
   const created = generateId("ctrl");
   if (store) {
     try {
       store.setItem(CLIENT_ID_STORAGE_KEY, created);
+      return created;
     } catch {
-      // Ignore
+      // Fall back to per-tab in-memory ID if sessionStorage write fails
     }
+  }
+  if (!storage) {
+    if (inMemoryClientId) return inMemoryClientId;
+    inMemoryClientId = created;
   }
   return created;
 }

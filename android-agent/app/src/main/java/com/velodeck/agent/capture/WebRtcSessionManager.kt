@@ -123,6 +123,7 @@ class WebRtcSessionManager(
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val lastFrameCapturedElapsedMs = AtomicLong(0L)
+    private val lastRealFrameElapsedMs = AtomicLong(0L)
     private val capturedFrameCount = AtomicLong(0L)
 
     @Volatile
@@ -151,6 +152,7 @@ class WebRtcSessionManager(
             return try {
                 PeerConnectionFactory.initialize(
                     PeerConnectionFactory.InitializationOptions.builder(appContext)
+                        .setFieldTrials(WEBRTC_FIELD_TRIALS)
                         .setEnableInternalTracer(false)
                         .createInitializationOptions(),
                 )
@@ -185,12 +187,22 @@ class WebRtcSessionManager(
     ): Boolean {
         if (!ensureInitialized()) return false
         if (rtcExecutor.isShutdown) return false
+        val cancelled = AtomicBoolean(false)
         return try {
             rtcExecutor.submit<Boolean> {
-                startSessionOnExecutor(sessionId, iceServers, quality, createOfferImmediately)
+                startSessionOnExecutor(sessionId, iceServers, quality, createOfferImmediately, cancelled)
             }.get(START_SESSION_TIMEOUT_SEC, TimeUnit.SECONDS)
         } catch (t: Throwable) {
+            cancelled.set(true)
             Log.e(TAG, "startSession($sessionId) failed or timed out on rtcExecutor", t)
+            if (!rtcExecutor.isShutdown) {
+                try {
+                    rtcExecutor.execute {
+                        closeSessionOnExecutor(sessionId)
+                    }
+                } catch (_: Throwable) {
+                }
+            }
             false
         }
     }
@@ -200,9 +212,18 @@ class WebRtcSessionManager(
         iceServers: List<IceServerConfig>,
         quality: StreamQuality,
         createOfferImmediately: Boolean,
+        cancelled: AtomicBoolean,
     ): Boolean {
+        if (cancelled.get()) {
+            Log.w(TAG, "startSessionOnExecutor($sessionId) skipped; already cancelled before start")
+            return false
+        }
         // Tear down any previous session sequentially on rtcExecutor without holding locks across JNI
         closeSessionInternal()
+        if (cancelled.get()) {
+            Log.w(TAG, "startSessionOnExecutor($sessionId) aborted after closing previous session")
+            return false
+        }
 
         val pcf = factory ?: return false
         val egl = eglBase ?: return false
@@ -214,7 +235,10 @@ class WebRtcSessionManager(
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
-            tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED
+            // Prevent P2P TCP host/srflx selection while still permitting turn:...?transport=tcp fallback
+            tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.DISABLED
+            // Immediately prune TCP TURN once UDP TURN succeeds
+            turnPortPrunePolicy = PeerConnection.PortPrunePolicy.PRUNE_BASED_ON_PRIORITY
             iceCandidatePoolSize = 2
             // Mark RTP/UDP packets with DSCP QoS (WMM AC_VI) to prioritize stream over background downloads
             enableDscp = true
@@ -318,16 +342,22 @@ class WebRtcSessionManager(
         val surface = Surface(sth.surfaceTexture)
         capturedFrameCount.set(0L)
         lastFrameCapturedElapsedMs.set(0L)
+        lastRealFrameElapsedMs.set(0L)
         var lastRawSurfaceTsNs = 0L
         var lastDeliveredTsNs = 0L
         source.capturerObserver.onCapturerStarted(true)
         sth.startListening { frame ->
             val count = capturedFrameCount.incrementAndGet()
-            lastFrameCapturedElapsedMs.set(SystemClock.elapsedRealtime())
+            val nowElapsedMs = SystemClock.elapsedRealtime()
+            lastFrameCapturedElapsedMs.set(nowElapsedMs)
             if (count == 1L) {
                 Log.i(TAG, "First WebRTC frame captured (${frame.rotatedWidth}x${frame.rotatedHeight})")
             }
             val rawTsNs = frame.timestampNs
+            val isRealFrame = rawTsNs > 0L && rawTsNs != lastRawSurfaceTsNs
+            if (isRealFrame) {
+                lastRealFrameElapsedMs.set(nowElapsedMs)
+            }
             // SurfaceTexture.getTimestamp() uses CLOCK_MONOTONIC (System.nanoTime()), NOT CLOCK_BOOTTIME.
             val nowNs = System.nanoTime()
             val deliveredTsNs = LowLatencyEncoderMath.normalizeCaptureTimestampNs(
@@ -336,7 +366,7 @@ class WebRtcSessionManager(
                 lastRawSurfaceTsNs = lastRawSurfaceTsNs,
                 lastDeliveredTsNs = lastDeliveredTsNs,
             )
-            if (rawTsNs > 0L && rawTsNs != lastRawSurfaceTsNs) {
+            if (isRealFrame) {
                 lastRawSurfaceTsNs = rawTsNs
             }
             lastDeliveredTsNs = deliveredTsNs
@@ -348,6 +378,19 @@ class WebRtcSessionManager(
             source.capturerObserver.onFrameCaptured(deliveredFrame)
         }
 
+        if (cancelled.get()) {
+            Log.w(TAG, "startSessionOnExecutor($sessionId) aborted due to timeout before attaching surface")
+            sth.stopListening()
+            source.capturerObserver.onCapturerStopped()
+            surface.release()
+            sth.dispose()
+            track.dispose()
+            source.dispose()
+            pc.close()
+            pc.dispose()
+            return false
+        }
+
         if (!captureManager.attachExternalSurface(surface, w, h)) {
             sth.stopListening()
             source.capturerObserver.onCapturerStopped()
@@ -355,6 +398,20 @@ class WebRtcSessionManager(
             sth.dispose()
             track.dispose()
             source.dispose()
+            pc.close()
+            pc.dispose()
+            return false
+        }
+
+        if (cancelled.get()) {
+            Log.w(TAG, "startSessionOnExecutor($sessionId) aborted after attachExternalSurface due to timeout")
+            sth.stopListening()
+            source.capturerObserver.onCapturerStopped()
+            surface.release()
+            sth.dispose()
+            track.dispose()
+            source.dispose()
+            pc.close()
             pc.dispose()
             return false
         }
@@ -391,7 +448,13 @@ class WebRtcSessionManager(
         try {
             rtcExecutor.execute {
                 val pc = synchronized(stateLock) {
-                    if (activeSessionId != sessionId) null else peerConnection
+                    if (activeSessionId != sessionId) return@synchronized null
+                    val activePc = peerConnection ?: return@synchronized null
+                    // Reset before setRemoteDescription so ICE restart candidates arriving while
+                    // setRemoteDescription runs asynchronously on signaling_thread are queued in
+                    // pendingRemoteIce and flushed cleanly instead of dropped against the old ufrag.
+                    remoteDescriptionSet = false
+                    activePc
                 } ?: return@execute
 
                 Log.i(TAG, "Handling remote WebRTC offer ($sessionId, sdpLen=${sdp.length})")
@@ -608,62 +671,24 @@ class WebRtcSessionManager(
         val presetMaxKbps = resolveTargetBitrateKbps(quality)
         val startKbps = LowLatencyEncoderMath.computeSdpStartBitrateKbps(presetMaxKbps)
         val minKbps = LowLatencyEncoderMath.computeSdpMinBitrateKbps(presetMaxKbps)
-        val sessionCeilingKbps = SDP_SESSION_MAX_BITRATE_KBPS
-        val normalized = sdp.replace("\r\n", "\n").replace("\r", "\n")
-        val lines = normalized.split("\n").toMutableList()
-        var inVideo = false
-        var videoLineIdx = -1
-        val videoPayloadTypes = mutableSetOf<String>()
-
-        for (i in lines.indices) {
-            val line = lines[i]
-            if (line.startsWith("m=video ")) {
-                inVideo = true
-                videoLineIdx = i
-                line.split(" ").drop(3).forEach { videoPayloadTypes.add(it) }
-            } else if (line.startsWith("m=")) {
-                inVideo = false
-            } else if (inVideo && line.startsWith("a=fmtp:")) {
-                val pt = line.substringAfter("a=fmtp:").substringBefore(" ").trim()
-                if (pt in videoPayloadTypes && !line.contains("x-google-start-bitrate") && !line.contains("apt=")) {
-                    lines[i] = "$line;x-google-min-bitrate=$minKbps;x-google-start-bitrate=$startKbps;x-google-max-bitrate=$sessionCeilingKbps"
-                }
-            }
-        }
-
-        if (videoLineIdx >= 0) {
-            // Insert b=AS right after c=IN line in video section if not already present
-            var insertAt = videoLineIdx + 1
-            var hasAs = false
-            while (insertAt < lines.size && !lines[insertAt].startsWith("m=")) {
-                if (lines[insertAt].startsWith("b=AS:")) {
-                    lines[insertAt] = "b=AS:$sessionCeilingKbps"
-                    hasAs = true
-                    break
-                }
-                if (lines[insertAt].startsWith("c=")) {
-                    insertAt++
-                    break
-                }
-                insertAt++
-            }
-            if (!hasAs) {
-                lines.add(insertAt.coerceAtMost(lines.size), "b=AS:$sessionCeilingKbps")
-            }
-        }
-        return lines.joinToString("\r\n")
+        return Companion.injectSdpBitrateHints(
+            sdp = sdp,
+            minKbps = minKbps,
+            startKbps = startKbps,
+            sessionCeilingKbps = SDP_SESSION_MAX_BITRATE_KBPS,
+        )
     }
 
     private fun applyVideoSenderParameters(sender: RtpSender?, quality: StreamQuality) {
         if (sender == null) return
         try {
             val params = sender.parameters ?: return
-            // Prefer smooth 30-60 FPS over constrained WAN/TURN links rather than collapsing to
-            // single-digit FPS while still allowing LAN links to stay at full target bitrate.
-            params.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
+            // Match ScalingSettings.OFF cleanly: bitrate floors (300-500k) + QP_P_MAX=46 adapt
+            // smoothly on WAN/TURN without resolution reinit glitches or FPS collapses.
+            params.degradationPreference = RtpParameters.DegradationPreference.DISABLED
             val maxKbps = resolveTargetBitrateKbps(quality)
             val maxBps = maxKbps * 1_000
-            // Adaptive 20% floor (500-1500 kbps) lets BWE scale smoothly on congested WAN/TURN links
+            // Adaptive 15% floor (300-600 kbps) lets BWE scale smoothly on congested WAN/TURN links
             val minBps = LowLatencyEncoderMath.computeSdpMinBitrateKbps(maxKbps) * 1_000
             val maxFps = resolveTargetFps(quality)
             for (encoding in params.encodings) {
@@ -690,24 +715,29 @@ class WebRtcSessionManager(
                 val now = SystemClock.elapsedRealtime()
                 val ageMs = now - sessionStartedElapsedMs
                 val sinceLastFrameMs = now - lastFrameCapturedElapsedMs.get()
-                val intervalMs = if (ageMs < 3_000L) 250L else 500L
+                val lastRealMs = lastRealFrameElapsedMs.get()
+                val sinceLastRealFrameMs = if (lastRealMs > 0L) now - lastRealMs else Long.MAX_VALUE
+                val intervalMs = LowLatencyEncoderMath.computeStaticPumpIntervalMs(
+                    sessionAgeMs = ageMs,
+                    sinceLastRealFrameMs = sinceLastRealFrameMs,
+                )
                 if (sinceLastFrameMs >= intervalMs) {
                     try {
                         rtcExecutor.execute {
                             if (activeSessionId == sessionId) {
-                                forceCaptureFrameOnExecutor()
+                                forceCaptureFrameOnExecutor(skipIfTextureInUse = true)
                             }
                         }
                     } catch (_: Throwable) {
                     }
                 }
                 if (activeSessionId == sessionId) {
-                    mainHandler.postDelayed(this, intervalMs)
+                    mainHandler.postDelayed(this, LowLatencyEncoderMath.STATIC_PUMP_FAST_INTERVAL_MS)
                 }
             }
         }
         framePumpRunnable = pump
-        mainHandler.postDelayed(pump, 250L)
+        mainHandler.postDelayed(pump, LowLatencyEncoderMath.STATIC_PUMP_FAST_INTERVAL_MS)
     }
 
     private fun stopStaticFramePump() {
@@ -768,9 +798,8 @@ class WebRtcSessionManager(
             var encoderImpl: Any? = null
             var width: Any? = null
             var height: Any? = null
-            var rttMs: String = "--"
-            var localCandId: String? = null
-            var remoteCandId: String? = null
+            var selectedPairId: String? = null
+            var fallbackPairMembers: Map<String, Any>? = null
 
             for (stat in map.values) {
                 val m = stat.members
@@ -787,25 +816,42 @@ class WebRtcSessionManager(
                         }
                     }
 
+                    "transport" -> {
+                        val pairId = m["selectedCandidatePairId"] as? String
+                        if (!pairId.isNullOrBlank()) {
+                            selectedPairId = pairId
+                        }
+                    }
+
                     "candidate-pair" -> {
                         val state = m["state"] as? String
                         val nominated = m["nominated"] as? Boolean == true
                         if (state == "succeeded" && nominated) {
-                            val rttSec = (m["currentRoundTripTime"] as? Number)?.toDouble()
-                            if (rttSec != null) {
-                                rttMs = "${(rttSec * 1000.0).toInt()}ms"
-                            }
-                            localCandId = m["localCandidateId"] as? String
-                            remoteCandId = m["remoteCandidateId"] as? String
+                            fallbackPairMembers = m
                         }
                     }
                 }
             }
 
+            val selectedPairMembers = selectedPairId?.let { map[it]?.members } ?: fallbackPairMembers
+            val rttSec = (selectedPairMembers?.get("currentRoundTripTime") as? Number)?.toDouble()
+            val rttMs = if (rttSec != null) "${(rttSec * 1000.0).toInt()}ms" else "--"
+            val availOutBps = (selectedPairMembers?.get("availableOutgoingBitrate") as? Number)?.toLong()
+            val availOutDesc = if (availOutBps != null) "${availOutBps / 1_000L}kbps" else "--"
+            val localCandId = selectedPairMembers?.get("localCandidateId") as? String
+            val remoteCandId = selectedPairMembers?.get("remoteCandidateId") as? String
+
             val localCand = localCandId?.let { map[it]?.members }
             val remoteCand = remoteCandId?.let { map[it]?.members }
             val pairDesc = if (localCand != null && remoteCand != null) {
-                "${localCand["candidateType"]}(${localCand["ip"] ?: localCand["address"] ?: "?"})" +
+                val localProto = localCand["protocol"] as? String ?: "?"
+                val relayProto = localCand["relayProtocol"] as? String
+                val protoTag = if (!relayProto.isNullOrBlank()) {
+                    "$localProto/relay:$relayProto"
+                } else {
+                    localProto
+                }
+                "${localCand["candidateType"]}[$protoTag](${localCand["ip"] ?: localCand["address"] ?: "?"})" +
                     "->${remoteCand["candidateType"]}(${remoteCand["ip"] ?: remoteCand["address"] ?: "?"})"
             } else {
                 "pending"
@@ -823,7 +869,7 @@ class WebRtcSessionManager(
 
             Log.i(
                 TAG,
-                "WebRtcStats($sessionId): ${width}x${height} fps=$fps rate=${kbps}kbps rtt=$rttMs " +
+                "WebRtcStats($sessionId): ${width}x${height} fps=$fps rate=${kbps}kbps bwe=$availOutDesc rtt=$rttMs " +
                     "retx=$retransmitted limit=$qualityLimit enc=$encoderImpl pair=$pairDesc",
             )
         } catch (_: Throwable) {
@@ -841,9 +887,12 @@ class WebRtcSessionManager(
         }
     }
 
-    private fun forceCaptureFrameOnExecutor() {
+    private fun forceCaptureFrameOnExecutor(skipIfTextureInUse: Boolean = false) {
         val sth = surfaceTextureHelper ?: return
         try {
+            if (skipIfTextureInUse && sth.isTextureInUse) {
+                return
+            }
             sth.forceFrame()
         } catch (_: Throwable) {
         }
@@ -905,11 +954,15 @@ class WebRtcSessionManager(
         if (rtcExecutor.isShutdown) return
         try {
             rtcExecutor.execute {
-                if (sessionId == null || activeSessionId == sessionId) {
-                    closeSessionInternal()
-                }
+                closeSessionOnExecutor(sessionId)
             }
         } catch (_: Throwable) {
+        }
+    }
+
+    private fun closeSessionOnExecutor(sessionId: String?) {
+        if (sessionId == null || activeSessionId == sessionId) {
+            closeSessionInternal()
         }
     }
 
@@ -945,6 +998,7 @@ class WebRtcSessionManager(
         captureManager.setExternalResizeListener(null)
         lastAdaptedWidth = 0
         lastAdaptedHeight = 0
+        lastRealFrameElapsedMs.set(0L)
         controlDataChannelOpen = false
         fileDataChannelOpen = false
 
@@ -1203,6 +1257,72 @@ class WebRtcSessionManager(
         private const val POINTER_CHANNEL_LABEL = "pointer"
         private const val FILE_CHANNEL_LABEL = "file"
         private const val START_SESSION_TIMEOUT_SEC = 4L
-        private const val SDP_SESSION_MAX_BITRATE_KBPS = 10_000
+        internal const val SDP_SESSION_MAX_BITRATE_KBPS = 10_000
+        private const val WEBRTC_FIELD_TRIALS =
+            "WebRTC-VideoRateControl/alr_probing:true,pacing_factor:3.0,bitrate_adjuster:false/" +
+                "WebRTC-Bwe-AlrProbing/Enabled/" +
+                "WebRTC-CongestionWindow/QueueSize:500,MinBitrate:30000,DropFrame:false/"
+
+        /**
+         * Injects `x-google-min-bitrate`, `x-google-start-bitrate`, `x-google-max-bitrate`, and
+         * a single `b=AS:` line into the `m=video` section of an SDP without ever creating
+         * duplicate `b=AS:` lines when one already follows `c=`.
+         */
+        internal fun injectSdpBitrateHints(
+            sdp: String,
+            minKbps: Int,
+            startKbps: Int,
+            sessionCeilingKbps: Int = SDP_SESSION_MAX_BITRATE_KBPS,
+        ): String {
+            val normalized = sdp.replace("\r\n", "\n").replace("\r", "\n")
+            val lines = normalized.split("\n").toMutableList()
+            var inVideo = false
+            var videoLineIdx = -1
+            val videoPayloadTypes = mutableSetOf<String>()
+
+            for (i in lines.indices) {
+                val line = lines[i]
+                if (line.startsWith("m=video ")) {
+                    inVideo = true
+                    videoLineIdx = i
+                    line.split(" ").drop(3).forEach { videoPayloadTypes.add(it) }
+                } else if (line.startsWith("m=")) {
+                    inVideo = false
+                } else if (inVideo && line.startsWith("a=fmtp:")) {
+                    val pt = line.substringAfter("a=fmtp:").substringBefore(" ").trim()
+                    if (pt in videoPayloadTypes && !line.contains("x-google-start-bitrate") && !line.contains("apt=")) {
+                        lines[i] = "$line;x-google-min-bitrate=$minKbps;x-google-start-bitrate=$startKbps;x-google-max-bitrate=$sessionCeilingKbps"
+                    }
+                }
+            }
+
+            if (videoLineIdx >= 0) {
+                // Scan the entire m=video section first for any existing b=AS: line before inserting after c=
+                var videoSectionEnd = videoLineIdx + 1
+                var firstAsIdx = -1
+                var insertAfterCIdx = -1
+                while (videoSectionEnd < lines.size && !lines[videoSectionEnd].startsWith("m=")) {
+                    val line = lines[videoSectionEnd]
+                    if (line.startsWith("b=AS:") && firstAsIdx < 0) {
+                        firstAsIdx = videoSectionEnd
+                    } else if (line.startsWith("c=") && insertAfterCIdx < 0) {
+                        insertAfterCIdx = videoSectionEnd + 1
+                    }
+                    videoSectionEnd++
+                }
+                if (firstAsIdx >= 0) {
+                    lines[firstAsIdx] = "b=AS:$sessionCeilingKbps"
+                    for (idx in (videoSectionEnd - 1) downTo (firstAsIdx + 1)) {
+                        if (lines[idx].startsWith("b=AS:")) {
+                            lines.removeAt(idx)
+                        }
+                    }
+                } else {
+                    val insertAt = if (insertAfterCIdx >= 0) insertAfterCIdx else (videoLineIdx + 1)
+                    lines.add(insertAt.coerceAtMost(lines.size), "b=AS:$sessionCeilingKbps")
+                }
+            }
+            return lines.joinToString("\r\n")
+        }
     }
 }

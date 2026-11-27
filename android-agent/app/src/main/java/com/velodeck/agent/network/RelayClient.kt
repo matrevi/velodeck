@@ -252,7 +252,7 @@ class RelayClient(
             return
         }
 
-        lastPongOrActivityMs.set(System.currentTimeMillis())
+        lastPongOrActivityMs.set(SystemClock.elapsedRealtime())
 
         val socketAlreadyFailed = AtomicBoolean(false)
         val ws = okHttp.newWebSocket(
@@ -271,7 +271,7 @@ class RelayClient(
                         closeSocketSafely(webSocket, "stale")
                         return
                     }
-                    lastPongOrActivityMs.set(System.currentTimeMillis())
+                    lastPongOrActivityMs.set(SystemClock.elapsedRealtime())
                     val regMsg = registerBuilder()
                     try {
                         webSocket.send(ProtocolCodec.serialize(regMsg))
@@ -283,7 +283,7 @@ class RelayClient(
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     if (gen != connectionGen.get()) return
-                    lastPongOrActivityMs.set(System.currentTimeMillis())
+                    lastPongOrActivityMs.set(SystemClock.elapsedRealtime())
                     handleIncomingText(text)
                 }
 
@@ -345,7 +345,7 @@ class RelayClient(
             }
 
             is WireMessage.Pong -> {
-                lastPongOrActivityMs.set(System.currentTimeMillis())
+                lastPongOrActivityMs.set(SystemClock.elapsedRealtime())
             }
 
             is WireMessage.Error -> {
@@ -378,8 +378,10 @@ class RelayClient(
                     delay(HEARTBEAT_INTERVAL_MS)
                     if (gen != connectionGen.get()) break
 
-                    val idleMs = System.currentTimeMillis() - lastPongOrActivityMs.get()
-                    if (idleMs > HEARTBEAT_TIMEOUT_MS) {
+                    val nowElapsedMs = SystemClock.elapsedRealtime()
+                    val lastActivityElapsedMs = lastPongOrActivityMs.get()
+                    if (isHeartbeatTimedOut(nowElapsedMs, lastActivityElapsedMs)) {
+                        val idleMs = nowElapsedMs - lastActivityElapsedMs
                         Log.w(TAG, "Relay heartbeat timeout (${idleMs}ms); forcing reconnect")
                         // Increment connectionGen BEFORE ws.cancel() so onFailure never double-triggers handleSocketGone
                         val nextGen = synchronized(socketLock) {
@@ -493,6 +495,12 @@ class RelayClient(
         private const val RECONNECT_DEBOUNCE_MS = 500L
         // Tight backpressure cap (48 KB = 1-2 frames) eliminates multi-second TCP bufferbloat on ws-jpeg fallback
         private const val MAX_OUTBOUND_QUEUE_BYTES = 48L * 1024L
+
+        internal fun isHeartbeatTimedOut(
+            nowElapsedMs: Long,
+            lastActivityElapsedMs: Long,
+            timeoutMs: Long = HEARTBEAT_TIMEOUT_MS,
+        ): Boolean = (nowElapsedMs - lastActivityElapsedMs) > timeoutMs
 
         fun shouldReconnectOnStart(
             running: Boolean,

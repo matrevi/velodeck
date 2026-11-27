@@ -120,6 +120,7 @@ class FakeRTCPeerConnection {
   fileDc: FakeDataChannel | null = null;
   channels = new Map<string, FakeDataChannel>();
   offerCalls: Array<RTCOfferOptions | undefined> = [];
+  addedIceCandidates: RTCIceCandidateInit[] = [];
   statsEntries: Array<Record<string, unknown>> = [];
 
   ontrack: ((ev: unknown) => void) | null = null;
@@ -175,8 +176,8 @@ class FakeRTCPeerConnection {
     // No-op
   }
 
-  async addIceCandidate(): Promise<void> {
-    // No-op
+  async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
+    this.addedIceCandidates.push(candidate);
   }
 
   close(): void {
@@ -609,7 +610,7 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
       expect(pc).toBeDefined();
       expect(pc?.config).toEqual({
         iceServers: [{ urls: ["stun:stun.miwifi.com:3478"] }],
-        iceCandidatePoolSize: 2,
+        iceCandidatePoolSize: 0,
         bundlePolicy: "max-bundle",
         rtcpMuxPolicy: "require",
       });
@@ -737,7 +738,7 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
     }
   });
 
-  it("sets ultra-low-latency receiver hints (16ms), polls rich WebRTC telemetry with deltas/ICE pair, supports requestKeyframe, and resets telemetry on stop/disconnect", async () => {
+  it("sets 0ms jitterBufferTarget without clobbering playoutDelayHint, polls rich WebRTC telemetry with deltas/ICE pair & TURN protocol, preserves deltas across connected/completed, supports requestKeyframe, and resets telemetry on stop/disconnect", async () => {
     vi.useFakeTimers();
     const { client, ws } = setupConnectedClient(
       makeDeviceSummary({ mediaProjection: true, webrtc: true }),
@@ -760,7 +761,8 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
     expect(pc).toBeDefined();
     expect(client.getState().webrtcTelemetry).toBeNull();
 
-    // Trigger ontrack with playoutDelayHint / jitterBufferTarget receiver
+    // Trigger ontrack with receiver supporting both jitterBufferTarget & playoutDelayHint:
+    // MUST prefer jitterBufferTarget = 0 and NOT write playoutDelayHint back-to-back.
     const fakeReceiver = {
       playoutDelayHint: 0.1,
       jitterBufferTarget: 100,
@@ -771,8 +773,8 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
       streams: [fakeStream],
       track: {} as MediaStreamTrack,
     });
-    expect(fakeReceiver.playoutDelayHint).toBe(0.016);
-    expect(fakeReceiver.jitterBufferTarget).toBe(16);
+    expect(fakeReceiver.jitterBufferTarget).toBe(0);
+    expect(fakeReceiver.playoutDelayHint).toBe(0.1);
 
     // requestKeyframe dispatches over open DataChannel
     const kfResult = client.requestKeyframe();
@@ -840,6 +842,10 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
       freezeCount: 0,
       icePair: "P2P直连 (IPv4)",
     });
+
+    // Subsequent iceConnectionState -> completed must NOT restart stats timer or reset deltas!
+    pc.iceConnectionState = "completed";
+    pc.oniceconnectionstatechange?.();
 
     // Sample 2: 1 second later, +400_000 bytes (3200 kbps), delta decode 2.5ms, delta buffer 14.5ms, IPv6 host pair
     pc.statsEntries = [
@@ -923,7 +929,7 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
     await vi.advanceTimersByTimeAsync(1_000);
     expect(client.getState().webrtcTelemetry?.icePair).toBe("P2P穿透 (NAT)");
 
-    // Sample 5: relay -> TURN Relay
+    // Sample 5: relay without protocol -> TURN Relay
     pc.statsEntries = [
       {
         id: "pair-1",
@@ -939,6 +945,54 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
     await vi.advanceTimersByTimeAsync(1_000);
     expect(client.getState().webrtcRoute).toBe("turn");
     expect(client.getState().webrtcTelemetry?.icePair).toBe("TURN Relay");
+
+    // Sample 6: relay with relayProtocol udp -> TURN (UDP)
+    pc.statsEntries = [
+      {
+        id: "pair-1",
+        type: "candidate-pair",
+        nominated: true,
+        state: "succeeded",
+        localCandidateId: "loc-turn-udp",
+        remoteCandidateId: "rem-turn",
+      },
+      {
+        id: "loc-turn-udp",
+        type: "local-candidate",
+        candidateType: "relay",
+        address: "8.8.8.8",
+        protocol: "udp",
+        relayProtocol: "udp",
+      },
+      { id: "rem-turn", type: "remote-candidate", candidateType: "srflx", address: "5.6.7.8" },
+    ];
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(client.getState().webrtcRoute).toBe("turn");
+    expect(client.getState().webrtcTelemetry?.icePair).toBe("TURN (UDP)");
+
+    // Sample 7: relay with relayProtocol tcp -> TURN (TCP)
+    pc.statsEntries = [
+      {
+        id: "pair-1",
+        type: "candidate-pair",
+        nominated: true,
+        state: "succeeded",
+        localCandidateId: "loc-turn-tcp",
+        remoteCandidateId: "rem-turn",
+      },
+      {
+        id: "loc-turn-tcp",
+        type: "local-candidate",
+        candidateType: "relay",
+        address: "8.8.8.8",
+        protocol: "udp",
+        relayProtocol: "tcp",
+      },
+      { id: "rem-turn", type: "remote-candidate", candidateType: "srflx", address: "5.6.7.8" },
+    ];
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(client.getState().webrtcRoute).toBe("turn");
+    expect(client.getState().webrtcTelemetry?.icePair).toBe("TURN (TCP)");
 
     // stopSession resets webrtcTelemetry to null
     client.stopSession();
@@ -1242,7 +1296,7 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
     client.disconnect();
   });
 
-  it("P1-3: uses unordered pointer DataChannel for touch_move with backpressure drop, control DC failover, and 180ms keepalive", async () => {
+  it("P1-3: uses in-order partial-reliability pointer DataChannel ({ ordered: true, maxRetransmits: 0 }), avoids touch split-transport & first-move races, drops under backpressure, and sends 180ms keepalive", async () => {
     vi.useFakeTimers();
     const { client, ws } = setupConnectedClient(
       makeDeviceSummary({ mediaProjection: true, webrtc: true }),
@@ -1264,14 +1318,40 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
     expect(pc.dc?.label).toBe("control");
     expect(pc.dc?.options).toEqual({ ordered: true });
     expect(pc.pointerDc?.label).toBe("pointer");
-    expect(pc.pointerDc?.options).toEqual({ ordered: false, maxRetransmits: 0 });
+    expect(pc.pointerDc?.options).toEqual({ ordered: true, maxRetransmits: 0 });
 
-    // touch_move routes over pointer DC
+    // Standalone touch_move routes over pointer DC
     const moveRes = client.sendCommand({ action: "touch_move", pointerId: 1, x: 0.5, y: 0.5 });
     expect(moveRes.sent).toBe(true);
     expect(moveRes.channel).toBe("datachannel");
     expect(pc.pointerDc?.sent).toHaveLength(1);
     expect(pc.dc?.sent).toHaveLength(0);
+
+    // Full gesture over DC: touch_down + first touch_move stay on ordered control DC;
+    // subsequent touch_move routes over pointer DC; touch_up closes on control DC.
+    const downRes = client.sendCommand({ action: "touch_down", pointerId: 2, x: 0.1, y: 0.1 });
+    const firstMoveRes = client.sendCommand({ action: "touch_move", pointerId: 2, x: 0.2, y: 0.2 });
+    const secondMoveRes = client.sendCommand({ action: "touch_move", pointerId: 2, x: 0.3, y: 0.3 });
+    const upRes = client.sendCommand({ action: "touch_up", pointerId: 2, x: 0.4, y: 0.4 });
+    expect(downRes.channel).toBe("datachannel");
+    expect(firstMoveRes.channel).toBe("datachannel");
+    expect(secondMoveRes.channel).toBe("datachannel");
+    expect(upRes.channel).toBe("datachannel");
+    expect(pc.dc?.sent).toHaveLength(3); // touch_down, first touch_move, touch_up
+    expect(pc.pointerDc?.sent).toHaveLength(2); // standalone move + second touch_move
+
+    // Split-transport guard: if touch_down falls back to WS (control DC congested/closed),
+    // subsequent touch_move and touch_up of that gesture MUST remain on WS (never jump to pointer DC!).
+    pc.dc!.readyState = "connecting";
+    const wsDown = client.sendCommand({ action: "touch_down", pointerId: 3, x: 0.2, y: 0.2 });
+    expect(wsDown.channel).toBe("websocket");
+    pc.dc!.readyState = "open"; // even if control DC opens mid-gesture, keep gesture on WS!
+    const wsMove = client.sendCommand({ action: "touch_move", pointerId: 3, x: 0.3, y: 0.3 });
+    const wsUp = client.sendCommand({ action: "touch_up", pointerId: 3, x: 0.4, y: 0.4 });
+    expect(wsMove.channel).toBe("websocket");
+    expect(wsUp.channel).toBe("websocket");
+    expect(pc.pointerDc?.sent).toHaveLength(2);
+    expect(pc.dc?.sent).toHaveLength(3);
 
     // Backpressure > 4096 drops stale touch_move
     pc.pointerDc!.bufferedAmount = 5_000;
@@ -1281,9 +1361,10 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
     pc.pointerDc!.bufferedAmount = 0;
 
     // Non-move command routes over control DC, and fails over to WS if bufferedAmount > 65536
+    const dcSentBeforeTap = pc.dc!.sent.length;
     const tapRes = client.sendCommand({ action: "tap", x: 0.2, y: 0.3 });
     expect(tapRes.channel).toBe("datachannel");
-    expect(pc.dc?.sent).toHaveLength(1);
+    expect(pc.dc?.sent).toHaveLength(dcSentBeforeTap + 1);
 
     pc.dc!.bufferedAmount = 70_000;
     const failoverRes = client.sendCommand({ action: "key", key: "back" });
@@ -1314,6 +1395,94 @@ describe("RemoteClient WebRTC transport resolution, auto-upgrade, auto-resume, a
     expect(client.getState().nextReconnectAt).toBeNull();
 
     client.disconnect();
+  });
+
+  it("clears stale sessionId and tears down PC on terminal session errors so sessionless wake works, and queues remote ICE during ICE restart", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { client, ws } = setupConnectedClient(
+        makeDeviceSummary({ mediaProjection: true, webrtc: true }),
+      );
+      expect(client.getAuthToken()).toBe("jwt-valid");
+
+      client.startSession("dev-1", { preferredTransport: "webrtc" });
+      const sessId = client.getState().sessionId!;
+      ws.emitJson({
+        type: "session.ready",
+        sessionId: sessId,
+        deviceId: "dev-1",
+        transport: "webrtc",
+        screenWidth: 1080,
+        screenHeight: 2400,
+        rotation: 0,
+      });
+      await Promise.resolve();
+
+      const pc = FakeRTCPeerConnection.instances[0]!;
+      ws.emitJson({ type: "rtc.answer", sessionId: sessId, deviceId: "dev-1", sdp: "v=0\r\n" });
+      await Promise.resolve();
+      pc.connectionState = "connected";
+      pc.iceConnectionState = "connected";
+      pc.onconnectionstatechange?.();
+
+      // Trigger ICE restart after 4s disconnect -> remoteDescriptionReady resets to false
+      pc.iceConnectionState = "disconnected";
+      pc.oniceconnectionstatechange?.();
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(pc.offerCalls).toHaveLength(2);
+
+      // Remote ICE arriving before restart rtc.answer MUST be queued, NOT applied prematurely!
+      const restartCandidate = { candidate: "candidate:restart 1 udp 1 1.2.3.4 5000 typ host" };
+      ws.emitJson({
+        type: "rtc.ice",
+        sessionId: sessId,
+        deviceId: "dev-1",
+        candidate: restartCandidate,
+      });
+      await Promise.resolve();
+      expect(pc.addedIceCandidates).toHaveLength(0);
+
+      // Once restart rtc.answer arrives, queued ICE candidate flushes cleanly
+      ws.emitJson({
+        type: "rtc.answer",
+        sessionId: sessId,
+        deviceId: "dev-1",
+        sdp: "v=0\r\na=ice-restart-answer\r\n",
+      });
+      await Promise.resolve();
+      expect(pc.addedIceCandidates).toEqual([restartCandidate]);
+
+      // Terminal session error (INTERNAL_ERROR) tears down PC & clears sessionId
+      ws.emitJson({
+        type: "error",
+        code: "INTERNAL_ERROR",
+        message: "MediaProjection not yet granted",
+        sessionId: sessId,
+        deviceId: "dev-1",
+      });
+      expect(client.getState().sessionStatus).toBe("error");
+      expect(client.getState().sessionId).toBeNull();
+      expect(client.getState().activeTransport).toBeNull();
+      expect(client.getState().mediaStream).toBeNull();
+      expect(client.getState().dataChannelOpen).toBe(false);
+      expect(client.getState().fileChannelOpen).toBe(false);
+      expect(pc.connectionState).toBe("closed");
+
+      // Clicking "强制唤醒" sends sessionless wake (sessionId: "") over WS instead of stale sessionId!
+      const wakeRes = client.sendCommand({ action: "wake" }, "dev-1");
+      expect(wakeRes.sent).toBe(true);
+      expect(wakeRes.channel).toBe("websocket");
+      const lastWsMsg = parseSentMessages(ws).at(-1);
+      expect(lastWsMsg?.type).toBe("control.cmd");
+      expect(lastWsMsg?.sessionId).toBe("");
+      expect(lastWsMsg?.deviceId).toBe("dev-1");
+      expect(lastWsMsg?.command).toEqual({ action: "wake" });
+
+      client.disconnect();
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it("decays static ws-jpeg FPS to 0 after 1s, decays stale unchanged WebRTC framesPerSecond to 0, and clears remoteClipboard on session transitions", async () => {
@@ -1738,30 +1907,15 @@ describe("RemoteClient WebRTC P2P file transfer", () => {
 });
 
 describe("selectAdaptivePlayoutDelayMs and isWebRtcStaticIdle", () => {
-  it("selects coarse playout delay buckets for LAN P2P, moderate WAN, high RTT, and TURN", () => {
-    // LAN / low-RTT P2P (< 25ms) -> 16ms
-    expect(selectAdaptivePlayoutDelayMs("p2p", 1)).toBe(16);
-    expect(selectAdaptivePlayoutDelayMs("p2p", 12)).toBe(16);
-    expect(selectAdaptivePlayoutDelayMs("p2p", 24)).toBe(16);
-
-    // Moderate WAN (25ms <= rtt < 60ms, non-TURN) -> 30ms
-    expect(selectAdaptivePlayoutDelayMs("p2p", 25)).toBe(30);
-    expect(selectAdaptivePlayoutDelayMs("p2p", 42)).toBe(30);
-    expect(selectAdaptivePlayoutDelayMs("p2p", 59)).toBe(30);
-    expect(selectAdaptivePlayoutDelayMs(null, 35)).toBe(30);
-
-    // High RTT (>= 60ms) or TURN relay -> 45ms
-    expect(selectAdaptivePlayoutDelayMs("p2p", 60)).toBe(45);
-    expect(selectAdaptivePlayoutDelayMs("p2p", 110)).toBe(45);
-    expect(selectAdaptivePlayoutDelayMs(null, 65)).toBe(45);
-    expect(selectAdaptivePlayoutDelayMs("turn", 10)).toBe(45);
-    expect(selectAdaptivePlayoutDelayMs("turn", 40)).toBe(45);
-    expect(selectAdaptivePlayoutDelayMs("turn", 85)).toBe(45);
-    expect(selectAdaptivePlayoutDelayMs("turn", null)).toBe(45);
-
-    // Missing RTT on non-TURN route preserves fallback bucket without thrashing
-    expect(selectAdaptivePlayoutDelayMs("p2p", null, 30)).toBe(30);
-    expect(selectAdaptivePlayoutDelayMs(null, null, 16)).toBe(16);
+  it("uses 0ms playout delay floor across P2P, WAN, and TURN links so VCMJitterEstimator adapts organically", () => {
+    expect(selectAdaptivePlayoutDelayMs("p2p", 1)).toBe(0);
+    expect(selectAdaptivePlayoutDelayMs("p2p", 12)).toBe(0);
+    expect(selectAdaptivePlayoutDelayMs("p2p", 35)).toBe(0);
+    expect(selectAdaptivePlayoutDelayMs("p2p", 110)).toBe(0);
+    expect(selectAdaptivePlayoutDelayMs("turn", 10)).toBe(0);
+    expect(selectAdaptivePlayoutDelayMs("turn", 85)).toBe(0);
+    expect(selectAdaptivePlayoutDelayMs("turn", null)).toBe(0);
+    expect(selectAdaptivePlayoutDelayMs(null, null, 0)).toBe(0);
   });
 
   it("classifies WebRTC static keepalive screens as idle without masking congested low-FPS scrolling", () => {
@@ -1805,7 +1959,7 @@ describe("RemoteClient adaptive playout delay on stats polling", () => {
     globalThis.RTCPeerConnection = originalRTC;
   });
 
-  it("adapts playoutDelayHint and jitterBufferTarget across P2P/WAN/TURN buckets without thrashing", async () => {
+  it("sets jitterBufferTarget=0 once without touching playoutDelayHint or thrashing across RTT/TURN changes, and falls back to playoutDelayHint when jitterBufferTarget is absent", async () => {
     vi.useFakeTimers();
     globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
     globalThis.RTCPeerConnection =
@@ -1872,30 +2026,11 @@ describe("RemoteClient adaptive playout delay on stats polling", () => {
       streams: [{} as MediaStream],
       track: { kind: "video" } as MediaStreamTrack,
     });
-    expect(playoutHistory).toEqual([0.016]);
-    expect(jitterHistory).toEqual([16]);
+    // MUST write ONLY jitterBufferTarget=0 and NEVER touch playoutDelayHint
+    expect(jitterHistory).toEqual([0]);
+    expect(playoutHistory).toEqual([]);
 
-    // Poll 1 & 2: P2P low RTT (12ms, 18ms) -> remains in 16ms bucket, NO extra writes
-    pc.statsEntries = [
-      {
-        id: "pair-1",
-        type: "candidate-pair",
-        nominated: true,
-        state: "succeeded",
-        currentRoundTripTime: 0.012,
-        localCandidateId: "loc-1",
-        remoteCandidateId: "rem-1",
-      },
-      { id: "loc-1", type: "local-candidate", candidateType: "host", address: "192.168.1.2" },
-      { id: "rem-1", type: "remote-candidate", candidateType: "host", address: "192.168.1.3" },
-    ];
-    pc.connectionState = "connected";
-    pc.onconnectionstatechange?.();
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(playoutHistory).toEqual([0.016]);
-    expect(jitterHistory).toEqual([16]);
-
-    // Poll 3 & 4: Moderate WAN P2P RTT (38ms) -> shifts once to 30ms (0.03s), no thrash on second poll
+    // Across P2P low RTT, high WAN RTT, and TURN relay -> zero extra writes, no artificial floor!
     pc.statsEntries = [
       {
         id: "pair-1",
@@ -1909,52 +2044,53 @@ describe("RemoteClient adaptive playout delay on stats polling", () => {
       { id: "loc-srflx", type: "local-candidate", candidateType: "srflx", address: "1.2.3.4" },
       { id: "rem-srflx", type: "remote-candidate", candidateType: "srflx", address: "5.6.7.8" },
     ];
+    pc.connectionState = "connected";
+    pc.onconnectionstatechange?.();
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(playoutHistory).toEqual([0.016, 0.03]);
-    expect(jitterHistory).toEqual([16, 30]);
 
-    // Poll 5: TURN relay (even with low RTT 18ms) -> shifts to 45ms (0.045s)
     pc.statsEntries = [
       {
         id: "pair-1",
         type: "candidate-pair",
         nominated: true,
         state: "succeeded",
-        currentRoundTripTime: 0.018,
+        currentRoundTripTime: 0.085,
         localCandidateId: "loc-relay",
         remoteCandidateId: "rem-srflx",
       },
-      { id: "loc-relay", type: "local-candidate", candidateType: "relay", address: "9.9.9.9" },
+      {
+        id: "loc-relay",
+        type: "local-candidate",
+        candidateType: "relay",
+        address: "9.9.9.9",
+        relayProtocol: "udp",
+      },
       { id: "rem-srflx", type: "remote-candidate", candidateType: "srflx", address: "5.6.7.8" },
     ];
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(playoutHistory).toEqual([0.016, 0.03, 0.045]);
-    expect(jitterHistory).toEqual([16, 30, 45]);
-
-    // Poll 6: Back to low-RTT P2P (10ms) -> drops back down to 16ms (0.016s)
-    pc.statsEntries = [
-      {
-        id: "pair-1",
-        type: "candidate-pair",
-        nominated: true,
-        state: "succeeded",
-        currentRoundTripTime: 0.01,
-        localCandidateId: "loc-1",
-        remoteCandidateId: "rem-1",
-      },
-      { id: "loc-1", type: "local-candidate", candidateType: "host", address: "192.168.1.2" },
-      { id: "rem-1", type: "remote-candidate", candidateType: "host", address: "192.168.1.3" },
-    ];
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(playoutHistory).toEqual([0.016, 0.03, 0.045, 0.016]);
-    expect(jitterHistory).toEqual([16, 30, 45, 16]);
-
-    // Cleanup on stopSession/disconnect prevents further mutations
-    client.stopSession();
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(playoutHistory).toEqual([0.016, 0.03, 0.045, 0.016]);
-    expect(jitterHistory).toEqual([16, 30, 45, 16]);
+    expect(jitterHistory).toEqual([0]);
+    expect(playoutHistory).toEqual([]);
 
+    // Fallback test: receiver supporting ONLY playoutDelayHint (no jitterBufferTarget)
+    const fallbackPlayoutHistory: number[] = [];
+    let fallbackVal = 0.05;
+    const legacyReceiver = {
+      get playoutDelayHint() {
+        return fallbackVal;
+      },
+      set playoutDelayHint(v: number) {
+        fallbackVal = v;
+        fallbackPlayoutHistory.push(v);
+      },
+    };
+    pc.ontrack?.({
+      receiver: legacyReceiver,
+      streams: [{} as MediaStream],
+      track: { kind: "video" } as MediaStreamTrack,
+    });
+    expect(fallbackPlayoutHistory).toEqual([0]);
+
+    client.stopSession();
     client.disconnect();
   });
 });

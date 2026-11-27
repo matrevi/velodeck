@@ -15,10 +15,10 @@ import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Custom [VideoEncoderFactory] that puts our zero-copy [LowLatencyH264Encoder] (Constrained
- * Baseline 42e01f, clamped PTS, KEY_LOW_LATENCY=1, KEY_LATENCY=1, KEY_PRIORITY=0, intra-refresh)
- * in the #1 SDP codec slot whenever a hardware `video/avc` encoder is present, wrapped in
- * [VideoEncoderFallback] when a fallback encoder is available, while cleanly delegating
- * VP8/VP9/AV1 or fallback devices to stock [DefaultVideoEncoderFactory].
+ * High 640c1f / Constrained Baseline 42e01f, clamped PTS, KEY_LOW_LATENCY=1, KEY_LATENCY=1,
+ * KEY_PRIORITY=0, intra-refresh) in the #1 SDP codec slot whenever a hardware `video/avc` encoder
+ * is present, wrapped in [VideoEncoderFallback] when a fallback encoder is available, while cleanly
+ * delegating VP8/VP9/AV1 or fallback devices to stock [DefaultVideoEncoderFactory].
  */
 class LowLatencyH264EncoderFactory(
     private val sharedContext: EglBase.Context,
@@ -27,6 +27,8 @@ class LowLatencyH264EncoderFactory(
     private data class HardwareAvcCandidate(
         val name: String,
         val supportsIntraRefresh: Boolean,
+        val supportsConstrainedHigh: Boolean,
+        val supportsHighProfile: Boolean,
     )
 
     private val fallbackFactory = DefaultVideoEncoderFactory(sharedContext, true, true)
@@ -57,7 +59,10 @@ class LowLatencyH264EncoderFactory(
         if (hardwareAvc != null) {
             Log.i(
                 TAG,
-                "Selected hardware AVC encoder=${hardwareAvc.name} (intraRefresh=${hardwareAvc.supportsIntraRefresh})",
+                "Selected hardware AVC encoder=${hardwareAvc.name} " +
+                    "(intraRefresh=${hardwareAvc.supportsIntraRefresh}, " +
+                    "constrainedHigh=${hardwareAvc.supportsConstrainedHigh}, " +
+                    "highProfile=${hardwareAvc.supportsHighProfile})",
             )
         } else {
             Log.w(TAG, "No hardware AVC encoder discovered; delegating to DefaultVideoEncoderFactory")
@@ -103,8 +108,11 @@ class LowLatencyH264EncoderFactory(
         val result = ArrayList<VideoCodecInfo>()
         if (hardwareAvc != null) {
             // Slot #0: Constrained High (640c1f — CABAC + 8x8 DCT + 0 B-frames for razor-sharp UI text)
+            //          when the discovered hardware AVC encoder advertises High / Constrained High.
             // Slot #1: Constrained Baseline (42e01f — universal compatibility fallback)
-            result.add(h264HighCodecInfo)
+            if (hardwareAvc.supportsHighProfile) {
+                result.add(h264HighCodecInfo)
+            }
             result.add(h264BaselineCodecInfo)
         }
         for (codec in fallbackFactory.supportedCodecs) {
@@ -144,8 +152,23 @@ class LowLatencyH264EncoderFactory(
                 } catch (_: Throwable) {
                     false
                 }
-                val score = scoreHardwareAvcName(name) + if (supportsIntraRefresh) 10 else 0
-                candidates.add(score to HardwareAvcCandidate(name, supportsIntraRefresh))
+                val advertisedProfiles = caps.profileLevels?.map { it.profile }?.toSet().orEmpty()
+                val supportsConstrainedHigh = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1 &&
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileConstrainedHigh in advertisedProfiles
+                val supportsHighProfile = supportsConstrainedHigh ||
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileHigh in advertisedProfiles ||
+                    advertisedProfiles.isEmpty()
+                val score = scoreHardwareAvcName(name) +
+                    (if (supportsIntraRefresh) 10 else 0) +
+                    (if (supportsConstrainedHigh) 5 else 0)
+                candidates.add(
+                    score to HardwareAvcCandidate(
+                        name = name,
+                        supportsIntraRefresh = supportsIntraRefresh,
+                        supportsConstrainedHigh = supportsConstrainedHigh,
+                        supportsHighProfile = supportsHighProfile,
+                    ),
+                )
             }
             candidates.maxByOrNull { it.first }?.second
         } catch (t: Throwable) {

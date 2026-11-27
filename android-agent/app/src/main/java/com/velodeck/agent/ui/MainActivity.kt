@@ -57,9 +57,11 @@ import com.velodeck.agent.service.PowerHelper
 import com.velodeck.agent.service.UpdateCheckResult
 import com.velodeck.agent.storage.AgentConfig
 import com.velodeck.agent.storage.AgentConfigStore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 class MainActivity : AppCompatActivity() {
@@ -71,6 +73,7 @@ class MainActivity : AppCompatActivity() {
 
     private var advancedExpanded = false
     private var controlPasswordVisible = false
+    private var updatingSwitchesProgrammatically = false
     private var pendingProjectionAfterNotif = false
     private var guidedSetupActive = false
     private var guidedNotifPrompted = false
@@ -234,20 +237,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private inline fun withProgrammaticSwitchUpdate(block: () -> Unit) {
+        val prev = updatingSwitchesProgrammatically
+        updatingSwitchesProgrammatically = true
+        try {
+            block()
+        } finally {
+            updatingSwitchesProgrammatically = prev
+        }
+    }
+
     private fun populateAdvancedFormFromConfig() {
         val cfg = configStore.current
         binding.tvDeviceId.text = "设备 ID: ${cfg.deviceId}"
         binding.etDeviceName.setText(cfg.deviceName)
         binding.etAccessToken.setText(cfg.accessToken)
-        binding.switchRelayEnabled.isChecked = cfg.relayEnabled
         binding.etRelayUrl.setText(cfg.relayUrl)
-        binding.switchDirectEnabled.isChecked = cfg.directEnabled
         binding.etDirectPort.setText(cfg.directPort.toString())
         binding.etUnlockPin.setText(cfg.unlockPin)
-        binding.switchAutoStart.isChecked = cfg.autoStart
-        binding.switchAutoAccept.isChecked = cfg.autoAcceptProjection
-        binding.switchBlackScreenMode.isChecked = cfg.blackScreenMode
-        binding.switchForcePortrait.isChecked = cfg.forcePortrait
+        withProgrammaticSwitchUpdate {
+            binding.switchRelayEnabled.isChecked = cfg.relayEnabled
+            binding.switchDirectEnabled.isChecked = cfg.directEnabled
+            binding.switchAutoStart.isChecked = cfg.autoStart
+            binding.switchAutoAccept.isChecked = cfg.autoAcceptProjection
+            binding.switchBlackScreenMode.isChecked = cfg.blackScreenMode
+            binding.switchForcePortrait.isChecked = cfg.forcePortrait
+        }
 
         val guide = RomKeepAliveHelper.getGuide(this)
         val shortBrand = guide.brandLabel.substringBefore(" (").substringBefore(" /")
@@ -347,8 +362,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Card 3: Black-Screen Running Mode (Disguised OLED Black Curtain + Power-Key Wake)
-        binding.switchBlackScreenMode.setOnCheckedChangeListener { buttonView, isChecked ->
-            if (!buttonView.isPressed) return@setOnCheckedChangeListener
+        binding.switchBlackScreenMode.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingSwitchesProgrammatically) return@setOnCheckedChangeListener
             configStore.update { it.copy(blackScreenMode = isChecked) }
             if (isChecked) {
                 applyOrStartService()
@@ -372,7 +387,9 @@ class MainActivity : AppCompatActivity() {
             } else {
                 if (!configStore.current.blackScreenMode) {
                     configStore.update { it.copy(blackScreenMode = true) }
-                    binding.switchBlackScreenMode.isChecked = true
+                    withProgrammaticSwitchUpdate {
+                        binding.switchBlackScreenMode.isChecked = true
+                    }
                 }
                 if (!AgentForegroundService.isRunning.value) {
                     AgentForegroundService.start(this)
@@ -382,8 +399,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        binding.switchForcePortrait.setOnCheckedChangeListener { buttonView, isChecked ->
-            if (!buttonView.isPressed) return@setOnCheckedChangeListener
+        binding.switchForcePortrait.setOnCheckedChangeListener { _, isChecked ->
+            if (updatingSwitchesProgrammatically) return@setOnCheckedChangeListener
             AgentForegroundService.setForcePortraitEnabled(this, isChecked)
             if (isChecked) {
                 val msg = if (VeloDeckAccessibilityService.connectedFlow.value) {
@@ -627,14 +644,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveAdvancedFormToStore(applyRunning: Boolean) {
+        val prevConfig = configStore.current
         val port = binding.etDirectPort.text.toString().trim().toIntOrNull()
             ?.coerceIn(1024, 65535)
             ?: AgentConfigStore.DEFAULT_DIRECT_PORT
-        val token = binding.etAccessToken.text.toString().trim().ifEmpty { configStore.current.accessToken }
-        val name = binding.etDeviceName.text.toString().trim().ifEmpty { configStore.current.deviceName }
+        val token = binding.etAccessToken.text.toString().trim().ifEmpty { prevConfig.accessToken }
+        val name = binding.etDeviceName.text.toString().trim().ifEmpty { prevConfig.deviceName }
         val relayUrl = binding.etRelayUrl.text.toString().trim().ifEmpty { AgentConfigStore.DEFAULT_RELAY_URL }
         val derivedApi = AgentConfigStore.deriveApiBaseFromRelayUrl(relayUrl)
         val pin = binding.etUnlockPin.text.toString().trim()
+        val serverUrlChanged = prevConfig.relayUrl.trim() != relayUrl ||
+            prevConfig.effectiveApiBaseUrl() != derivedApi
 
         configStore.update {
             it.copy(
@@ -651,6 +671,9 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
+        if (serverUrlChanged) {
+            pendingApkToInstall = null
+        }
         if (!updateDownloadInProgress) {
             lastUpdateCheckElapsedMs = 0L
             latestUpdateCheck = null
@@ -750,11 +773,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Black-Screen running mode & Force-Portrait card state
-        if (binding.switchBlackScreenMode.isChecked != cfg.blackScreenMode) {
-            binding.switchBlackScreenMode.isChecked = cfg.blackScreenMode
-        }
-        if (binding.switchForcePortrait.isChecked != cfg.forcePortrait) {
-            binding.switchForcePortrait.isChecked = cfg.forcePortrait
+        withProgrammaticSwitchUpdate {
+            if (binding.switchBlackScreenMode.isChecked != cfg.blackScreenMode) {
+                binding.switchBlackScreenMode.isChecked = cfg.blackScreenMode
+            }
+            if (binding.switchForcePortrait.isChecked != cfg.forcePortrait) {
+                binding.switchForcePortrait.isChecked = cfg.forcePortrait
+            }
         }
         when {
             state.blackScreenActive -> {
@@ -1229,7 +1254,7 @@ class MainActivity : AppCompatActivity() {
                     return@onSuccess
                 }
                 Toast.makeText(this@MainActivity, "开始重新下载云端安装包...", Toast.LENGTH_SHORT).show()
-                downloadAndInstallUpdate(info)
+                downloadAndInstallUpdate(info, forceRedownload = true)
             }.onFailure { err ->
                 val msg = err.message ?: "网络异常"
                 binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.status_err))
@@ -1309,19 +1334,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun downloadAndInstallUpdate(checkResult: UpdateCheckResult?) {
+    private fun downloadAndInstallUpdate(
+        checkResult: UpdateCheckResult?,
+        forceRedownload: Boolean = false,
+    ) {
         if (updateDownloadInProgress) return
         updateDownloadInProgress = true
         pendingApkToInstall = null
 
-        binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.accent_blue))
-        binding.tvAppUpdateSubtitle.text = "正在下载 0%..."
-        binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_warn)
-        binding.tvAppUpdateAction.setTextColor(getColor(R.color.status_warn))
-        binding.tvAppUpdateAction.text = "下载中..."
-
         lifecycleScope.launch {
             try {
+                if (!forceRedownload) {
+                    val cachedApk = withContext(Dispatchers.IO) {
+                        AppUpdater.findVerifiedCachedApk(
+                            context = this@MainActivity,
+                            expectedSha256 = checkResult?.apkSha256,
+                        )
+                    }
+                    if (cachedApk != null) {
+                        if (isFinishing || isDestroyed) return@launch
+                        triggerApkInstall(cachedApk)
+                        return@launch
+                    }
+                }
+
+                if (isFinishing || isDestroyed) return@launch
+                binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.accent_blue))
+                binding.tvAppUpdateSubtitle.text = "正在下载 0%..."
+                binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_warn)
+                binding.tvAppUpdateAction.setTextColor(getColor(R.color.status_warn))
+                binding.tvAppUpdateAction.text = "下载中..."
+
                 val cfg = configStore.current
                 val apiBaseUrl = cfg.effectiveApiBaseUrl()
                 val authToken = cfg.authToken.takeIf { it.isNotBlank() }
@@ -1332,10 +1375,12 @@ class MainActivity : AppCompatActivity() {
                     expectedSha256 = checkResult?.apkSha256,
                 ) { progress ->
                     runOnUiThread {
+                        if (isFinishing || isDestroyed) return@runOnUiThread
                         renderUpdateDownloadProgress(progress)
                     }
                 }
 
+                if (isFinishing || isDestroyed) return@launch
                 downloadResult.onSuccess { apkFile ->
                     triggerApkInstall(apkFile)
                 }.onFailure { err ->

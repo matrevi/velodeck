@@ -414,28 +414,19 @@ export function sortPreferredVideoCodecs<T extends VideoCodecPreferenceLike>(
   ];
 }
 
-export type PlayoutDelayBucketMs = 16 | 30 | 45;
+export type PlayoutDelayBucketMs = 0;
 
+/**
+ * Interactive remote control uses a 0ms minimum jitter-buffer floor on both P2P and TURN,
+ * letting the browser's built-in VCMJitterEstimator adapt organically without imposing
+ * an artificial minimum playout delay or mid-burst stalls on RTT jumps.
+ */
 export function selectAdaptivePlayoutDelayMs(
-  route: "p2p" | "turn" | null,
-  rttMs: number | null,
-  fallbackMs: PlayoutDelayBucketMs = 16,
+  _route: "p2p" | "turn" | null,
+  _rttMs: number | null,
+  _fallbackMs: PlayoutDelayBucketMs = 0,
 ): PlayoutDelayBucketMs {
-  if (route === "turn") {
-    return 45;
-  }
-  if (rttMs !== null && Number.isFinite(rttMs)) {
-    if (rttMs >= 60) {
-      return 45;
-    }
-    if (rttMs >= 25) {
-      return 30;
-    }
-    if (route === "p2p") {
-      return 16;
-    }
-  }
-  return fallbackMs;
+  return 0;
 }
 
 export function isWebRtcStaticIdle(
@@ -453,9 +444,12 @@ export function isWebRtcStaticIdle(
   );
 }
 
-type AdaptiveRtpReceiver = RTCRtpReceiver & {
+type AdaptiveRtpReceiver = Omit<
+  RTCRtpReceiver,
+  "jitterBufferTarget" | "playoutDelayHint"
+> & {
   playoutDelayHint?: number;
-  jitterBufferTarget?: number;
+  jitterBufferTarget?: number | null;
 };
 
 export class RemoteClient {
@@ -486,6 +480,8 @@ export class RemoteClient {
   private dataChannel: RTCDataChannel | null = null;
   private pointerDataChannel: RTCDataChannel | null = null;
   private fileDataChannel: RTCDataChannel | null = null;
+  private activeTouchViaWs = false;
+  private activeTouchFirstMovePending = false;
   private activeFileTransfer: ActiveFileTransfer | null = null;
   private fileTransferGeneration = 0;
   private pointerKeepaliveTimer: ReturnType<typeof setInterval> | null = null;
@@ -583,6 +579,12 @@ export class RemoteClient {
 
   getState(): RemoteClientState {
     return this.state;
+  }
+
+  getAuthToken(): string | null {
+    return this.activeRequest?.kind === "account"
+      ? this.activeRequest.authToken
+      : null;
   }
 
   subscribe(listener: StateListener): () => void {
@@ -943,8 +945,13 @@ export class RemoteClient {
     }
 
     const seq = ++this.cmdSeq;
+    const hasLiveSession =
+      Boolean(this.state.sessionId) &&
+      this.state.sessionStatus !== "error" &&
+      this.state.sessionStatus !== "ended" &&
+      this.state.sessionStatus !== "idle";
     const isCurrentSessionDevice =
-      Boolean(this.state.sessionId) && deviceId === this.state.activeDeviceId;
+      hasLiveSession && deviceId === this.state.activeDeviceId;
     const sessionId = isCurrentSessionDevice ? (this.state.sessionId ?? "") : "";
 
     const msg: WireMessage = {
@@ -957,10 +964,33 @@ export class RemoteClient {
 
     const payload = JSON.stringify(msg);
 
-    // P1-3: Route high-frequency touch_move over unordered/unreliable "pointer" DataChannel
-    // to eliminate SCTP head-of-line blocking; drop stale move frames under backpressure.
+    const isTouchDown = command.action === "touch_down";
+    const isTouchMove = command.action === "touch_move";
+    const isTouchUp = command.action === "touch_up";
+
+    if (isTouchDown) {
+      this.activeTouchViaWs = false;
+      this.activeTouchFirstMovePending = false;
+    }
+
+    const pinTouchToWs = (isTouchMove || isTouchUp) && this.activeTouchViaWs;
+    const routeFirstMoveOnControlDc = isTouchMove && this.activeTouchFirstMovePending;
+    if (routeFirstMoveOnControlDc) {
+      this.activeTouchFirstMovePending = false;
+    }
+    if (isTouchUp) {
+      this.activeTouchViaWs = false;
+      this.activeTouchFirstMovePending = false;
+    }
+
+    // Route steady-state touch_move over partially-reliable, in-order "pointer" DataChannel
+    // (ordered: true, maxRetransmits: 0) to avoid HoL retransmit stalls without backward jumps.
+    // Never split a gesture started on WS onto DC, and send the first touch_move right after
+    // touch_down on the ordered "control" DC so it cannot overtake touch_down across SCTP streams.
     if (
-      command.action === "touch_move" &&
+      isTouchMove &&
+      !pinTouchToWs &&
+      !routeFirstMoveOnControlDc &&
       isCurrentSessionDevice &&
       this.pointerDataChannel &&
       this.pointerDataChannel.readyState === "open"
@@ -982,6 +1012,7 @@ export class RemoteClient {
     }
 
     if (
+      !pinTouchToWs &&
       isCurrentSessionDevice &&
       this.dataChannel &&
       this.dataChannel.readyState === "open"
@@ -994,6 +1025,10 @@ export class RemoteClient {
         try {
           this.dataChannel.send(payload);
           this.lastCommandSentAt = Date.now();
+          if (isTouchDown) {
+            this.activeTouchViaWs = false;
+            this.activeTouchFirstMovePending = true;
+          }
           return { sent: true, seq, channel: "datachannel" };
         } catch {
           // Fall through to WebSocket if DataChannel send fails
@@ -1005,6 +1040,10 @@ export class RemoteClient {
       try {
         this.ws.send(payload);
         this.lastCommandSentAt = Date.now();
+        if (isTouchDown) {
+          this.activeTouchViaWs = true;
+          this.activeTouchFirstMovePending = false;
+        }
         return { sent: true, seq, channel: "websocket" };
       } catch {
         return { sent: false, seq, channel: "none" };
@@ -1924,6 +1963,10 @@ export class RemoteClient {
       case "error": {
         const authKind = this.activeRequest?.kind ?? this.state.authType;
         const readable = mapServerErrorMessage(parsed.code, parsed.message, authKind);
+        const isTerminalSessionError =
+          parsed.code === "INTERNAL_ERROR" ||
+          parsed.code === "SESSION_NOT_FOUND" ||
+          parsed.code === "DEVICE_OFFLINE";
         if (
           parsed.code === "UNAUTHORIZED" ||
           (parsed.code === "RATE_LIMITED" &&
@@ -1941,17 +1984,47 @@ export class RemoteClient {
           parsed.sessionId &&
           parsed.sessionId === this.state.sessionId
         ) {
-          this.setState({
-            sessionStatus: "error",
-            errorCode: parsed.code,
-            errorMessage: readable,
-          });
+          if (isTerminalSessionError) {
+            this.teardownPeerConnection();
+            this.stopWsJpegFpsTimer();
+            this.clearAutoReRequestTimer();
+            this.setState({
+              sessionId: null,
+              sessionStatus: "error",
+              activeTransport: null,
+              webrtcRoute: null,
+              webrtcTelemetry: null,
+              mediaStream: null,
+              dataChannelOpen: false,
+              fileChannelOpen: false,
+              fps: 0,
+              errorCode: parsed.code,
+              errorMessage: readable,
+            });
+          } else {
+            this.setState({
+              sessionStatus: "error",
+              errorCode: parsed.code,
+              errorMessage: readable,
+            });
+          }
         } else if (
           parsed.code === "DEVICE_OFFLINE" &&
           parsed.deviceId === this.state.activeDeviceId
         ) {
+          this.teardownPeerConnection();
+          this.stopWsJpegFpsTimer();
+          this.clearAutoReRequestTimer();
           this.setState({
+            sessionId: null,
             sessionStatus: "error",
+            activeTransport: null,
+            webrtcRoute: null,
+            webrtcTelemetry: null,
+            mediaStream: null,
+            dataChannelOpen: false,
+            fileChannelOpen: false,
+            fps: 0,
             errorCode: parsed.code,
             errorMessage: readable,
           });
@@ -2059,7 +2132,7 @@ export class RemoteClient {
     try {
       pc = new RTCPeerConnection({
         iceServers: this.iceServers.length > 0 ? this.iceServers : [],
-        iceCandidatePoolSize: 2,
+        iceCandidatePoolSize: 0,
         bundlePolicy: "max-bundle",
         rtcpMuxPolicy: "require",
       });
@@ -2076,6 +2149,8 @@ export class RemoteClient {
     this.webrtcIceRestartInFlight = false;
     this.activeVideoReceiver = null;
     this.lastAppliedPlayoutDelayMs = null;
+    this.activeTouchViaWs = false;
+    this.activeTouchFirstMovePending = false;
     let localIceCount = 0;
 
     const videoTransceiver = pc.addTransceiver("video", { direction: "recvonly" });
@@ -2120,7 +2195,7 @@ export class RemoteClient {
 
     try {
       const pointerDc = pc.createDataChannel("pointer", {
-        ordered: false,
+        ordered: true,
         maxRetransmits: 0,
       });
       this.pointerDataChannel = pointerDc;
@@ -2171,13 +2246,13 @@ export class RemoteClient {
 
     pc.ontrack = (event) => {
       if (this.pc !== pc) return;
-      // Minimize browser WebRTC playout / jitter buffer latency for interactive remote control;
-      // start at 16ms (~1 frame @ 60fps) and let stats polling adapt cleanly for WAN/TURN links.
+      // Use a 0ms minimum jitter-buffer floor so Chrome's VCMJitterEstimator adapts organically
+      // for interactive remote control without artificial playout delay or mid-burst stalls.
       const receiver = event.receiver as AdaptiveRtpReceiver | undefined;
       const isVideoTrack = !event.track?.kind || event.track.kind === "video";
       if (receiver && isVideoTrack) {
         this.activeVideoReceiver = receiver;
-        this.applyReceiverPlayoutDelay(receiver, 16, true);
+        this.applyReceiverPlayoutDelay(receiver, 0, true);
       }
       const existingStream = event.streams[0];
       const stream = existingStream ?? new MediaStream([event.track]);
@@ -2274,6 +2349,8 @@ export class RemoteClient {
       try {
         const restartOffer = await pc.createOffer({ iceRestart: true });
         if (this.pc !== pc) return;
+        this.remoteDescriptionReady = false;
+        this.pendingRemoteIce = [];
         await pc.setLocalDescription(restartOffer);
         if (this.pc !== pc || !restartOffer.sdp) {
           throw new Error("ICE restart offer SDP missing");
@@ -2487,6 +2564,9 @@ export class RemoteClient {
   }
 
   private startWebRtcStatsPolling(pc: RTCPeerConnection): void {
+    if (this.webrtcStatsTimer !== null && this.pc === pc) {
+      return;
+    }
     this.stopWebRtcStatsPolling();
     this.webrtcStatsTimer = setInterval(() => {
       if (this.pc !== pc) {
@@ -2528,7 +2608,12 @@ export class RemoteClient {
           const codecs = new Map<string, string>();
           const candidates = new Map<
             string,
-            { candidateType: string; address: string | null }
+            {
+              candidateType: string;
+              address: string | null;
+              protocol: string | null;
+              relayProtocol: string | null;
+            }
           >();
           const candidatePairs = new Map<string, Record<string, unknown>>();
 
@@ -2615,8 +2700,21 @@ export class RemoteClient {
                   : typeof rec.ip === "string" && rec.ip.length > 0
                     ? rec.ip
                     : null;
+              const protocol =
+                typeof rec.protocol === "string" && rec.protocol.trim().length > 0
+                  ? rec.protocol.trim().toLowerCase()
+                  : null;
+              const relayProtocol =
+                typeof rec.relayProtocol === "string" && rec.relayProtocol.trim().length > 0
+                  ? rec.relayProtocol.trim().toLowerCase()
+                  : null;
               if (candidateType) {
-                candidates.set(report.id, { candidateType, address });
+                candidates.set(report.id, {
+                  candidateType,
+                  address,
+                  protocol,
+                  relayProtocol,
+                });
               }
             }
           });
@@ -2663,7 +2761,20 @@ export class RemoteClient {
             const remoteType = remoteCand?.candidateType;
             if (localType === "relay" || remoteType === "relay") {
               route = "turn";
-              icePair = "TURN Relay";
+              const relayCand = localType === "relay" ? localCand : remoteCand;
+              const proto =
+                relayCand?.relayProtocol ??
+                relayCand?.protocol ??
+                localCand?.relayProtocol ??
+                localCand?.protocol ??
+                remoteCand?.relayProtocol ??
+                remoteCand?.protocol ??
+                null;
+              if (proto === "udp" || proto === "tcp" || proto === "tls") {
+                icePair = `TURN (${proto.toUpperCase()})`;
+              } else {
+                icePair = "TURN Relay";
+              }
             } else if (localType === "host" && remoteType === "host") {
               route = "p2p";
               const addrs = [localCand?.address, remoteCand?.address].filter(
@@ -2843,7 +2954,7 @@ export class RemoteClient {
             const targetPlayoutDelayMs = selectAdaptivePlayoutDelayMs(
               route,
               rttMs,
-              this.lastAppliedPlayoutDelayMs ?? 16,
+              this.lastAppliedPlayoutDelayMs ?? 0,
             );
             this.applyReceiverPlayoutDelay(this.activeVideoReceiver, targetPlayoutDelayMs);
           }
@@ -2865,18 +2976,17 @@ export class RemoteClient {
     if (!force && this.lastAppliedPlayoutDelayMs === delayMs) {
       return;
     }
-    if ("playoutDelayHint" in receiver) {
-      try {
-        receiver.playoutDelayHint = delayMs / 1000;
-      } catch {
-        // Ignore browsers without playoutDelayHint support
-      }
-    }
     if ("jitterBufferTarget" in receiver) {
       try {
         receiver.jitterBufferTarget = delayMs;
       } catch {
         // Ignore browsers without jitterBufferTarget support
+      }
+    } else if ("playoutDelayHint" in receiver) {
+      try {
+        receiver.playoutDelayHint = delayMs / 1000;
+      } catch {
+        // Ignore browsers without playoutDelayHint support
       }
     }
     this.lastAppliedPlayoutDelayMs = delayMs;
@@ -2966,6 +3076,8 @@ export class RemoteClient {
     this.webrtcIceRestartInFlight = false;
     this.activeVideoReceiver = null;
     this.lastAppliedPlayoutDelayMs = null;
+    this.activeTouchViaWs = false;
+    this.activeTouchFirstMovePending = false;
 
     if (this.fileDataChannel) {
       try {

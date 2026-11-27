@@ -99,6 +99,10 @@ class AgentForegroundService : Service() {
     private var appliedAccessToken: String? = null
     private var appliedControlPassword: String? = null
     private val projectionRecoveryMutex = Mutex()
+    private val overlaySyncLock = Any()
+    private var lastSyncedOverlayMode: VeloDeckAccessibilityService.DisplayOverlayMode? = null
+    private var lastSyncedForcePortrait: Boolean? = null
+    private var lastSyncedOverlayA11y: VeloDeckAccessibilityService? = null
 
     @Volatile
     private var endpointsPopulated: Boolean = false
@@ -278,7 +282,7 @@ class AgentForegroundService : Service() {
             }
         }
 
-        // Start in SPECIAL_USE (API 34+) / DATA_SYNC (API 29-33) foreground mode first before projection consent
+        // Start in SPECIAL_USE (API 34+) / untyped (API <34) foreground mode first before projection consent
         promoteForeground(withMediaProjection = false)
         acquireKeepAliveLocks()
         registerSystemReceivers()
@@ -516,7 +520,17 @@ class AgentForegroundService : Service() {
         if (activeInstance === this) {
             activeInstance = null
         }
-        setBlackScreenActive(false, reason = "service_destroyed")
+        synchronized(overlaySyncLock) {
+            lastSyncedOverlayMode = null
+            lastSyncedForcePortrait = null
+            lastSyncedOverlayA11y = null
+        }
+        val forcePortraitOnExit = if (::configStore.isInitialized) configStore.current.forcePortrait else false
+        BlackScreenActivity.dismissIfActive()
+        VeloDeckAccessibilityService.instance?.updateDisplayOverlay(
+            mode = VeloDeckAccessibilityService.DisplayOverlayMode.OFF,
+            forcePortrait = forcePortraitOnExit,
+        )
         _isRunning.value = false
         endpointsPopulated = false
         unregisterSystemReceivers()
@@ -526,6 +540,7 @@ class AgentForegroundService : Service() {
         coordinator.shutdown()
         captureManager.shutdown()
         releaseKeepAliveLocks()
+        mainHandler.removeCallbacksAndMessages(null)
         serviceScope.cancel()
         val cfg = configStore.current
         _runtimeState.value = AgentRuntimeState(
@@ -550,7 +565,6 @@ class AgentForegroundService : Service() {
             (appliedAuthToken != null && appliedAuthToken != cfg.authToken) ||
             (appliedPendingUnbind != null && appliedPendingUnbind != cfg.pendingUnbindOwner) ||
             (appliedDeviceName != null && appliedDeviceName != cfg.deviceName) ||
-            (appliedAccessToken != null && appliedAccessToken != cfg.accessToken) ||
             (appliedControlPassword != null && appliedControlPassword != cfg.controlPassword)
 
         appliedRelayUrl = trimmedRelayUrl
@@ -669,15 +683,30 @@ class AgentForegroundService : Service() {
         val a11y = VeloDeckAccessibilityService.instance
         val remoteViewing = forceRemoteViewing || st.activeSessions > 0
 
-        if (remoteViewing) {
-            BlackScreenActivity.dismissIfActive()
-        }
-
         val targetMode = when {
             st.blackScreenActive && !remoteViewing -> VeloDeckAccessibilityService.DisplayOverlayMode.PURE_BLACK_IDLE
             st.blackScreenActive && remoteViewing -> VeloDeckAccessibilityService.DisplayOverlayMode.STEALTH_DIM
             !st.blackScreenActive && remoteViewing -> VeloDeckAccessibilityService.DisplayOverlayMode.KEEP_AWAKE_ONLY
             else -> VeloDeckAccessibilityService.DisplayOverlayMode.OFF
+        }
+
+        val unchanged = synchronized(overlaySyncLock) {
+            val same = lastSyncedOverlayMode == targetMode &&
+                lastSyncedForcePortrait == st.forcePortraitActive &&
+                lastSyncedOverlayA11y === a11y
+            if (!same) {
+                lastSyncedOverlayMode = targetMode
+                lastSyncedForcePortrait = st.forcePortraitActive
+                lastSyncedOverlayA11y = a11y
+            }
+            same
+        }
+        if (unchanged) {
+            return
+        }
+
+        if (remoteViewing) {
+            BlackScreenActivity.dismissIfActive()
         }
 
         if (a11y != null) {
@@ -687,8 +716,20 @@ class AgentForegroundService : Service() {
             ) {
                 setBlackScreenActive(false, reason = "emergency_tap")
             }
-            if (!applied && targetMode == VeloDeckAccessibilityService.DisplayOverlayMode.PURE_BLACK_IDLE) {
-                BlackScreenActivity.launch(this)
+            if (!applied) {
+                synchronized(overlaySyncLock) {
+                    if (lastSyncedOverlayA11y === a11y &&
+                        lastSyncedOverlayMode == targetMode &&
+                        lastSyncedForcePortrait == st.forcePortraitActive
+                    ) {
+                        lastSyncedOverlayMode = null
+                        lastSyncedForcePortrait = null
+                        lastSyncedOverlayA11y = null
+                    }
+                }
+                if (targetMode == VeloDeckAccessibilityService.DisplayOverlayMode.PURE_BLACK_IDLE) {
+                    BlackScreenActivity.launch(this)
+                }
             }
         } else {
             if (targetMode == VeloDeckAccessibilityService.DisplayOverlayMode.PURE_BLACK_IDLE) {
@@ -853,8 +894,6 @@ class AgentForegroundService : Service() {
         val notif = buildNotification()
         val baseType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
         } else {
             0
         }

@@ -167,6 +167,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       `turn:${formattedHost}:3478?transport=tcp`,
     ];
   }
+  if (turnSecret !== undefined && turnUrls.length === 0) {
+    console.warn(
+      "[velodeck-server] TURN_SECRET is configured, but TURN_URLS is empty and PUBLIC_IP is unset; TURN servers will not be advertised to clients.",
+    );
+  }
 
   const config: ServerConfig = {
     port: parseIntEnv(env.PORT, 8080, 0),

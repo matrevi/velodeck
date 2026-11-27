@@ -710,4 +710,84 @@ class ProtocolMessagesTest {
         )
         assertFalse(SessionCoordinator.isDataChannelKeepalive("not-json dc.ping"))
     }
+
+    @Test
+    fun touchMoveSeqMonotonicityCoalescingAndAckSuppression() {
+        // Strict monotonic seq acceptance for TouchMove
+        assertTrue(SessionCoordinator.shouldAcceptTouchMoveSeq(lastSeq = null, candidateSeq = 1))
+        assertTrue(SessionCoordinator.shouldAcceptTouchMoveSeq(lastSeq = 5, candidateSeq = 6))
+        assertFalse(SessionCoordinator.shouldAcceptTouchMoveSeq(lastSeq = 5, candidateSeq = 5))
+        assertFalse(SessionCoordinator.shouldAcceptTouchMoveSeq(lastSeq = 5, candidateSeq = 4))
+        assertTrue(SessionCoordinator.shouldAcceptTouchMoveSeq(lastSeq = 5, candidateSeq = null))
+        assertTrue(SessionCoordinator.shouldAcceptTouchMoveSeq(lastSeq = null, candidateSeq = null))
+
+        // Move coalescing keeps the highest seq even when delayed packets arrive out of order
+        assertTrue(SessionCoordinator.shouldPreferCoalescedTouchMove(currentSeq = 10, nextSeq = 12))
+        assertFalse(SessionCoordinator.shouldPreferCoalescedTouchMove(currentSeq = 12, nextSeq = 11))
+        assertFalse(SessionCoordinator.shouldPreferCoalescedTouchMove(currentSeq = 12, nextSeq = 12))
+        assertTrue(SessionCoordinator.shouldPreferCoalescedTouchMove(currentSeq = null, nextSeq = null))
+        assertTrue(SessionCoordinator.shouldPreferCoalescedTouchMove(currentSeq = null, nextSeq = 7))
+        assertFalse(SessionCoordinator.shouldPreferCoalescedTouchMove(currentSeq = 7, nextSeq = null))
+
+        // Skip ControlAck only for successful TouchMove; keep error ACKs and discrete commands
+        assertFalse(SessionCoordinator.shouldSendControlAck(ControlCommand.TouchMove(0, 0.5, 0.5), ok = true))
+        assertTrue(SessionCoordinator.shouldSendControlAck(ControlCommand.TouchMove(0, 0.5, 0.5), ok = false))
+        assertTrue(SessionCoordinator.shouldSendControlAck(ControlCommand.TouchDown(0, 0.5, 0.5), ok = true))
+        assertTrue(SessionCoordinator.shouldSendControlAck(ControlCommand.TouchUp(0, 0.5, 0.5), ok = true))
+        assertTrue(SessionCoordinator.shouldSendControlAck(ControlCommand.Tap(0.5, 0.5), ok = true))
+    }
+
+    @Test
+    fun accessibilityOverlay_cachingAndNoOpShortCircuitLogic() {
+        // Matching attached overlay state short-circuits redundant updateDisplayOverlay calls
+        assertTrue(
+            VeloDeckAccessibilityService.isOverlayStateUnchanged(
+                hasAttachedOverlay = true,
+                lastMode = VeloDeckAccessibilityService.DisplayOverlayMode.STEALTH_DIM,
+                lastForcePortrait = true,
+                nextMode = VeloDeckAccessibilityService.DisplayOverlayMode.STEALTH_DIM,
+                nextForcePortrait = true,
+            ),
+        )
+        // Missing view must never short-circuit (even if cached mode/portrait happened to match)
+        assertFalse(
+            VeloDeckAccessibilityService.isOverlayStateUnchanged(
+                hasAttachedOverlay = false,
+                lastMode = VeloDeckAccessibilityService.DisplayOverlayMode.STEALTH_DIM,
+                lastForcePortrait = true,
+                nextMode = VeloDeckAccessibilityService.DisplayOverlayMode.STEALTH_DIM,
+                nextForcePortrait = true,
+            ),
+        )
+        // Cleared cache (after hideBlackCurtain/onDestroy) must not short-circuit
+        assertFalse(
+            VeloDeckAccessibilityService.isOverlayStateUnchanged(
+                hasAttachedOverlay = true,
+                lastMode = null,
+                lastForcePortrait = null,
+                nextMode = VeloDeckAccessibilityService.DisplayOverlayMode.OFF,
+                nextForcePortrait = true,
+            ),
+        )
+        // Mode change must apply update
+        assertFalse(
+            VeloDeckAccessibilityService.isOverlayStateUnchanged(
+                hasAttachedOverlay = true,
+                lastMode = VeloDeckAccessibilityService.DisplayOverlayMode.PURE_BLACK_IDLE,
+                lastForcePortrait = true,
+                nextMode = VeloDeckAccessibilityService.DisplayOverlayMode.STEALTH_DIM,
+                nextForcePortrait = true,
+            ),
+        )
+        // Portrait lock change must apply update
+        assertFalse(
+            VeloDeckAccessibilityService.isOverlayStateUnchanged(
+                hasAttachedOverlay = true,
+                lastMode = VeloDeckAccessibilityService.DisplayOverlayMode.KEEP_AWAKE_ONLY,
+                lastForcePortrait = true,
+                nextMode = VeloDeckAccessibilityService.DisplayOverlayMode.KEEP_AWAKE_ONLY,
+                nextForcePortrait = false,
+            ),
+        )
+    }
 }

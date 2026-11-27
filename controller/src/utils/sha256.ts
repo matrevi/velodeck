@@ -24,84 +24,93 @@ function bytesToHex(bytes: Uint8Array): string {
   return out;
 }
 
-/**
- * Synchronous, zero-dependency pure-JS SHA-256 returning lowercase 64-char hex.
- * Streams 64-byte blocks directly from the input Uint8Array (O(1) extra memory).
- */
-export function sha256HexSync(data: Uint8Array): string {
-  let h0 = 0x6a09e667;
-  let h1 = 0xbb67ae85;
-  let h2 = 0x3c6ef372;
-  let h3 = 0xa54ff53a;
-  let h4 = 0x510e527f;
-  let h5 = 0x9b05688c;
-  let h6 = 0x1f83d9ab;
-  let h7 = 0x5be0cd19;
+const ASYNC_YIELD_CHUNK_BYTES = 2 * 1024 * 1024; // 2 MiB (exact multiple of 64-byte SHA-256 block)
 
-  const w = new Uint32Array(64);
+interface Sha256Context {
+  h0: number;
+  h1: number;
+  h2: number;
+  h3: number;
+  h4: number;
+  h5: number;
+  h6: number;
+  h7: number;
+  w: Uint32Array;
+}
 
-  const processBlock = (buf: Uint8Array, offset: number): void => {
-    for (let i = 0; i < 16; i++) {
-      const j = offset + i * 4;
-      w[i] =
-        ((buf[j]! << 24) |
-          (buf[j + 1]! << 16) |
-          (buf[j + 2]! << 8) |
-          buf[j + 3]!) >>>
-        0;
-    }
-
-    for (let i = 16; i < 64; i++) {
-      const w15 = w[i - 15]!;
-      const s0 = ((w15 >>> 7) | (w15 << 25)) ^ ((w15 >>> 18) | (w15 << 14)) ^ (w15 >>> 3);
-      const w2 = w[i - 2]!;
-      const s1 = ((w2 >>> 17) | (w2 << 15)) ^ ((w2 >>> 19) | (w2 << 13)) ^ (w2 >>> 10);
-      w[i] = (w[i - 16]! + s0 + w[i - 7]! + s1) >>> 0;
-    }
-
-    let a = h0;
-    let b = h1;
-    let c = h2;
-    let d = h3;
-    let e = h4;
-    let f = h5;
-    let g = h6;
-    let h = h7;
-
-    for (let i = 0; i < 64; i++) {
-      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
-      const ch = (e & f) ^ (~e & g);
-      const temp1 = (h + S1 + ch + K[i]! + w[i]!) >>> 0;
-      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
-      const maj = (a & b) ^ (a & c) ^ (b & c);
-      const temp2 = (S0 + maj) >>> 0;
-
-      h = g;
-      g = f;
-      f = e;
-      e = (d + temp1) >>> 0;
-      d = c;
-      c = b;
-      b = a;
-      a = (temp1 + temp2) >>> 0;
-    }
-
-    h0 = (h0 + a) >>> 0;
-    h1 = (h1 + b) >>> 0;
-    h2 = (h2 + c) >>> 0;
-    h3 = (h3 + d) >>> 0;
-    h4 = (h4 + e) >>> 0;
-    h5 = (h5 + f) >>> 0;
-    h6 = (h6 + g) >>> 0;
-    h7 = (h7 + h) >>> 0;
+function createSha256Context(): Sha256Context {
+  return {
+    h0: 0x6a09e667,
+    h1: 0xbb67ae85,
+    h2: 0x3c6ef372,
+    h3: 0xa54ff53a,
+    h4: 0x510e527f,
+    h5: 0x9b05688c,
+    h6: 0x1f83d9ab,
+    h7: 0x5be0cd19,
+    w: new Uint32Array(64),
   };
+}
 
-  const len = data.byteLength;
-  const fullLen = len - (len % 64);
-  for (let offset = 0; offset < fullLen; offset += 64) {
-    processBlock(data, offset);
+function processBlock(ctx: Sha256Context, buf: Uint8Array, offset: number): void {
+  const { w } = ctx;
+  for (let i = 0; i < 16; i++) {
+    const j = offset + i * 4;
+    w[i] =
+      ((buf[j]! << 24) |
+        (buf[j + 1]! << 16) |
+        (buf[j + 2]! << 8) |
+        buf[j + 3]!) >>>
+      0;
   }
 
+  for (let i = 16; i < 64; i++) {
+    const w15 = w[i - 15]!;
+    const s0 = ((w15 >>> 7) | (w15 << 25)) ^ ((w15 >>> 18) | (w15 << 14)) ^ (w15 >>> 3);
+    const w2 = w[i - 2]!;
+    const s1 = ((w2 >>> 17) | (w2 << 15)) ^ ((w2 >>> 19) | (w2 << 13)) ^ (w2 >>> 10);
+    w[i] = (w[i - 16]! + s0 + w[i - 7]! + s1) >>> 0;
+  }
+
+  let a = ctx.h0;
+  let b = ctx.h1;
+  let c = ctx.h2;
+  let d = ctx.h3;
+  let e = ctx.h4;
+  let f = ctx.h5;
+  let g = ctx.h6;
+  let h = ctx.h7;
+
+  for (let i = 0; i < 64; i++) {
+    const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+    const ch = (e & f) ^ (~e & g);
+    const temp1 = (h + S1 + ch + K[i]! + w[i]!) >>> 0;
+    const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+    const maj = (a & b) ^ (a & c) ^ (b & c);
+    const temp2 = (S0 + maj) >>> 0;
+
+    h = g;
+    g = f;
+    f = e;
+    e = (d + temp1) >>> 0;
+    d = c;
+    c = b;
+    b = a;
+    a = (temp1 + temp2) >>> 0;
+  }
+
+  ctx.h0 = (ctx.h0 + a) >>> 0;
+  ctx.h1 = (ctx.h1 + b) >>> 0;
+  ctx.h2 = (ctx.h2 + c) >>> 0;
+  ctx.h3 = (ctx.h3 + d) >>> 0;
+  ctx.h4 = (ctx.h4 + e) >>> 0;
+  ctx.h5 = (ctx.h5 + f) >>> 0;
+  ctx.h6 = (ctx.h6 + g) >>> 0;
+  ctx.h7 = (ctx.h7 + h) >>> 0;
+}
+
+function finalizeSha256(ctx: Sha256Context, data: Uint8Array, fullLen: number): string {
+  const len = data.byteLength;
   // Final padded 1 or 2 blocks (64 or 128 bytes)
   const rem = len - fullLen;
   const finalSize = rem < 56 ? 64 : 128;
@@ -124,27 +133,58 @@ export function sha256HexSync(data: Uint8Array): string {
   finalBuf[lenPos + 6] = (bitLenLo >>> 8) & 0xff;
   finalBuf[lenPos + 7] = bitLenLo & 0xff;
 
-  processBlock(finalBuf, 0);
+  processBlock(ctx, finalBuf, 0);
   if (finalSize === 128) {
-    processBlock(finalBuf, 64);
+    processBlock(ctx, finalBuf, 64);
   }
 
   return (
-    toHex8(h0) +
-    toHex8(h1) +
-    toHex8(h2) +
-    toHex8(h3) +
-    toHex8(h4) +
-    toHex8(h5) +
-    toHex8(h6) +
-    toHex8(h7)
+    toHex8(ctx.h0) +
+    toHex8(ctx.h1) +
+    toHex8(ctx.h2) +
+    toHex8(ctx.h3) +
+    toHex8(ctx.h4) +
+    toHex8(ctx.h5) +
+    toHex8(ctx.h6) +
+    toHex8(ctx.h7)
   );
+}
+
+/**
+ * Synchronous, zero-dependency pure-JS SHA-256 returning lowercase 64-char hex.
+ * Streams 64-byte blocks directly from the input Uint8Array (O(1) extra memory).
+ */
+export function sha256HexSync(data: Uint8Array): string {
+  const ctx = createSha256Context();
+  const len = data.byteLength;
+  const fullLen = len - (len % 64);
+  for (let offset = 0; offset < fullLen; offset += 64) {
+    processBlock(ctx, data, offset);
+  }
+  return finalizeSha256(ctx, data, fullLen);
+}
+
+async function sha256HexAsync(data: Uint8Array): Promise<string> {
+  const ctx = createSha256Context();
+  const len = data.byteLength;
+  const fullLen = len - (len % 64);
+  for (let chunkStart = 0; chunkStart < fullLen; chunkStart += ASYNC_YIELD_CHUNK_BYTES) {
+    const chunkEnd = Math.min(chunkStart + ASYNC_YIELD_CHUNK_BYTES, fullLen);
+    for (let offset = chunkStart; offset < chunkEnd; offset += 64) {
+      processBlock(ctx, data, offset);
+    }
+    if (chunkEnd < fullLen) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
+  return finalizeSha256(ctx, data, fullLen);
 }
 
 /**
  * Computes lowercase 64-char SHA-256 hex digest.
  * Uses hardware-accelerated `crypto.subtle.digest` when available (HTTPS / localhost),
- * and seamlessly falls back to pure-JS `sha256HexSync` on plain HTTP.
+ * and seamlessly falls back to chunk-yielding pure-JS SHA-256 on plain HTTP so large
+ * files never freeze video rendering or touch input.
  */
 export async function computeSha256Hex(data: Uint8Array): Promise<string> {
   if (
@@ -163,5 +203,5 @@ export async function computeSha256Hex(data: Uint8Array): Promise<string> {
       // Fall through to pure-JS implementation
     }
   }
-  return sha256HexSync(data);
+  return sha256HexAsync(data);
 }
