@@ -365,6 +365,9 @@ function cloneCapabilities(cap: DeviceCapabilities): DeviceCapabilities {
   if (cap.rootOrShizuku !== undefined) {
     copy.rootOrShizuku = Boolean(cap.rootOrShizuku);
   }
+  if (cap.p2pFileTransfer !== undefined) {
+    copy.p2pFileTransfer = Boolean(cap.p2pFileTransfer);
+  }
   return copy;
 }
 

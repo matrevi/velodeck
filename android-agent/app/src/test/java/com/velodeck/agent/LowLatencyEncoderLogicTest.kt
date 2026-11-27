@@ -1,11 +1,13 @@
 package com.velodeck.agent
 
+import android.media.MediaCodecInfo
 import com.velodeck.agent.capture.DisplayScaleMath
 import com.velodeck.agent.capture.LowLatencyEncoderMath
 import com.velodeck.agent.capture.LowLatencyH264EncoderFactory
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -127,17 +129,43 @@ class LowLatencyEncoderLogicTest {
     }
 
     @Test
-    fun `bitrate clamping and tightened 150ms 3-percent threshold guard behave correctly`() {
+    fun `bitrate clamping, WAN-TURN floors, QP bounds, and tightened 150ms 3-percent threshold guard behave correctly`() {
         assertEquals(150L, LowLatencyEncoderMath.BITRATE_UPDATE_MIN_INTERVAL_MS)
         assertEquals(0.03, LowLatencyEncoderMath.BITRATE_CHANGE_THRESHOLD_RATIO, 1e-9)
+        assertEquals(400_000, LowLatencyEncoderMath.MIN_BITRATE_BPS)
         assertEquals(LowLatencyEncoderMath.MIN_BITRATE_BPS, LowLatencyEncoderMath.clampBitrateBps(100_000))
         assertEquals(LowLatencyEncoderMath.MAX_BITRATE_BPS, LowLatencyEncoderMath.clampBitrateBps(25_000_000))
-        assertEquals(2_200_000, LowLatencyEncoderMath.minBitrateForResolution(900, 2012))
-        assertEquals(3_200_000, LowLatencyEncoderMath.minBitrateForResolution(2414, 1080))
+
+        // WAN/TURN-friendly per-resolution floors
+        assertEquals(400_000, LowLatencyEncoderMath.minBitrateForResolution(540, 1206))
+        assertEquals(700_000, LowLatencyEncoderMath.minBitrateForResolution(720, 1610))
+        assertEquals(900_000, LowLatencyEncoderMath.minBitrateForResolution(900, 2012))
+        assertEquals(1_200_000, LowLatencyEncoderMath.minBitrateForResolution(2414, 1080))
         assertEquals(
-            2_200_000,
-            LowLatencyEncoderMath.clampBitrateBps(900_000, LowLatencyEncoderMath.minBitrateForResolution(900, 2012)),
+            700_000,
+            LowLatencyEncoderMath.clampBitrateBps(500_000, LowLatencyEncoderMath.minBitrateForResolution(720, 1610)),
         )
+        assertEquals(
+            900_000,
+            LowLatencyEncoderMath.clampBitrateBps(600_000, LowLatencyEncoderMath.minBitrateForResolution(900, 2012)),
+        )
+        assertEquals(
+            1_200_000,
+            LowLatencyEncoderMath.clampBitrateBps(800_000, LowLatencyEncoderMath.minBitrateForResolution(1080, 2414)),
+        )
+
+        // Relaxed Android 12+ QP caps prevent CBR FrameDropper stalls during full-screen motion
+        assertEquals(12, LowLatencyEncoderMath.QP_MIN)
+        assertEquals(34, LowLatencyEncoderMath.QP_I_MAX)
+        assertEquals(38, LowLatencyEncoderMath.QP_P_MAX)
+
+        // Adaptive SDP/sender min (20% clamped 500..1500 kbps) and start (55% clamped 1200..4000 kbps)
+        assertEquals(500, LowLatencyEncoderMath.computeSdpMinBitrateKbps(1_600))   // ECO
+        assertEquals(900, LowLatencyEncoderMath.computeSdpMinBitrateKbps(4_500))   // BALANCED
+        assertEquals(1_500, LowLatencyEncoderMath.computeSdpMinBitrateKbps(7_500)) // HD
+        assertEquals(1_200, LowLatencyEncoderMath.computeSdpStartBitrateKbps(1_600))
+        assertEquals(2_475, LowLatencyEncoderMath.computeSdpStartBitrateKbps(4_500))
+        assertEquals(4_000, LowLatencyEncoderMath.computeSdpStartBitrateKbps(7_500))
 
         // 2.5% delta < 3% threshold -> ignored even after 500ms
         assertFalse(LowLatencyEncoderMath.shouldApplyBitrateUpdate(2_000_000, 2_050_000, 500L))
@@ -147,6 +175,195 @@ class LowLatencyEncoderLogicTest {
         assertTrue(LowLatencyEncoderMath.shouldApplyBitrateUpdate(2_000_000, 2_070_000, 160L))
         // Large delta after cooldown -> applied
         assertTrue(LowLatencyEncoderMath.shouldApplyBitrateUpdate(2_000_000, 2_500_000, 300L))
+    }
+
+    @Test
+    fun `normalizeCaptureTimestampNs preserves 120Hz real frame cadence without +16_67ms inflation`() {
+        val frameStep120HzNs = 8_333_333L
+        var lastRaw = 0L
+        var lastDelivered = 0L
+        val baseMonotonicNs = 120_000_000_000L // 120s CLOCK_MONOTONIC
+
+        val delivered = mutableListOf<Long>()
+        for (i in 0 until 10) {
+            val rawTs = baseMonotonicNs + i * frameStep120HzNs
+            val nowNs = rawTs + 400_000L // 0.4ms dispatch latency in same CLOCK_MONOTONIC domain
+            val ts = LowLatencyEncoderMath.normalizeCaptureTimestampNs(
+                rawTsNs = rawTs,
+                nowNs = nowNs,
+                lastRawSurfaceTsNs = lastRaw,
+                lastDeliveredTsNs = lastDelivered,
+            )
+            assertEquals("Real 120Hz frame #$i must be delivered unchanged", rawTs, ts)
+            lastRaw = rawTs
+            lastDelivered = ts
+            delivered.add(ts)
+        }
+        // Verify consecutive deltas remain exact 8.333ms so libwebrtc VideoAdapter cleanly decimates 120->60fps
+        for (i in 1 until delivered.size) {
+            assertEquals(frameStep120HzNs, delivered[i] - delivered[i - 1])
+        }
+    }
+
+    @Test
+    fun `normalizeCaptureTimestampNs aligns monotonically after device sleep and jitter`() {
+        // After hours of deep sleep, CLOCK_MONOTONIC (System.nanoTime & SurfaceTexture) is e.g. 500s
+        // (far below CLOCK_BOOTTIME, which is no longer used).
+        val postSleepMonotonicNs = 500_000_000_000L
+        var lastRaw = 0L
+        var lastDelivered = 0L
+
+        // 1. Initial forceFrame() fires before first real draw (rawTsNs = 0)
+        val tsForce0 = LowLatencyEncoderMath.normalizeCaptureTimestampNs(
+            rawTsNs = 0L,
+            nowNs = postSleepMonotonicNs,
+            lastRawSurfaceTsNs = lastRaw,
+            lastDeliveredTsNs = lastDelivered,
+        )
+        assertEquals(postSleepMonotonicNs, tsForce0)
+        lastDelivered = tsForce0
+
+        // 2. Real frame was latched 1.5ms BEFORE forceFrame() ran -> rawTsNs < lastDelivered
+        val slightlyOlderRealTs = postSleepMonotonicNs - 1_500_000L
+        val nowForOlderReal = postSleepMonotonicNs + 200_000L
+        val tsClampedReal = LowLatencyEncoderMath.normalizeCaptureTimestampNs(
+            rawTsNs = slightlyOlderRealTs,
+            nowNs = nowForOlderReal,
+            lastRawSurfaceTsNs = lastRaw,
+            lastDeliveredTsNs = lastDelivered,
+        )
+        // Must clamp by +1ms (NOT +16.67ms!)
+        assertEquals(postSleepMonotonicNs + 1_000_000L, tsClampedReal)
+        lastRaw = slightlyOlderRealTs
+        lastDelivered = tsClampedReal
+
+        // 3. Very next 120Hz real frame (8.333ms later) immediately exceeds lastDelivered and delivers rawTsNs untouched
+        val nextRealTs = slightlyOlderRealTs + 8_333_333L
+        val tsRecovered = LowLatencyEncoderMath.normalizeCaptureTimestampNs(
+            rawTsNs = nextRealTs,
+            nowNs = nextRealTs + 300_000L,
+            lastRawSurfaceTsNs = lastRaw,
+            lastDeliveredTsNs = lastDelivered,
+        )
+        assertEquals(nextRealTs, tsRecovered)
+    }
+
+    @Test
+    fun `normalizeCaptureTimestampNs keeps repeated forceFrame monotonic and anchored with zero runaway`() {
+        val realFrameTs = 200_000_000_000L
+        var lastRaw = realFrameTs
+        var lastDelivered = realFrameTs
+
+        // Static screen: forceFrame() repeats lastRawSurfaceTsNs at 250ms and 750ms later
+        val force1 = LowLatencyEncoderMath.normalizeCaptureTimestampNs(
+            rawTsNs = realFrameTs,
+            nowNs = realFrameTs + 250_000_000L,
+            lastRawSurfaceTsNs = lastRaw,
+            lastDeliveredTsNs = lastDelivered,
+        )
+        assertEquals(realFrameTs + 250_000_000L, force1)
+        lastDelivered = force1
+
+        // Back-to-back forceFrame() only 0.2ms later -> strictly monotonic (+1ms)
+        val forceBurst = LowLatencyEncoderMath.normalizeCaptureTimestampNs(
+            rawTsNs = realFrameTs,
+            nowNs = force1 + 200_000L,
+            lastRawSurfaceTsNs = lastRaw,
+            lastDeliveredTsNs = lastDelivered,
+        )
+        assertEquals(force1 + 1_000_000L, forceBurst)
+        lastDelivered = forceBurst
+
+        // Next periodic pump 500ms later re-anchors directly to real nowNs (zero drift/runaway)
+        val pumpLaterNow = realFrameTs + 750_000_000L
+        val force2 = LowLatencyEncoderMath.normalizeCaptureTimestampNs(
+            rawTsNs = realFrameTs,
+            nowNs = pumpLaterNow,
+            lastRawSurfaceTsNs = lastRaw,
+            lastDeliveredTsNs = lastDelivered,
+        )
+        assertEquals(pumpLaterNow, force2)
+        lastDelivered = force2
+
+        // Resuming real VirtualDisplay frames right after static pump passes rawTsNs through cleanly
+        val resumedRealTs = pumpLaterNow + 8_333_333L
+        val resumed = LowLatencyEncoderMath.normalizeCaptureTimestampNs(
+            rawTsNs = resumedRealTs,
+            nowNs = resumedRealTs + 250_000L,
+            lastRawSurfaceTsNs = lastRaw,
+            lastDeliveredTsNs = lastDelivered,
+        )
+        assertEquals(resumedRealTs, resumed)
+    }
+
+    @Test
+    fun `selectAvcLevel and resolveSupportedAvcLevel pick Level 5_1 for 20-9 HD and Balanced`() {
+        // 720p (1280x720 = 3,600 MBs, *120 = 432,000 <= 522,240) and ECO 540x1206 fit Level 4.2
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel42,
+            LowLatencyEncoderMath.selectAvcLevel(1280, 720, 60),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel42,
+            LowLatencyEncoderMath.selectAvcLevel(540, 1206, 30),
+        )
+
+        // 900x2012 (7,182 MBs, *120 = 861,840 > Level 4.2 MaxMBPS 522,240) requires Level 5.1
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+            LowLatencyEncoderMath.selectAvcLevel(900, 2012, 60),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+            LowLatencyEncoderMath.selectAvcLevel(2012, 900, 60),
+        )
+
+        // 1080x2414 (10,268 MBs > Level 4.2 MaxFS 8,704) requires Level 5.1 in portrait & landscape
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+            LowLatencyEncoderMath.selectAvcLevel(1080, 2414, 60),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+            LowLatencyEncoderMath.selectAvcLevel(2414, 1080, 60),
+        )
+
+        // Capability resolution against CodecCapabilities.profileLevels
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+            LowLatencyEncoderMath.resolveSupportedAvcLevel(
+                desiredLevel = MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+                supportedLevelsForProfile = listOf(MediaCodecInfo.CodecProfileLevel.AVCLevel52),
+            ),
+        )
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+            LowLatencyEncoderMath.resolveSupportedAvcLevel(
+                desiredLevel = MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+                supportedLevelsForProfile = listOf(
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel42,
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+                ),
+            ),
+        )
+        // Older HAL capped below desired level -> falls back to highest supported level for profile
+        assertEquals(
+            MediaCodecInfo.CodecProfileLevel.AVCLevel5,
+            LowLatencyEncoderMath.resolveSupportedAvcLevel(
+                desiredLevel = MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+                supportedLevelsForProfile = listOf(
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel42,
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel5,
+                ),
+            ),
+        )
+        // Profile not advertised / empty list -> returns null so KEY_LEVEL is omitted for HAL auto-pick
+        assertNull(
+            LowLatencyEncoderMath.resolveSupportedAvcLevel(
+                desiredLevel = MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+                supportedLevelsForProfile = emptyList(),
+            ),
+        )
     }
 
     @Test

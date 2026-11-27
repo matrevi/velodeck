@@ -328,21 +328,22 @@ class WebRtcSessionManager(
                 Log.i(TAG, "First WebRTC frame captured (${frame.rotatedWidth}x${frame.rotatedHeight})")
             }
             val rawTsNs = frame.timestampNs
-            val nowNs = SystemClock.elapsedRealtimeNanos()
-            val deliveredFrame = if (rawTsNs == 0L || rawTsNs == lastRawSurfaceTsNs || rawTsNs <= lastDeliveredTsNs) {
-                // Static screen forceFrame() repeats stale SurfaceTexture timestamp (or 0 before first real draw):
-                // replace with monotonic wall time so libwebrtc TimestampAligner & BWE stay accurate.
-                val fixedTsNs = if (lastDeliveredTsNs > 0L) {
-                    maxOf(lastDeliveredTsNs + NOMINAL_FRAME_STEP_NS, nowNs)
-                } else {
-                    nowNs
-                }
-                lastDeliveredTsNs = fixedTsNs
-                VideoFrame(frame.buffer, frame.rotation, fixedTsNs)
-            } else {
+            // SurfaceTexture.getTimestamp() uses CLOCK_MONOTONIC (System.nanoTime()), NOT CLOCK_BOOTTIME.
+            val nowNs = System.nanoTime()
+            val deliveredTsNs = LowLatencyEncoderMath.normalizeCaptureTimestampNs(
+                rawTsNs = rawTsNs,
+                nowNs = nowNs,
+                lastRawSurfaceTsNs = lastRawSurfaceTsNs,
+                lastDeliveredTsNs = lastDeliveredTsNs,
+            )
+            if (rawTsNs > 0L && rawTsNs != lastRawSurfaceTsNs) {
                 lastRawSurfaceTsNs = rawTsNs
-                lastDeliveredTsNs = rawTsNs
+            }
+            lastDeliveredTsNs = deliveredTsNs
+            val deliveredFrame = if (deliveredTsNs == rawTsNs) {
                 frame
+            } else {
+                VideoFrame(frame.buffer, frame.rotation, deliveredTsNs)
             }
             source.capturerObserver.onFrameCaptured(deliveredFrame)
         }
@@ -605,8 +606,8 @@ class WebRtcSessionManager(
      */
     private fun injectSdpBitrateHints(sdp: String, quality: StreamQuality): String {
         val presetMaxKbps = resolveTargetBitrateKbps(quality)
-        val startKbps = ((presetMaxKbps * 4) / 5).coerceIn(1_200, 6_000)
-        val minKbps = ((presetMaxKbps * 55) / 100).coerceIn(800, 4_200)
+        val startKbps = LowLatencyEncoderMath.computeSdpStartBitrateKbps(presetMaxKbps)
+        val minKbps = LowLatencyEncoderMath.computeSdpMinBitrateKbps(presetMaxKbps)
         val sessionCeilingKbps = SDP_SESSION_MAX_BITRATE_KBPS
         val normalized = sdp.replace("\r\n", "\n").replace("\r", "\n")
         val lines = normalized.split("\n").toMutableList()
@@ -657,13 +658,13 @@ class WebRtcSessionManager(
         if (sender == null) return
         try {
             val params = sender.parameters ?: return
-            // Disable dynamic resolution/fps adaptation so app-launch scene changes never trigger
-            // a ~250ms MediaCodec teardown/re-init stall (e.g., 720p -> 540p mid-session).
-            params.degradationPreference = RtpParameters.DegradationPreference.DISABLED
+            // Prefer smooth 30-60 FPS over constrained WAN/TURN links rather than collapsing to
+            // single-digit FPS while still allowing LAN links to stay at full target bitrate.
+            params.degradationPreference = RtpParameters.DegradationPreference.MAINTAIN_FRAMERATE
             val maxKbps = resolveTargetBitrateKbps(quality)
             val maxBps = maxKbps * 1_000
-            // Hold a crisp 55% floor so periodic Wi-Fi/AWDL jitter spikes never crush 900p/1080p into blurry 800kbps
-            val minBps = ((maxBps * 55L) / 100L).toInt().coerceIn(800_000, 4_200_000)
+            // Adaptive 20% floor (500-1500 kbps) lets BWE scale smoothly on congested WAN/TURN links
+            val minBps = LowLatencyEncoderMath.computeSdpMinBitrateKbps(maxKbps) * 1_000
             val maxFps = resolveTargetFps(quality)
             for (encoding in params.encodings) {
                 encoding.maxBitrateBps = maxBps
@@ -1202,7 +1203,6 @@ class WebRtcSessionManager(
         private const val POINTER_CHANNEL_LABEL = "pointer"
         private const val FILE_CHANNEL_LABEL = "file"
         private const val START_SESSION_TIMEOUT_SEC = 4L
-        private const val NOMINAL_FRAME_STEP_NS = 16_666_667L
         private const val SDP_SESSION_MAX_BITRATE_KBPS = 10_000
     }
 }

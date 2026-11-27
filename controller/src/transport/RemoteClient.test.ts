@@ -3,6 +3,8 @@ import { FRAME_TYPE_JPEG, encodeMediaFrame } from "@velodeck/protocol";
 import {
   RemoteClient,
   isAllowedDataChannelMessage,
+  isWebRtcStaticIdle,
+  selectAdaptivePlayoutDelayMs,
   sortPreferredVideoCodecs,
 } from "./RemoteClient";
 
@@ -1730,6 +1732,228 @@ describe("RemoteClient WebRTC P2P file transfer", () => {
       client.sendFileOverWebRtc(data, { fileName: "next.bin" }),
     ).rejects.toThrow("WebRTC P2P 文件通道未就绪");
     expect(client.getState().fileTransfer?.status).toBe("error");
+
+    client.disconnect();
+  });
+});
+
+describe("selectAdaptivePlayoutDelayMs and isWebRtcStaticIdle", () => {
+  it("selects coarse playout delay buckets for LAN P2P, moderate WAN, high RTT, and TURN", () => {
+    // LAN / low-RTT P2P (< 25ms) -> 16ms
+    expect(selectAdaptivePlayoutDelayMs("p2p", 1)).toBe(16);
+    expect(selectAdaptivePlayoutDelayMs("p2p", 12)).toBe(16);
+    expect(selectAdaptivePlayoutDelayMs("p2p", 24)).toBe(16);
+
+    // Moderate WAN (25ms <= rtt < 60ms, non-TURN) -> 30ms
+    expect(selectAdaptivePlayoutDelayMs("p2p", 25)).toBe(30);
+    expect(selectAdaptivePlayoutDelayMs("p2p", 42)).toBe(30);
+    expect(selectAdaptivePlayoutDelayMs("p2p", 59)).toBe(30);
+    expect(selectAdaptivePlayoutDelayMs(null, 35)).toBe(30);
+
+    // High RTT (>= 60ms) or TURN relay -> 45ms
+    expect(selectAdaptivePlayoutDelayMs("p2p", 60)).toBe(45);
+    expect(selectAdaptivePlayoutDelayMs("p2p", 110)).toBe(45);
+    expect(selectAdaptivePlayoutDelayMs(null, 65)).toBe(45);
+    expect(selectAdaptivePlayoutDelayMs("turn", 10)).toBe(45);
+    expect(selectAdaptivePlayoutDelayMs("turn", 40)).toBe(45);
+    expect(selectAdaptivePlayoutDelayMs("turn", 85)).toBe(45);
+    expect(selectAdaptivePlayoutDelayMs("turn", null)).toBe(45);
+
+    // Missing RTT on non-TURN route preserves fallback bucket without thrashing
+    expect(selectAdaptivePlayoutDelayMs("p2p", null, 30)).toBe(30);
+    expect(selectAdaptivePlayoutDelayMs(null, null, 16)).toBe(16);
+  });
+
+  it("classifies WebRTC static keepalive screens as idle without masking congested low-FPS scrolling", () => {
+    // 0 FPS while streaming WebRTC -> idle
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 0, null)).toBe(true);
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 0, 50)).toBe(true);
+
+    // Static keepalive pump (~1-2 FPS, low bitrate <= 120 kbps) -> idle
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 1, 20)).toBe(true);
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 2, 80)).toBe(true);
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 2, 120)).toBe(true);
+
+    // Real congested scrolling at 2 FPS (> 120 kbps) -> NOT idle
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 2, 121)).toBe(false);
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 2, 950)).toBe(false);
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 1, 400)).toBe(false);
+
+    // Without bitrate measurement yet, 1-2 FPS should not claim idle
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 2, null)).toBe(false);
+
+    // Active FPS (> 2) -> NOT idle even if low bitrate
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 3, 40)).toBe(false);
+    expect(isWebRtcStaticIdle("webrtc", "streaming", 60, 2400)).toBe(false);
+
+    // Non-WebRTC or non-streaming -> NOT idle
+    expect(isWebRtcStaticIdle("ws-jpeg", "streaming", 0, 0)).toBe(false);
+    expect(isWebRtcStaticIdle("webrtc", "negotiating", 0, 0)).toBe(false);
+    expect(isWebRtcStaticIdle(null, "streaming", 0, 0)).toBe(false);
+  });
+});
+
+describe("RemoteClient adaptive playout delay on stats polling", () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const originalRTC = globalThis.RTCPeerConnection;
+
+  afterEach(() => {
+    vi.useRealTimers();
+    FakeWebSocket.instances = [];
+    FakeRTCPeerConnection.instances = [];
+    globalThis.WebSocket = originalWebSocket;
+    globalThis.RTCPeerConnection = originalRTC;
+  });
+
+  it("adapts playoutDelayHint and jitterBufferTarget across P2P/WAN/TURN buckets without thrashing", async () => {
+    vi.useFakeTimers();
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+    globalThis.RTCPeerConnection =
+      FakeRTCPeerConnection as unknown as typeof RTCPeerConnection;
+
+    const client = new RemoteClient("ctrl-adaptive-delay");
+    client.connectWithAccount({
+      wsUrl: "wss://velodeck.example.com/ws",
+      authToken: "jwt-valid",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      preferredTransport: "webrtc",
+    });
+
+    const ws = FakeWebSocket.instances[0]!;
+    ws.emitOpen();
+    ws.emitJson({
+      type: "controller.authed",
+      clientId: "ctrl-adaptive-delay",
+      serverTime: Date.now(),
+      mode: "relay",
+      authType: "account",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      devices: [makeDeviceSummary({ mediaProjection: true, webrtc: true })],
+      iceServers: [],
+    });
+
+    client.startSession("dev-1", { preferredTransport: "webrtc" });
+    const sessId = client.getState().sessionId!;
+    ws.emitJson({
+      type: "session.ready",
+      sessionId: sessId,
+      deviceId: "dev-1",
+      transport: "webrtc",
+      screenWidth: 1080,
+      screenHeight: 2400,
+      rotation: 0,
+    });
+    await Promise.resolve();
+
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    const playoutHistory: number[] = [];
+    const jitterHistory: number[] = [];
+    let playoutDelayVal = 0.1;
+    let jitterTargetVal = 100;
+    const trackedReceiver = {
+      get playoutDelayHint() {
+        return playoutDelayVal;
+      },
+      set playoutDelayHint(v: number) {
+        playoutDelayVal = v;
+        playoutHistory.push(v);
+      },
+      get jitterBufferTarget() {
+        return jitterTargetVal;
+      },
+      set jitterBufferTarget(v: number) {
+        jitterTargetVal = v;
+        jitterHistory.push(v);
+      },
+    };
+
+    pc.ontrack?.({
+      receiver: trackedReceiver,
+      streams: [{} as MediaStream],
+      track: { kind: "video" } as MediaStreamTrack,
+    });
+    expect(playoutHistory).toEqual([0.016]);
+    expect(jitterHistory).toEqual([16]);
+
+    // Poll 1 & 2: P2P low RTT (12ms, 18ms) -> remains in 16ms bucket, NO extra writes
+    pc.statsEntries = [
+      {
+        id: "pair-1",
+        type: "candidate-pair",
+        nominated: true,
+        state: "succeeded",
+        currentRoundTripTime: 0.012,
+        localCandidateId: "loc-1",
+        remoteCandidateId: "rem-1",
+      },
+      { id: "loc-1", type: "local-candidate", candidateType: "host", address: "192.168.1.2" },
+      { id: "rem-1", type: "remote-candidate", candidateType: "host", address: "192.168.1.3" },
+    ];
+    pc.connectionState = "connected";
+    pc.onconnectionstatechange?.();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(playoutHistory).toEqual([0.016]);
+    expect(jitterHistory).toEqual([16]);
+
+    // Poll 3 & 4: Moderate WAN P2P RTT (38ms) -> shifts once to 30ms (0.03s), no thrash on second poll
+    pc.statsEntries = [
+      {
+        id: "pair-1",
+        type: "candidate-pair",
+        nominated: true,
+        state: "succeeded",
+        currentRoundTripTime: 0.038,
+        localCandidateId: "loc-srflx",
+        remoteCandidateId: "rem-srflx",
+      },
+      { id: "loc-srflx", type: "local-candidate", candidateType: "srflx", address: "1.2.3.4" },
+      { id: "rem-srflx", type: "remote-candidate", candidateType: "srflx", address: "5.6.7.8" },
+    ];
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(playoutHistory).toEqual([0.016, 0.03]);
+    expect(jitterHistory).toEqual([16, 30]);
+
+    // Poll 5: TURN relay (even with low RTT 18ms) -> shifts to 45ms (0.045s)
+    pc.statsEntries = [
+      {
+        id: "pair-1",
+        type: "candidate-pair",
+        nominated: true,
+        state: "succeeded",
+        currentRoundTripTime: 0.018,
+        localCandidateId: "loc-relay",
+        remoteCandidateId: "rem-srflx",
+      },
+      { id: "loc-relay", type: "local-candidate", candidateType: "relay", address: "9.9.9.9" },
+      { id: "rem-srflx", type: "remote-candidate", candidateType: "srflx", address: "5.6.7.8" },
+    ];
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(playoutHistory).toEqual([0.016, 0.03, 0.045]);
+    expect(jitterHistory).toEqual([16, 30, 45]);
+
+    // Poll 6: Back to low-RTT P2P (10ms) -> drops back down to 16ms (0.016s)
+    pc.statsEntries = [
+      {
+        id: "pair-1",
+        type: "candidate-pair",
+        nominated: true,
+        state: "succeeded",
+        currentRoundTripTime: 0.01,
+        localCandidateId: "loc-1",
+        remoteCandidateId: "rem-1",
+      },
+      { id: "loc-1", type: "local-candidate", candidateType: "host", address: "192.168.1.2" },
+      { id: "rem-1", type: "remote-candidate", candidateType: "host", address: "192.168.1.3" },
+    ];
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(playoutHistory).toEqual([0.016, 0.03, 0.045, 0.016]);
+    expect(jitterHistory).toEqual([16, 30, 45, 16]);
+
+    // Cleanup on stopSession/disconnect prevents further mutations
+    client.stopSession();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(playoutHistory).toEqual([0.016, 0.03, 0.045, 0.016]);
+    expect(jitterHistory).toEqual([16, 30, 45, 16]);
 
     client.disconnect();
   });

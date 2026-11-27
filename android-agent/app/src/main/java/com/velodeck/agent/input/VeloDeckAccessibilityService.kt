@@ -123,9 +123,9 @@ class VeloDeckAccessibilityService : AccessibilityService() {
      * - [DisplayOverlayMode.OFF]: removes overlay completely.
      * - [DisplayOverlayMode.KEEP_AWAKE_ONLY]: 1x1 transparent touch-passthrough keep-screen-on
      *   layer at normal system brightness so remote sessions never auto-sleep into black frames.
-     * - [DisplayOverlayMode.STEALTH_DIM]: transparent touch-passthrough + 0.1% hardware minimum
+     * - [DisplayOverlayMode.STEALTH_DIM]: 1x1 transparent touch-passthrough + 0.1% hardware minimum
      *   backlight + KEEP_SCREEN_ON so remote MediaProjection captures 100% full-brightness frames
-     *   while the physical display stays ultra-dim and awake.
+     *   while the physical display stays ultra-dim and awake without a full-screen SurfaceFlinger layer.
      * - [DisplayOverlayMode.PURE_BLACK_IDLE]: pure #000000 OLED curtain + 0.1% backlight +
      *   KEEP_SCREEN_ON when idle (0 active remote sessions), with 5-tap emergency dismiss.
      */
@@ -150,11 +150,7 @@ class VeloDeckAccessibilityService : AccessibilityService() {
                 } else {
                     baseFlags
                 }
-                val size = if (mode == DisplayOverlayMode.KEEP_AWAKE_ONLY) {
-                    1
-                } else {
-                    WindowManager.LayoutParams.MATCH_PARENT
-                }
+                val size = overlayDimensionForMode(mode)
                 val lp = WindowManager.LayoutParams(
                     size,
                     size,
@@ -1224,6 +1220,19 @@ class VeloDeckAccessibilityService : AccessibilityService() {
             "完成",
             "确认",
         )
+
+        /**
+         * Only [DisplayOverlayMode.PURE_BLACK_IDLE] needs a full-screen surface to paint opaque
+         * black pixels; both [DisplayOverlayMode.KEEP_AWAKE_ONLY] and [DisplayOverlayMode.STEALTH_DIM]
+         * use a 1x1 pixel overlay so WindowManager applies `FLAG_KEEP_SCREEN_ON` and
+         * `screenBrightness` display-wide without allocating a full-screen RGBA8888 SurfaceFlinger layer.
+         */
+        internal fun overlayDimensionForMode(mode: DisplayOverlayMode): Int =
+            if (mode == DisplayOverlayMode.PURE_BLACK_IDLE) {
+                WindowManager.LayoutParams.MATCH_PARENT
+            } else {
+                1
+            }
 
         /**
          * Verifies that the SystemUI dialog tree contains BOTH a screen recording/casting phrase

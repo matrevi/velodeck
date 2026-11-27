@@ -36,12 +36,51 @@ internal object LowLatencyEncoderMath {
     const val STATIC_SETTLE_RAW_DELTA_NS = 180_000_000L // >= 180ms real pause -> user stopped scrolling to read
     const val STATIC_SETTLE_DELTA_NS = 24_000_000L     // 24ms gentle refinement budget so static text sharpens cleanly
     const val DEFAULT_FRAME_DELTA_NS = 16_666_667L     // 60fps nominal step
-    const val MIN_BITRATE_BPS = 800_000
+    const val MIN_CAPTURE_MONOTONIC_STEP_NS = 1_000_000L // 1ms minimum monotonic advance for synthetic/jitter frames
+    const val MIN_BITRATE_BPS = 400_000
     const val MAX_BITRATE_BPS = 12_000_000
     const val MIN_KEYFRAME_INTERVAL_MS = 350L
     const val BITRATE_UPDATE_MIN_INTERVAL_MS = 150L
     const val BITRATE_CHANGE_THRESHOLD_RATIO = 0.03
     const val SPS_SCAN_LIMIT_BYTES = 512
+    const val OPERATING_RATE_FPS = 120
+    const val AVC_LEVEL_42_MAX_FS_MB = 8_704L
+    const val AVC_LEVEL_42_MAX_MBPS = 522_240L
+    const val QP_MIN = 12
+    const val QP_I_MAX = 34
+    const val QP_P_MAX = 38
+
+    /**
+     * Normalizes a `SurfaceTexture` capture timestamp into a strictly monotonic `CLOCK_MONOTONIC`
+     * (`System.nanoTime()`) timeline suitable for `libwebrtc`'s `VideoAdapter` and `TimestampAligner`.
+     *
+     * `SurfaceTexture.getTimestamp()` uses `CLOCK_MONOTONIC`, so [nowNs] MUST also come from
+     * `System.nanoTime()` (never `SystemClock.elapsedRealtimeNanos()` / `CLOCK_BOOTTIME`, which
+     * advances across deep sleep and would poison subsequent real VirtualDisplay frames).
+     *
+     * - Real VirtualDisplay frames (`rawTsNs > 0L && rawTsNs != lastRawSurfaceTsNs`):
+     *   delivered unchanged when `rawTsNs > lastDeliveredTsNs` so native 90/120Hz cadence is
+     *   preserved for clean 120->60fps decimation; otherwise clamped monotonically by >= 1ms
+     *   (never +16.67ms).
+     * - Synthetic `forceFrame()` / pre-first-draw frames (`rawTsNs == 0L || rawTsNs == lastRawSurfaceTsNs`):
+     *   monotonically advanced and anchored to real `nowNs` with zero runaway.
+     */
+    fun normalizeCaptureTimestampNs(
+        rawTsNs: Long,
+        nowNs: Long,
+        lastRawSurfaceTsNs: Long,
+        lastDeliveredTsNs: Long,
+    ): Long {
+        val isRealFrame = rawTsNs > 0L && rawTsNs != lastRawSurfaceTsNs
+        if (isRealFrame && rawTsNs > lastDeliveredTsNs) {
+            return rawTsNs
+        }
+        return if (lastDeliveredTsNs > 0L) {
+            maxOf(lastDeliveredTsNs + MIN_CAPTURE_MONOTONIC_STEP_NS, nowNs)
+        } else {
+            nowNs
+        }
+    }
 
     /**
      * Computes the next clamped monotonic codec PTS (in nanoseconds) given the previous real frame
@@ -72,11 +111,59 @@ internal object LowLatencyEncoderMath {
     fun minBitrateForResolution(width: Int, height: Int): Int {
         val shortEdge = minOf(width, height)
         return when {
-            shortEdge >= 1080 -> 3_200_000
-            shortEdge >= 800 -> 2_200_000
-            shortEdge >= 720 -> 1_800_000
+            shortEdge >= 1080 -> 1_200_000
+            shortEdge >= 800 -> 900_000
+            shortEdge >= 720 -> 700_000
             else -> MIN_BITRATE_BPS
         }
+    }
+
+    /**
+     * WAN/TURN-friendly minimum bitrate floor (`20%` of preset max, clamped to `[500, 1500] kbps`)
+     * shared by SDP `x-google-min-bitrate` and `RtpParameters` `encoding.minBitrateBps`.
+     */
+    fun computeSdpMinBitrateKbps(presetMaxKbps: Int): Int =
+        ((presetMaxKbps * 20) / 100).coerceIn(500, 1_500)
+
+    /**
+     * Brisk initial bitrate (`55%` of preset max, clamped to `[1200, 4000] kbps`) for SDP
+     * `x-google-start-bitrate` so LAN starts crisp immediately while WAN/TURN can adapt downward.
+     */
+    fun computeSdpStartBitrateKbps(presetMaxKbps: Int): Int =
+        ((presetMaxKbps * 55) / 100).coerceIn(1_200, 4_000)
+
+    /**
+     * Selects the H.264 AVC codec level matching the target resolution and VPU operating rate.
+     *
+     * 20:9 HD (`1080x2414` = 10,268 macroblocks > Level 4.2 MaxFS 8,704) and 20:9 BALANCED
+     * (`900x2012` at 120fps operating rate = 861,840 MB/s > Level 4.2 MaxMBPS 522,240) require
+     * `AVCLevel51` (MaxFS 36,864, MaxMBPS 983,040) so Tier 1/2 HAL validation never rejects
+     * `KEY_LATENCY = 1` + `KEY_OPERATING_RATE`.
+     */
+    fun selectAvcLevel(width: Int, height: Int, targetFps: Int): Int {
+        val mbW = ((width.coerceAtLeast(16) + 15) / 16).toLong()
+        val mbH = ((height.coerceAtLeast(16) + 15) / 16).toLong()
+        val mbPerFrame = mbW * mbH
+        val effectiveRate = maxOf(targetFps, OPERATING_RATE_FPS).toLong()
+        return if (mbPerFrame > AVC_LEVEL_42_MAX_FS_MB || mbPerFrame * effectiveRate > AVC_LEVEL_42_MAX_MBPS) {
+            MediaCodecInfo.CodecProfileLevel.AVCLevel51
+        } else {
+            MediaCodecInfo.CodecProfileLevel.AVCLevel42
+        }
+    }
+
+    /**
+     * Resolves [desiredLevel] against the levels advertised in `CodecCapabilities.profileLevels`
+     * for the target profile. Returns [desiredLevel] when supported (`maxSupported >= desiredLevel`),
+     * falls back to the highest supported level if capped lower, or returns `null` so the caller
+     * omits `KEY_LEVEL` and lets the HAL pick automatically.
+     */
+    fun resolveSupportedAvcLevel(
+        desiredLevel: Int,
+        supportedLevelsForProfile: Collection<Int>,
+    ): Int? {
+        val maxSupported = supportedLevelsForProfile.filter { it > 0 }.maxOrNull() ?: return null
+        return if (maxSupported >= desiredLevel) desiredLevel else maxSupported
     }
 
     fun clampBitrateBps(requestedBps: Int, minFloorBps: Int = MIN_BITRATE_BPS): Int {
@@ -378,9 +465,17 @@ class LowLatencyH264Encoder(
      * flagship chips while safely degrading on older or stricter HALs without ever failing startup.
      */
     private fun configureCodecWithFallbacks(mediaCodec: MediaCodec): Int {
+        val supportedLevelsByProfile: Map<Int, List<Int>> = try {
+            val caps = mediaCodec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            caps.profileLevels
+                ?.groupBy({ it.profile }, { it.level })
+                .orEmpty()
+        } catch (_: Throwable) {
+            emptyMap()
+        }
         val tiers = listOf(1, 2, 3, 4)
         for (tier in tiers) {
-            val format = buildMediaFormat(tier)
+            val format = buildMediaFormat(tier, supportedLevelsByProfile)
             try {
                 mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 return tier
@@ -395,7 +490,10 @@ class LowLatencyH264Encoder(
         return -1
     }
 
-    private fun buildMediaFormat(tier: Int): MediaFormat {
+    private fun buildMediaFormat(
+        tier: Int,
+        supportedLevelsByProfile: Map<Int, List<Int>>,
+    ): MediaFormat {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
         format.setInteger(
             MediaFormat.KEY_COLOR_FORMAT,
@@ -438,18 +536,23 @@ class LowLatencyH264Encoder(
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
             }
             format.setInteger(MediaFormat.KEY_PROFILE, targetProfile)
-            format.setInteger(
-                MediaFormat.KEY_LEVEL,
-                MediaCodecInfo.CodecProfileLevel.AVCLevel42,
+            val desiredLevel = LowLatencyEncoderMath.selectAvcLevel(width, height, targetFps)
+            val resolvedLevel = LowLatencyEncoderMath.resolveSupportedAvcLevel(
+                desiredLevel = desiredLevel,
+                supportedLevelsForProfile = supportedLevelsByProfile[targetProfile].orEmpty(),
             )
+            if (resolvedLevel != null) {
+                format.setInteger(MediaFormat.KEY_LEVEL, resolvedLevel)
+            }
             if (isQualcommCodec(codecName)) {
                 format.setInteger("vendor.qti-ext-enc-low-latency.enable", 1)
             }
         }
 
         if (tier == 1 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Hard-cap worst-case quantization parameter on Android 12+ so scrolling & text never
-            // degrade into blurry QP 38-46 artifacts (Tier 2 drops these cleanly if HAL rejects).
+            // Cap worst-case quantization parameter on Android 12+ so hardware CBR can stay within
+            // target bitrate during full-screen motion without triggering FrameDropper FPS stalls,
+            // while still preventing blurry QP 45-51 mush (Tier 2 drops these cleanly if HAL rejects).
             format.setInteger(MediaFormat.KEY_VIDEO_QP_I_MIN, QP_MIN)
             format.setInteger(MediaFormat.KEY_VIDEO_QP_I_MAX, QP_I_MAX)
             format.setInteger(MediaFormat.KEY_VIDEO_QP_P_MIN, QP_MIN)
@@ -841,7 +944,7 @@ class LowLatencyH264Encoder(
             hasSentAnyKeyframe = true
         }
 
-        val captureTimeNs = meta?.captureTimeNs ?: SystemClock.elapsedRealtimeNanos()
+        val captureTimeNs = meta?.captureTimeNs ?: System.nanoTime()
         val rotation = meta?.rotation ?: 0
         val encodeLatencyUs = if (meta != null) {
             ((SystemClock.elapsedRealtimeNanos() - meta.submitElapsedNs) / 1_000L).coerceAtLeast(0L)
@@ -963,7 +1066,7 @@ class LowLatencyH264Encoder(
         private const val TAG = "LowLatencyH264Encoder"
         private const val DEQUEUE_TIMEOUT_US = 10_000L
         private const val KEY_FRAME_INTERVAL_SEC = 60
-        private const val OPERATING_RATE_FPS = 120
+        private const val OPERATING_RATE_FPS = LowLatencyEncoderMath.OPERATING_RATE_FPS
         private const val INTRA_REFRESH_FRAMES = 120
         private const val MAX_IN_FLIGHT_FRAMES = 6
         private const val MAX_PENDING_META = 24
@@ -971,8 +1074,8 @@ class LowLatencyH264Encoder(
         private const val BUFFER_POOL_SIZE = 8
         private const val POOLED_BUFFER_CAPACITY = 196_608 // 192 KB (comfortably fits 1080p High IDR frames)
         private const val STATS_LOG_INTERVAL_MS = 2_000L
-        private const val QP_MIN = 12
-        private const val QP_I_MAX = 28
-        private const val QP_P_MAX = 32
+        private const val QP_MIN = LowLatencyEncoderMath.QP_MIN
+        private const val QP_I_MAX = LowLatencyEncoderMath.QP_I_MAX
+        private const val QP_P_MAX = LowLatencyEncoderMath.QP_P_MAX
     }
 }

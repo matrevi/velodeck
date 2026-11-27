@@ -1,5 +1,7 @@
 package com.velodeck.agent
 
+import android.view.WindowManager
+import com.velodeck.agent.input.VeloDeckAccessibilityService
 import com.velodeck.agent.network.AccountApiClient
 import com.velodeck.agent.network.NetworkUtils
 import com.velodeck.agent.network.SessionCoordinator
@@ -507,5 +509,44 @@ class ProtocolMessagesTest {
         )
         assertTrue(openInfo.isSuccess)
         assertFalse(openInfo.getOrThrow().requiresInviteCode)
+    }
+
+    @Test
+    fun accessibilityOverlay_uses1x1ForStealthDimAndKeepAwakeOnlyFullScreenForPureBlackIdle() {
+        assertEquals(
+            1,
+            VeloDeckAccessibilityService.overlayDimensionForMode(
+                VeloDeckAccessibilityService.DisplayOverlayMode.KEEP_AWAKE_ONLY,
+            ),
+        )
+        assertEquals(
+            1,
+            VeloDeckAccessibilityService.overlayDimensionForMode(
+                VeloDeckAccessibilityService.DisplayOverlayMode.STEALTH_DIM,
+            ),
+        )
+        assertEquals(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            VeloDeckAccessibilityService.overlayDimensionForMode(
+                VeloDeckAccessibilityService.DisplayOverlayMode.PURE_BLACK_IDLE,
+            ),
+        )
+    }
+
+    @Test
+    fun dataChannelKeepalive_detectsDcPingWithoutSwallowingControlCommands() {
+        assertTrue(SessionCoordinator.isDataChannelKeepalive("""{"type":"dc.ping"}"""))
+        assertTrue(SessionCoordinator.isDataChannelKeepalive("""{"type": "dc.ping", "ts": 1760000000000}"""))
+        assertFalse(
+            SessionCoordinator.isDataChannelKeepalive(
+                """{"type":"control.cmd","sessionId":"s1","deviceId":"d1","seq":1,"command":{"action":"text","text":"{\"type\":\"dc.ping\"}"}}""",
+            ),
+        )
+        assertFalse(
+            SessionCoordinator.isDataChannelKeepalive(
+                """{"type":"control.cmd","sessionId":"s1","deviceId":"d1","seq":2,"command":{"action":"tap","x":0.5,"y":0.5}}""",
+            ),
+        )
+        assertFalse(SessionCoordinator.isDataChannelKeepalive("not-json dc.ping"))
     }
 }

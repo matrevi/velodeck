@@ -50,14 +50,15 @@ import {
   type ServerInfo,
 } from "../state/auth";
 import type { QualityPreset } from "../state/profiles";
-import type {
-  FileTransferPurpose,
-  FileTransferState,
-  RemoteClient,
-  RemoteClientState,
-  SessionStatus,
-  SocketStatus,
-  WebRtcTelemetry,
+import {
+  isWebRtcStaticIdle,
+  type FileTransferPurpose,
+  type FileTransferState,
+  type RemoteClient,
+  type RemoteClientState,
+  type SessionStatus,
+  type SocketStatus,
+  type WebRtcTelemetry,
 } from "../transport/RemoteClient";
 
 interface RemoteViewportProps {
@@ -1716,10 +1717,13 @@ const TelemetryCapsule = memo(function TelemetryCapsule({
           ? "RTC"
           : "WS";
 
-  const isIdleWebRtc =
-    activeTransport === "webrtc" &&
-    sessionStatus === "streaming" &&
-    telemetry.fps === 0;
+  const bitrateKbps = telemetry.webrtcTelemetry?.bitrateKbps ?? null;
+  const isIdleWebRtc = isWebRtcStaticIdle(
+    activeTransport,
+    sessionStatus,
+    telemetry.fps,
+    bitrateKbps,
+  );
 
   return (
     <div

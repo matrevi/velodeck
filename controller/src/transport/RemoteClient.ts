@@ -414,6 +414,50 @@ export function sortPreferredVideoCodecs<T extends VideoCodecPreferenceLike>(
   ];
 }
 
+export type PlayoutDelayBucketMs = 16 | 30 | 45;
+
+export function selectAdaptivePlayoutDelayMs(
+  route: "p2p" | "turn" | null,
+  rttMs: number | null,
+  fallbackMs: PlayoutDelayBucketMs = 16,
+): PlayoutDelayBucketMs {
+  if (route === "turn") {
+    return 45;
+  }
+  if (rttMs !== null && Number.isFinite(rttMs)) {
+    if (rttMs >= 60) {
+      return 45;
+    }
+    if (rttMs >= 25) {
+      return 30;
+    }
+    if (route === "p2p") {
+      return 16;
+    }
+  }
+  return fallbackMs;
+}
+
+export function isWebRtcStaticIdle(
+  activeTransport: TransportMode | null,
+  sessionStatus: SessionStatus,
+  fps: number,
+  bitrateKbps: number | null,
+): boolean {
+  if (activeTransport !== "webrtc" || sessionStatus !== "streaming") {
+    return false;
+  }
+  return (
+    fps === 0 ||
+    (fps <= 2 && bitrateKbps !== null && bitrateKbps <= 120)
+  );
+}
+
+type AdaptiveRtpReceiver = RTCRtpReceiver & {
+  playoutDelayHint?: number;
+  jitterBufferTarget?: number;
+};
+
 export class RemoteClient {
   private readonly clientId: string;
   private readonly stateListeners = new Set<StateListener>();
@@ -437,6 +481,8 @@ export class RemoteClient {
 
   private iceServers: IceServerConfig[] = [];
   private pc: RTCPeerConnection | null = null;
+  private activeVideoReceiver: AdaptiveRtpReceiver | null = null;
+  private lastAppliedPlayoutDelayMs: PlayoutDelayBucketMs | null = null;
   private dataChannel: RTCDataChannel | null = null;
   private pointerDataChannel: RTCDataChannel | null = null;
   private fileDataChannel: RTCDataChannel | null = null;
@@ -2028,6 +2074,8 @@ export class RemoteClient {
     this.remoteDescriptionReady = false;
     this.webrtcIceRestartAttempted = false;
     this.webrtcIceRestartInFlight = false;
+    this.activeVideoReceiver = null;
+    this.lastAppliedPlayoutDelayMs = null;
     let localIceCount = 0;
 
     const videoTransceiver = pc.addTransceiver("video", { direction: "recvonly" });
@@ -2123,22 +2171,13 @@ export class RemoteClient {
 
     pc.ontrack = (event) => {
       if (this.pc !== pc) return;
-      // Minimize browser WebRTC playout / jitter buffer latency for interactive remote control
-      const receiver = event.receiver as RTCRtpReceiver & {
-        playoutDelayHint?: number;
-        jitterBufferTarget?: number;
-      };
-      try {
-        // 16ms (~1 frame @ 60fps) matches our low-latency hardware encoder with clamped PTS
-        // and zero oversized keyframes, minimizing interactive glass-to-glass latency.
-        if (receiver && "playoutDelayHint" in receiver) {
-          receiver.playoutDelayHint = 0.016;
-        }
-        if (receiver && "jitterBufferTarget" in receiver) {
-          receiver.jitterBufferTarget = 16;
-        }
-      } catch {
-        // Ignore browsers without playoutDelayHint support
+      // Minimize browser WebRTC playout / jitter buffer latency for interactive remote control;
+      // start at 16ms (~1 frame @ 60fps) and let stats polling adapt cleanly for WAN/TURN links.
+      const receiver = event.receiver as AdaptiveRtpReceiver | undefined;
+      const isVideoTrack = !event.track?.kind || event.track.kind === "video";
+      if (receiver && isVideoTrack) {
+        this.activeVideoReceiver = receiver;
+        this.applyReceiverPlayoutDelay(receiver, 16, true);
       }
       const existingStream = event.streams[0];
       const stream = existingStream ?? new MediaStream([event.track]);
@@ -2800,12 +2839,47 @@ export class RemoteClient {
             }
           }
 
+          if (this.activeVideoReceiver) {
+            const targetPlayoutDelayMs = selectAdaptivePlayoutDelayMs(
+              route,
+              rttMs,
+              this.lastAppliedPlayoutDelayMs ?? 16,
+            );
+            this.applyReceiverPlayoutDelay(this.activeVideoReceiver, targetPlayoutDelayMs);
+          }
+
           if (Object.keys(telemetryPatch).length > 0) {
             this.setTelemetry(telemetryPatch);
           }
         })
         .catch(() => undefined);
     }, WEBRTC_STATS_INTERVAL_MS);
+  }
+
+  private applyReceiverPlayoutDelay(
+    receiver: AdaptiveRtpReceiver | null,
+    delayMs: PlayoutDelayBucketMs,
+    force = false,
+  ): void {
+    if (!receiver) return;
+    if (!force && this.lastAppliedPlayoutDelayMs === delayMs) {
+      return;
+    }
+    if ("playoutDelayHint" in receiver) {
+      try {
+        receiver.playoutDelayHint = delayMs / 1000;
+      } catch {
+        // Ignore browsers without playoutDelayHint support
+      }
+    }
+    if ("jitterBufferTarget" in receiver) {
+      try {
+        receiver.jitterBufferTarget = delayMs;
+      } catch {
+        // Ignore browsers without jitterBufferTarget support
+      }
+    }
+    this.lastAppliedPlayoutDelayMs = delayMs;
   }
 
   private stopWebRtcStatsPolling(): void {
@@ -2890,6 +2964,8 @@ export class RemoteClient {
     this.remoteDescriptionReady = false;
     this.webrtcIceRestartAttempted = false;
     this.webrtcIceRestartInFlight = false;
+    this.activeVideoReceiver = null;
+    this.lastAppliedPlayoutDelayMs = null;
 
     if (this.fileDataChannel) {
       try {

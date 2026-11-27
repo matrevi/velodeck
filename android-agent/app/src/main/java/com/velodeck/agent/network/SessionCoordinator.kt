@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 
 interface SessionSink {
@@ -727,6 +728,7 @@ class SessionCoordinator(
     }
 
     override fun onDataChannelMessage(sessionId: String, text: String) {
+        if (isDataChannelKeepalive(text)) return
         try {
             val parsed = ProtocolCodec.parse(text)
             if (parsed is WireMessage.ControlCmd) {
@@ -784,5 +786,19 @@ class SessionCoordinator(
             IceServerConfig(urls = listOf("stun:stun.miwifi.com:3478")),
             IceServerConfig(urls = listOf("stun:stun.chat.bilibili.com:3478")),
         )
+
+        /**
+         * Detects lightweight DataChannel `dc.ping` keepalive frames so they can be ignored
+         * silently without throwing `IllegalArgumentException` or spamming warnings, while
+         * preserving real `control.cmd` payloads whose text happens to mention `"dc.ping"`.
+         */
+        internal fun isDataChannelKeepalive(text: String): Boolean {
+            if (!text.contains("dc.ping")) return false
+            return try {
+                JSONObject(text).optString("type") == "dc.ping"
+            } catch (_: Throwable) {
+                false
+            }
+        }
     }
 }

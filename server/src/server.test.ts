@@ -1500,7 +1500,7 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
   assert.equal(infoBefore.status, 200);
   assert.deepEqual(await infoBefore.json(), {
     ok: true,
-    version: "1.0.0",
+    version: "1.0.2",
     hasAndroidApk: false,
     apkSha256: null,
     registrationMode: "first-user-then-invite",
@@ -1521,7 +1521,7 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
   assert.equal(infoAfter.status, 200);
   assert.deepEqual(await infoAfter.json(), {
     ok: true,
-    version: "1.0.0",
+    version: "1.0.2",
     hasAndroidApk: true,
     apkSha256: expectedSha256,
     registrationMode: "first-user-then-invite",
@@ -2910,4 +2910,82 @@ test("coturn.conf never uses CIDR notation or wildcard denied-peer-ip=:: that bl
       `coturn denied-peer-ip does not support CIDR notation: ${rule}`,
     );
   }
+});
+
+test("Agent p2pFileTransfer capability is preserved in controller.authed and across partial telemetry updates", async (t) => {
+  const { server, baseUrl, wsUrl } = await startServer();
+  t.after(() => server.close());
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "p2p_cap_user", password: "p2p-password-123" }),
+  });
+  assert.equal(regRes.status, 201);
+  const { token } = (await regRes.json()) as { token: string };
+
+  const agent = await TestWsClient.connect(wsUrl);
+  const ctrl1 = await TestWsClient.connect(wsUrl);
+  const ctrl2 = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent.close(), ctrl1.close(), ctrl2.close()]);
+  });
+
+  agent.sendJson(
+    makeAgentRegister({
+      deviceId: "dev-p2p-file-01",
+      deviceSecret: "p2p-secret-01",
+      authToken: token,
+      capabilities: {
+        webrtc: true,
+        wsJpeg: true,
+        wsH264: false,
+        wake: true,
+        unlock: true,
+        accessibility: true,
+        mediaProjection: true,
+        p2pFileTransfer: true,
+      },
+    }),
+  );
+  const agentReg = await agent.nextJson<AgentRegisteredMessage>();
+  assert.equal(agentReg.type, "agent.registered");
+
+  // Controller 1 authenticates -> devices list preserves p2pFileTransfer: true
+  ctrl1.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-p2p-1",
+  });
+  const authed1 = await ctrl1.nextJson<ControllerAuthedMessage>();
+  assert.equal(authed1.type, "controller.authed");
+  assert.equal(authed1.devices.length, 1);
+  assert.equal(authed1.devices[0]?.capabilities.p2pFileTransfer, true);
+
+  // Agent sends partial telemetry updating another capability without specifying p2pFileTransfer
+  // (exercises hub.ts cloneCapabilities inside mergeCapabilities)
+  agent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "dev-p2p-file-01",
+    battery: 77,
+    capabilities: {
+      mediaProjection: false,
+    },
+  });
+  const statusUpdate = await ctrl1.nextJson<DeviceStatusMessage>();
+  assert.equal(statusUpdate.type, "device.status");
+  assert.equal(statusUpdate.device.battery, 77);
+  assert.equal(statusUpdate.device.capabilities.mediaProjection, false);
+  assert.equal(statusUpdate.device.capabilities.p2pFileTransfer, true);
+
+  // Newly connecting controller still receives p2pFileTransfer: true in controller.authed
+  ctrl2.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-p2p-2",
+  });
+  const authed2 = await ctrl2.nextJson<ControllerAuthedMessage>();
+  assert.equal(authed2.type, "controller.authed");
+  assert.equal(authed2.devices[0]?.capabilities.p2pFileTransfer, true);
+  assert.equal(authed2.devices[0]?.capabilities.mediaProjection, false);
 });
