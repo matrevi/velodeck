@@ -37,13 +37,13 @@ internal object LowLatencyEncoderMath {
     const val MIN_FRAME_DELTA_NS = 8_000_000L            // 8ms (125fps burst ceiling & consecutive idle step)
     const val MAX_FRAME_DELTA_NS = 1_000_000_000L / 60   // 16.67ms (60fps default motion ceiling -> prevents CBR bursts)
     const val STATIC_SETTLE_RAW_DELTA_NS = 180_000_000L  // >= 180ms real pause -> user stopped scrolling to read
-    const val STATIC_SETTLE_DELTA_NS = 20_000_000L       // 20ms one-shot refinement budget right after motion stops
+    const val STATIC_SETTLE_DELTA_NS = 20_000_000L       // 20ms first post-scroll refinement budget right after motion stops
     const val DEFAULT_FRAME_DELTA_NS = 1_000_000_000L / 60 // 60fps nominal step
-    const val IDLE_RESUME_RAW_DELTA_NS = 300_000_000L    // >= 300ms gap after idle triggers VBV leaky-bucket re-arm
-    const val VBV_REARM_BITRATE_NUMERATOR = 75           // Briefly clamp bitrate to 75% on idle->motion resume
+    const val IDLE_RESUME_RAW_DELTA_NS = 300_000_000L    // >= 300ms gap reference threshold
+    const val VBV_REARM_BITRATE_NUMERATOR = 96           // Micro -4% bitrate nudge on idle->motion resume (no starvation)
     const val VBV_REARM_BITRATE_DENOMINATOR = 100
-    const val VBV_REARM_RESTORE_MS = 250L                // Restore 100% target bitrate after 250ms or 10 frames
-    const val VBV_REARM_RESTORE_FRAMES = 10
+    const val VBV_REARM_RESTORE_MS = 80L                 // Restore 100% target bitrate after 80ms or 3 frames
+    const val VBV_REARM_RESTORE_FRAMES = 3
     const val MAX_IN_FLIGHT_FRAMES = 3                   // <= 50ms worst-case encoder input queue depth at 60fps
     const val MIN_CAPTURE_MONOTONIC_STEP_NS = 1_000_000L // 1ms minimum monotonic advance for synthetic/jitter frames
     const val MIN_BITRATE_BPS = 300_000
@@ -56,9 +56,9 @@ internal object LowLatencyEncoderMath {
     const val AVC_LEVEL_42_MAX_FS_MB = 8_704L
     const val AVC_LEVEL_42_MAX_MBPS = 522_240L
     const val AVC_LEVEL_51_MAX_MBPS = 983_040L
-    const val QP_MIN = 20
-    const val QP_I_MAX = 42
-    const val QP_P_MAX = 46
+    const val QP_MIN = 18
+    const val QP_I_MAX = 34
+    const val QP_P_MAX = 37
     const val STATIC_PUMP_STARTUP_WINDOW_MS = 3_000L
     const val STATIC_PUMP_POST_MOTION_SETTLE_MS = 1_000L
     const val STATIC_PUMP_FAST_INTERVAL_MS = 250L
@@ -110,9 +110,10 @@ internal object LowLatencyEncoderMath {
      * - During active motion (`rawDeltaNs < 180ms`), `dt` is clamped to
      *   `[8ms, 1_000_000_000L / targetFps.coerceIn(24, 60)]` so Qualcomm CBR matches [targetFps]
      *   without idle-gap bursts or 30fps ECO starvation.
-     * - When motion stops (`rawDeltaNs >= 180ms`), allows at most ONE `20ms` settle step
-     *   ([consecutiveIdleGaps] == 0) to sharpen static text; all subsequent consecutive idle frames
-     *   use `MIN_FRAME_DELTA_NS` (`8ms`) so repeated static frames never accumulate surplus VBV credit.
+     * - When motion stops (`rawDeltaNs >= 180ms`), grants a 2-frame post-scroll refinement polish:
+     *   `consecutiveIdleGaps == 0` -> `20ms` (`STATIC_SETTLE_DELTA_NS`),
+     *   `consecutiveIdleGaps == 1` -> `maxDeltaNs` (`16.67ms` at 60fps) to polish residual scroll noise,
+     *   `consecutiveIdleGaps >= 2` -> `MIN_FRAME_DELTA_NS` (`8ms`) so long idle never accumulates VBV surplus.
      */
     fun nextClampedCodecPtsNs(
         previousRealTsNs: Long,
@@ -128,8 +129,10 @@ internal object LowLatencyEncoderMath {
         val rawDeltaNs = currentRealTsNs - previousRealTsNs
         val clampedDeltaNs = when {
             rawDeltaNs <= 0L -> MIN_FRAME_DELTA_NS
-            rawDeltaNs >= STATIC_SETTLE_RAW_DELTA_NS -> {
-                if (consecutiveIdleGaps == 0) STATIC_SETTLE_DELTA_NS else MIN_FRAME_DELTA_NS
+            rawDeltaNs >= STATIC_SETTLE_RAW_DELTA_NS -> when (consecutiveIdleGaps) {
+                0 -> STATIC_SETTLE_DELTA_NS
+                1 -> maxDeltaNs
+                else -> MIN_FRAME_DELTA_NS
             }
             else -> rawDeltaNs.coerceIn(MIN_FRAME_DELTA_NS, maxDeltaNs)
         }
@@ -137,8 +140,8 @@ internal object LowLatencyEncoderMath {
     }
 
     /**
-     * Computes the brief 75% VBV re-arm bitrate sent on idle->motion resume so `c2.qti.avc.encoder`
-     * re-clamps its leaky-bucket fullness instead of emitting a 150 KB surplus burst.
+     * Computes the brief 96% (-4% micro-nudge) VBV re-arm bitrate sent on idle->motion resume so
+     * `c2.qti.avc.encoder` re-clamps its leaky-bucket fullness without starving initial scroll frames.
      */
     fun computeVbvRearmBitrateBps(
         currentBitrateBps: Int,
@@ -450,10 +453,10 @@ internal enum class AutoResolutionTier(
     val p2pCeilingKbps: Int,
     val turnCeilingKbps: Int,
 ) {
-    LOW(540, 30, 1_400, 950),        // weak cellular / severe congestion
-    SMOOTH(720, 45, 2_800, 1_500),   // moderate WAN / constrained TURN
-    BALANCED(900, 60, 4_500, 2_100), // fast TURN / normal Wi-Fi
-    ULTRA(1080, 60, 7_500, 2_500);   // fast LAN P2P (>= 5.5 Mbps)
+    LOW(540, 30, 1_400, 1_000),      // weak cellular / severe congestion
+    SMOOTH(720, 60, 3_200, 2_200),   // BPP-optimal 60fps on 3 Mbps TURN (0.032 BPP) / moderate WAN
+    BALANCED(900, 60, 4_500, 2_400), // high-BWE TURN (>= 3.2 Mbps) / normal Wi-Fi
+    ULTRA(1080, 60, 7_500, 2_600);   // fast LAN P2P (>= 5.5 Mbps)
 
     fun ceilingKbps(isTurnRelay: Boolean): Int =
         if (isTurnRelay) turnCeilingKbps else p2pCeilingKbps
@@ -989,7 +992,7 @@ internal class AdaptiveQoSController {
         const val DYNAMIC_SCREEN_MIN_KBPS = 180L
 
         const val AUTO_P2P_START_BITRATE_KBPS = 1_800
-        const val AUTO_TURN_START_BITRATE_KBPS = 1_500
+        const val AUTO_TURN_START_BITRATE_KBPS = 1_800
         const val STARTUP_CLEAN_EXCESS_MS = 40
         const val STARTUP_CLEAN_STREAK = 2
         const val STARTUP_ACCEL_STEP = 0.30
@@ -1028,12 +1031,12 @@ internal class AdaptiveQoSController {
         const val ULTRA_UPGRADE_MIN_SCALE = 0.95
         const val BALANCED_P2P_UPGRADE_BWE_KBPS = 2_400L
         const val BALANCED_P2P_UPGRADE_MIN_SCALE = 0.80
-        const val BALANCED_TURN_UPGRADE_BWE_KBPS = 1_800L
+        const val BALANCED_TURN_UPGRADE_BWE_KBPS = 3_200L
         const val BALANCED_TURN_UPGRADE_MIN_SCALE = 0.90
         const val SMOOTH_UPGRADE_BWE_KBPS = 1_100L
         const val SMOOTH_UPGRADE_MIN_SCALE = 0.80
         const val LOW_DOWNGRADE_BITRATE_KBPS = 950
-        const val SMOOTH_DOWNGRADE_BITRATE_KBPS = 1_550
+        const val SMOOTH_DOWNGRADE_BITRATE_KBPS = 1_650
         const val MIN_EFFECTIVE_BITRATE_KBPS = 350
 
         fun resolveManualTargetFps(quality: StreamQuality): Int {
@@ -1407,8 +1410,8 @@ class LowLatencyH264Encoder(
         }
 
         if (tier.includeQpBounds && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Bounded Android 12+ QP window [20..42/46] prevents QP-12 VBV explosions on idle->motion
-            // while giving hardware CBR enough headroom to avoid QP-38 FrameDropper spirals.
+            // Tightened Android 12+ QP window [18..34/37] stops coarse QP 40-46 DCT mosquito noise
+            // around scrolled text and UI borders while keeping ample CBR headroom.
             format.setInteger(MediaFormat.KEY_VIDEO_QP_I_MIN, QP_MIN)
             format.setInteger(MediaFormat.KEY_VIDEO_QP_I_MAX, QP_I_MAX)
             format.setInteger(MediaFormat.KEY_VIDEO_QP_P_MIN, QP_MIN)
@@ -1532,13 +1535,10 @@ class LowLatencyH264Encoder(
         lastCodecPtsNs = codecPtsNs
         val codecPtsUs = codecPtsNs / 1_000L
 
-        // VBV re-arm on idle->motion resume: briefly nudge bitrate to 75% on the first frame after
-        // an idle gap so c2.qti.avc.encoder re-clamps its empty leaky bucket instead of dumping a
-        // 150 KB surplus burst, then smoothly restore 100% after ~250ms / 10 frames.
-        val shouldRearmVbv = hadPreviousFrame && wasIdle && (
-            rawDeltaNs >= LowLatencyEncoderMath.IDLE_RESUME_RAW_DELTA_NS ||
-                (!isIdleGap && !vbvRearmActive)
-            )
+        // VBV re-arm on actual motion resume ONLY (!isIdleGap — never on idle static pump frames):
+        // micro-nudge bitrate to 96% (-4%) so c2.qti.avc.encoder re-clamps its leaky bucket without
+        // starving initial scroll frames, then restore 100% after ~80ms / 3 frames.
+        val shouldRearmVbv = hadPreviousFrame && wasIdle && !isIdleGap && !vbvRearmActive
         if (shouldRearmVbv) {
             val nudgedBps = LowLatencyEncoderMath.computeVbvRearmBitrateBps(
                 currentBitrateBps = currentBitrateBps,

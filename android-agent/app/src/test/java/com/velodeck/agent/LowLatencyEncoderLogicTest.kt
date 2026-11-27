@@ -38,7 +38,7 @@ class LowLatencyEncoderLogicTest {
         )
         assertEquals(LowLatencyEncoderMath.DEFAULT_FRAME_DELTA_NS, pts0)
 
-        // First idle gap (>= 180ms right after motion stops) -> grants at most ONE 20ms settle step
+        // First idle gap (>= 180ms right after motion stops) -> grants 20ms first refinement pass
         val ptsFirstIdle = LowLatencyEncoderMath.nextClampedCodecPtsNs(
             previousRealTsNs = 1_000_000_000L,
             currentRealTsNs = 1_250_000_000L,
@@ -48,39 +48,61 @@ class LowLatencyEncoderLogicTest {
         )
         assertEquals(pts0 + 20_000_000L, ptsFirstIdle)
 
-        // Subsequent consecutive idle frames (>= 180ms) MUST use MIN_FRAME_DELTA_NS (8ms) — never keep crediting 20ms into VBV!
+        // Second consecutive idle gap (consecutiveIdleGaps == 1) -> grants maxDeltaNs (16.67ms at 60fps)
+        // as a second post-scroll refinement polish pass to clear residual scroll noise within ~500ms!
         val ptsSecondIdle = LowLatencyEncoderMath.nextClampedCodecPtsNs(
             previousRealTsNs = 1_250_000_000L,
-            currentRealTsNs = 2_750_000_000L,
+            currentRealTsNs = 1_500_000_000L,
             previousCodecPtsNs = ptsFirstIdle,
             targetFps = 60,
             consecutiveIdleGaps = 1,
         )
-        assertEquals(ptsFirstIdle + LowLatencyEncoderMath.MIN_FRAME_DELTA_NS, ptsSecondIdle)
+        assertEquals(ptsFirstIdle + 16_666_666L, ptsSecondIdle)
 
+        // Second idle refinement scales to 33.33ms at 30fps
+        val ptsSecondIdle30 = LowLatencyEncoderMath.nextClampedCodecPtsNs(
+            previousRealTsNs = 1_250_000_000L,
+            currentRealTsNs = 1_500_000_000L,
+            previousCodecPtsNs = ptsFirstIdle,
+            targetFps = 30,
+            consecutiveIdleGaps = 1,
+        )
+        assertEquals(ptsFirstIdle + 33_333_333L, ptsSecondIdle30)
+
+        // Third+ consecutive idle frames (consecutiveIdleGaps >= 2) MUST use MIN_FRAME_DELTA_NS (8ms)
+        // so long idle never accumulates surplus VBV credit!
         val ptsThirdIdle = LowLatencyEncoderMath.nextClampedCodecPtsNs(
-            previousRealTsNs = 2_750_000_000L,
-            currentRealTsNs = 4_250_000_000L,
+            previousRealTsNs = 1_500_000_000L,
+            currentRealTsNs = 3_000_000_000L,
             previousCodecPtsNs = ptsSecondIdle,
             targetFps = 60,
             consecutiveIdleGaps = 2,
         )
         assertEquals(ptsSecondIdle + LowLatencyEncoderMath.MIN_FRAME_DELTA_NS, ptsThirdIdle)
 
+        val ptsFourthIdle = LowLatencyEncoderMath.nextClampedCodecPtsNs(
+            previousRealTsNs = 3_000_000_000L,
+            currentRealTsNs = 4_500_000_000L,
+            previousCodecPtsNs = ptsThirdIdle,
+            targetFps = 60,
+            consecutiveIdleGaps = 3,
+        )
+        assertEquals(ptsThirdIdle + LowLatencyEncoderMath.MIN_FRAME_DELTA_NS, ptsFourthIdle)
+
         // Active 60fps scrolling (~16.666ms delta) passes through cleanly
         val ptsScrolling = LowLatencyEncoderMath.nextClampedCodecPtsNs(
-            previousRealTsNs = 4_250_000_000L,
-            currentRealTsNs = 4_266_666_666L,
-            previousCodecPtsNs = ptsThirdIdle,
+            previousRealTsNs = 4_500_000_000L,
+            currentRealTsNs = 4_516_666_666L,
+            previousCodecPtsNs = ptsFourthIdle,
             targetFps = 60,
             consecutiveIdleGaps = 0,
         )
-        assertEquals(ptsThirdIdle + 16_666_666L, ptsScrolling)
+        assertEquals(ptsFourthIdle + 16_666_666L, ptsScrolling)
 
         // 30fps motion under 60fps target clamps to 16.666ms
         val pts30fpsAt60Target = LowLatencyEncoderMath.nextClampedCodecPtsNs(
-            previousRealTsNs = 4_266_666_666L,
-            currentRealTsNs = 4_300_000_000L,
+            previousRealTsNs = 4_516_666_666L,
+            currentRealTsNs = 4_550_000_000L,
             previousCodecPtsNs = ptsScrolling,
             targetFps = 60,
             consecutiveIdleGaps = 0,
@@ -89,8 +111,8 @@ class LowLatencyEncoderLogicTest {
 
         // 30fps ECO target scales MAX_FRAME_DELTA_NS to 33.333ms so ECO never gets 16.67ms PTS starvation!
         val pts30fpsEco = LowLatencyEncoderMath.nextClampedCodecPtsNs(
-            previousRealTsNs = 4_300_000_000L,
-            currentRealTsNs = 4_333_333_333L,
+            previousRealTsNs = 4_550_000_000L,
+            currentRealTsNs = 4_583_333_333L,
             previousCodecPtsNs = pts30fpsAt60Target,
             targetFps = 30,
             consecutiveIdleGaps = 0,
@@ -99,17 +121,21 @@ class LowLatencyEncoderLogicTest {
 
         // Duplicate / backwards timestamp clamps cleanly to MIN_FRAME_DELTA_NS (8ms)
         val ptsDup = LowLatencyEncoderMath.nextClampedCodecPtsNs(
-            previousRealTsNs = 4_333_333_333L,
-            currentRealTsNs = 4_333_333_333L,
+            previousRealTsNs = 4_583_333_333L,
+            currentRealTsNs = 4_583_333_333L,
             previousCodecPtsNs = pts30fpsEco,
             targetFps = 60,
             consecutiveIdleGaps = 0,
         )
         assertEquals(pts30fpsEco + LowLatencyEncoderMath.MIN_FRAME_DELTA_NS, ptsDup)
 
-        // VBV re-arm bitrate helper nudges to 75% and guarantees distinct value on repeated re-arm
-        assertEquals(3_000_000, LowLatencyEncoderMath.computeVbvRearmBitrateBps(4_000_000))
-        assertEquals(2_999_000, LowLatencyEncoderMath.computeVbvRearmBitrateBps(4_000_000, 3_000_000))
+        // VBV re-arm bitrate helper micro-nudges to 96% (-4%), restores within 80ms / 3 frames,
+        // and guarantees distinct value on repeated re-arm
+        assertEquals(96, LowLatencyEncoderMath.VBV_REARM_BITRATE_NUMERATOR)
+        assertEquals(80L, LowLatencyEncoderMath.VBV_REARM_RESTORE_MS)
+        assertEquals(3, LowLatencyEncoderMath.VBV_REARM_RESTORE_FRAMES)
+        assertEquals(3_840_000, LowLatencyEncoderMath.computeVbvRearmBitrateBps(4_000_000))
+        assertEquals(3_839_000, LowLatencyEncoderMath.computeVbvRearmBitrateBps(4_000_000, 3_840_000))
         assertEquals(LowLatencyEncoderMath.MIN_BITRATE_BPS, LowLatencyEncoderMath.computeVbvRearmBitrateBps(300_000))
 
         // Static frame pump backs off to 1500ms after 3s startup and 1s post-motion settle
@@ -214,10 +240,10 @@ class LowLatencyEncoderLogicTest {
             LowLatencyEncoderMath.clampBitrateBps(420_000, LowLatencyEncoderMath.minBitrateForResolution(1080, 2414)),
         )
 
-        // Bounded Android 12+ QP caps prevent QP-12 VBV explosions and QP-38 FrameDropper spirals
-        assertEquals(20, LowLatencyEncoderMath.QP_MIN)
-        assertEquals(42, LowLatencyEncoderMath.QP_I_MAX)
-        assertEquals(46, LowLatencyEncoderMath.QP_P_MAX)
+        // Tightened Android 12+ QP caps [18..34/37] eliminate coarse QP 40-46 mosquito noise during scrolling
+        assertEquals(18, LowLatencyEncoderMath.QP_MIN)
+        assertEquals(34, LowLatencyEncoderMath.QP_I_MAX)
+        assertEquals(37, LowLatencyEncoderMath.QP_P_MAX)
 
         // Adaptive SDP/sender min (15% clamped 300..600 kbps) and conservative start (35% clamped 1000..2000 kbps)
         assertEquals(300, LowLatencyEncoderMath.computeSdpMinBitrateKbps(1_600))   // ECO
@@ -877,11 +903,11 @@ class LowLatencyEncoderLogicTest {
         assertEquals(0.30, autoQos.bitrateScale, 1e-6)
         assertEquals(900, lastAuto.targetMaxWidth)
 
-        // Once 8s cooldown elapses (t=9000) with effective bitrate 1350 < 1550 kbps, downgrades cleanly to SMOOTH 720p@45fps
+        // Once 8s cooldown elapses (t=9000) with effective bitrate 1350 < 1650 kbps, downgrades cleanly to SMOOTH 720p@60fps
         val autoDowngraded = autoQos.onSample(sample(rttMs = 120, autoMode = true, nowElapsedMs = 9_000L))
         assertTrue(autoDowngraded.resolutionChanged)
         assertEquals(720, autoDowngraded.targetMaxWidth)
-        assertEquals(45, autoDowngraded.maxFps)
+        assertEquals(60, autoDowngraded.maxFps)
 
         // Two consecutive retxDelta >= 12 samples also cut bitrate even with clean RTT
         val retxQos = AdaptiveQoSController()
@@ -1124,36 +1150,82 @@ class LowLatencyEncoderLogicTest {
         assertEquals(30, downLow.maxFps)
         assertEquals(AutoResolutionTier.LOW, p2pQos.currentTier)
 
-        // 2. Auto TURN: starts cleanly at SMOOTH (720p @ 45fps, 1500 kbps), upgrades to BALANCED (900p @ 60fps, 2100 kbps),
-        //    and NEVER upgrades to ULTRA (1080p) even if BWE reports 9000 kbps!
+        // Verify BPP-optimal AutoResolutionTier definitions & TURN QoS constants
+        assertEquals(540, AutoResolutionTier.LOW.maxWidth)
+        assertEquals(30, AutoResolutionTier.LOW.nominalFps)
+        assertEquals(1_400, AutoResolutionTier.LOW.p2pCeilingKbps)
+        assertEquals(1_000, AutoResolutionTier.LOW.turnCeilingKbps)
+
+        assertEquals(720, AutoResolutionTier.SMOOTH.maxWidth)
+        assertEquals(60, AutoResolutionTier.SMOOTH.nominalFps)
+        assertEquals(3_200, AutoResolutionTier.SMOOTH.p2pCeilingKbps)
+        assertEquals(2_200, AutoResolutionTier.SMOOTH.turnCeilingKbps)
+
+        assertEquals(900, AutoResolutionTier.BALANCED.maxWidth)
+        assertEquals(60, AutoResolutionTier.BALANCED.nominalFps)
+        assertEquals(4_500, AutoResolutionTier.BALANCED.p2pCeilingKbps)
+        assertEquals(2_400, AutoResolutionTier.BALANCED.turnCeilingKbps)
+
+        assertEquals(1080, AutoResolutionTier.ULTRA.maxWidth)
+        assertEquals(60, AutoResolutionTier.ULTRA.nominalFps)
+        assertEquals(7_500, AutoResolutionTier.ULTRA.p2pCeilingKbps)
+        assertEquals(2_600, AutoResolutionTier.ULTRA.turnCeilingKbps)
+
+        assertEquals(1_800, AdaptiveQoSController.AUTO_TURN_START_BITRATE_KBPS)
+        assertEquals(3_200L, AdaptiveQoSController.BALANCED_TURN_UPGRADE_BWE_KBPS)
+        assertEquals(1_650, AdaptiveQoSController.SMOOTH_DOWNGRADE_BITRATE_KBPS)
+        assertEquals(950, AdaptiveQoSController.LOW_DOWNGRADE_BITRATE_KBPS)
+
+        // 2. Auto TURN: starts cleanly at SMOOTH (720p @ 60fps, 1800 kbps -> ramps to 2200 kbps),
+        //    stays at crisp 720p@60 on a 3 Mbps VPS (BWE < 3200 kbps), upgrades to BALANCED
+        //    (900p @ 60fps, 2400 kbps) only when BWE >= 3200 kbps, and NEVER upgrades to ULTRA (1080p)!
         val turnQos = AdaptiveQoSController()
         val turnInit = turnQos.onSample(
-            sample(rttMs = 35, bweKbps = 2_400L, isTurnRelay = true, autoMode = true, nowElapsedMs = 1_000L),
+            sample(rttMs = 35, bweKbps = 2_800L, isTurnRelay = true, autoMode = true, nowElapsedMs = 1_000L),
         )
         assertEquals(720, turnInit.targetMaxWidth)
-        assertEquals(45, turnInit.maxFps)
-        assertEquals(1_500, turnInit.maxBitrateKbps)
+        assertEquals(60, turnInit.maxFps)
+        assertEquals(1_800, turnInit.maxBitrateKbps)
         assertTrue(turnInit.resolutionChanged)
+        assertTrue(turnQos.startupActive)
 
-        // Wait 8s with clean RTT & BWE >= 1800 -> upgrades to BALANCED (900p @ 60fps, 2100 kbps)
-        var turnDecision = turnInit
-        for (t in 2_000L..9_000L step 1_000L) {
-            turnDecision = turnQos.onSample(
-                sample(rttMs = 35, bweKbps = 2_400L, isTurnRelay = true, autoMode = true, nowElapsedMs = t),
+        // Tick 2 ramps to full SMOOTH TURN ceiling (2200 kbps)
+        val turnTick2 = turnQos.onSample(
+            sample(rttMs = 35, bweKbps = 2_800L, isTurnRelay = true, autoMode = true, nowElapsedMs = 2_000L),
+        )
+        assertEquals(720, turnTick2.targetMaxWidth)
+        assertEquals(60, turnTick2.maxFps)
+        assertEquals(2_200, turnTick2.maxBitrateKbps)
+        assertFalse(turnQos.startupActive)
+
+        // 3 Mbps VPS (BWE = 2800 < 3200) for > 8s MUST stay in crisp noise-free SMOOTH (720p@60 @ 2200 kbps)
+        for (t in 3_000L..12_000L step 1_000L) {
+            val d = turnQos.onSample(
+                sample(rttMs = 35, bweKbps = 2_800L, isTurnRelay = true, autoMode = true, nowElapsedMs = t),
             )
+            assertEquals("3 Mbps TURN must stay in BPP-optimal SMOOTH 720p@60", 720, d.targetMaxWidth)
+            assertEquals(60, d.maxFps)
+            assertEquals(2_200, d.maxBitrateKbps)
+            assertFalse(d.resolutionChanged)
         }
-        assertTrue(turnDecision.resolutionChanged)
-        assertEquals(900, turnDecision.targetMaxWidth)
-        assertEquals(60, turnDecision.maxFps)
-        assertEquals(2_100, turnDecision.maxBitrateKbps)
 
-        // Even with 9000 kbps BWE for 20 more seconds on TURN, NEVER exceeds 900p or 2100 kbps
-        for (t in 10_000L..30_000L step 1_000L) {
+        // High-BWE TURN (>= 3200 kbps, e.g. 3500 kbps) upgrades cleanly to BALANCED (900p @ 60fps, 2400 kbps)
+        val turnUpBalanced = turnQos.onSample(
+            sample(rttMs = 35, bweKbps = 3_500L, isTurnRelay = true, autoMode = true, nowElapsedMs = 13_000L),
+        )
+        assertTrue(turnUpBalanced.resolutionChanged)
+        assertEquals(900, turnUpBalanced.targetMaxWidth)
+        assertEquals(60, turnUpBalanced.maxFps)
+        assertEquals(2_400, turnUpBalanced.maxBitrateKbps)
+        assertEquals(AutoResolutionTier.BALANCED, turnQos.currentTier)
+
+        // Even with 9000 kbps BWE for 20 more seconds on TURN, NEVER exceeds 900p or 2400 kbps
+        for (t in 14_000L..34_000L step 1_000L) {
             val d = turnQos.onSample(
                 sample(rttMs = 32, bweKbps = 9_000L, isTurnRelay = true, autoMode = true, nowElapsedMs = t),
             )
             assertEquals(900, d.targetMaxWidth)
-            assertEquals(2_100, d.maxBitrateKbps)
+            assertEquals(2_400, d.maxBitrateKbps)
             assertFalse(d.resolutionChanged)
         }
 
