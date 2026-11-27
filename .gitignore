@@ -37,6 +37,7 @@ android-agent/app/src/main/assets/web/
 controller/ios/
 controller/android/
 controller/dist/
+controller/.impeccable/
 
 # Coverage
 coverage/

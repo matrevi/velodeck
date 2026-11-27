@@ -230,3 +230,10 @@ pnpm dev:controller
 - 首次启动服务端会自动在 `DATA_DIR/jwt.secret`（权限 `0600`）生成独立随机 JWT 签名密钥，并在 `DATA_DIR/audit.jsonl` 记录关键认证、会话与控制审计事件（严格不记录任何密码、PIN、JWT 或剪贴板明文）。
 - 请勿在公开仓库中提交 `.env`、`keystore.properties`、`android-agent/local.properties` 或真实服务器密钥。
 - 生产环境强烈建议使用 `server/docker-compose.yml` 配合独立域名启用全站 HTTPS/WSS 加密传输，并为 `ADMIN_TOKEN` 与 `TURN_SECRET` 配置高熵随机密钥。
+
+---
+
+## 更新日志与开源协议 · Changelog & License
+
+- 更新日志：[CHANGELOG.md](CHANGELOG.md)
+- 开源协议：[MIT License](LICENSE)
