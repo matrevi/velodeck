@@ -97,17 +97,33 @@ class RelayClient(
         override fun sendBinary(bytes: ByteArray): Boolean = this@RelayClient.sendBinary(bytes)
     }
 
-    fun start(relayUrl: String) {
+    fun start(relayUrl: String, forceReconnect: Boolean = false) {
         val trimmed = relayUrl.trim()
         if (trimmed.isEmpty() || (!trimmed.startsWith("ws://") && !trimmed.startsWith("wss://"))) {
             stop(RelayConnectionState.DISABLED, "中继地址无效")
             return
         }
-        synchronized(socketLock) {
-            currentUrl = trimmed
-            running.set(true)
-            backoff.reset()
-            lastReconnectTriggerElapsedMs = 0L
+        val shouldConnect = synchronized(socketLock) {
+            if (!shouldReconnectOnStart(
+                    running = running.get(),
+                    currentUrl = currentUrl,
+                    nextUrl = trimmed,
+                    state = _stateFlow.value,
+                    forceReconnect = forceReconnect,
+                )
+            ) {
+                false
+            } else {
+                currentUrl = trimmed
+                running.set(true)
+                backoff.reset()
+                lastReconnectTriggerElapsedMs = 0L
+                true
+            }
+        }
+        if (!shouldConnect) {
+            Log.d(TAG, "Keeping existing healthy relay socket on $trimmed (state=${_stateFlow.value})")
+            return
         }
         emitState(RelayConnectionState.CONNECTING, null)
         connectNow()
@@ -477,5 +493,18 @@ class RelayClient(
         private const val RECONNECT_DEBOUNCE_MS = 500L
         // Tight backpressure cap (48 KB = 1-2 frames) eliminates multi-second TCP bufferbloat on ws-jpeg fallback
         private const val MAX_OUTBOUND_QUEUE_BYTES = 48L * 1024L
+
+        fun shouldReconnectOnStart(
+            running: Boolean,
+            currentUrl: String,
+            nextUrl: String,
+            state: RelayConnectionState,
+            forceReconnect: Boolean,
+        ): Boolean {
+            if (forceReconnect) return true
+            if (!running) return true
+            if (currentUrl.trim() != nextUrl.trim()) return true
+            return state != RelayConnectionState.CONNECTED && state != RelayConnectionState.CONNECTING
+        }
     }
 }

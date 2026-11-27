@@ -92,6 +92,10 @@ class AgentForegroundService : Service() {
     private var lastBatteryCharging: Boolean? = null
     private var receiverRegistered: Boolean = false
 
+    private var appliedRelayUrl: String? = null
+    private var appliedAuthToken: String? = null
+    private var appliedPendingUnbind: Boolean? = null
+    private var appliedDeviceName: String? = null
     private var appliedAccessToken: String? = null
     private var appliedControlPassword: String? = null
     private val projectionRecoveryMutex = Mutex()
@@ -242,6 +246,7 @@ class AgentForegroundService : Service() {
                         pendingUnbindOwner = nextPendingUnbind,
                     )
                 }
+                appliedPendingUnbind = updatedCfg.pendingUnbindOwner
                 _runtimeState.update {
                     it.copy(
                         controlCode = updatedCfg.controlCode,
@@ -535,9 +540,23 @@ class AgentForegroundService : Service() {
 
     private fun applyConfigAndStartTransports() {
         val cfg = configStore.current
+        val trimmedRelayUrl = cfg.relayUrl.trim()
 
         val credentialsChanged = (appliedAccessToken != null && appliedAccessToken != cfg.accessToken) ||
             (appliedControlPassword != null && appliedControlPassword != cfg.controlPassword)
+
+        val relayIdentityChanged =
+            (appliedRelayUrl != null && appliedRelayUrl != trimmedRelayUrl) ||
+            (appliedAuthToken != null && appliedAuthToken != cfg.authToken) ||
+            (appliedPendingUnbind != null && appliedPendingUnbind != cfg.pendingUnbindOwner) ||
+            (appliedDeviceName != null && appliedDeviceName != cfg.deviceName) ||
+            (appliedAccessToken != null && appliedAccessToken != cfg.accessToken) ||
+            (appliedControlPassword != null && appliedControlPassword != cfg.controlPassword)
+
+        appliedRelayUrl = trimmedRelayUrl
+        appliedAuthToken = cfg.authToken
+        appliedPendingUnbind = cfg.pendingUnbindOwner
+        appliedDeviceName = cfg.deviceName
         appliedAccessToken = cfg.accessToken
         appliedControlPassword = cfg.controlPassword
 
@@ -563,8 +582,8 @@ class AgentForegroundService : Service() {
             directServer.stop()
         }
 
-        if (cfg.relayEnabled && cfg.relayUrl.isNotBlank()) {
-            relayClient.start(cfg.relayUrl)
+        if (cfg.relayEnabled && trimmedRelayUrl.isNotBlank()) {
+            relayClient.start(trimmedRelayUrl, forceReconnect = relayIdentityChanged)
         } else {
             relayClient.stop(RelayConnectionState.DISABLED)
         }

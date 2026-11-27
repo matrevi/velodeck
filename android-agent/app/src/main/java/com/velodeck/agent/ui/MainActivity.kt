@@ -15,6 +15,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PersistableBundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.text.InputType
 import android.view.LayoutInflater
@@ -37,6 +38,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.button.MaterialButtonToggleGroup
+import com.velodeck.agent.BuildConfig
 import com.velodeck.agent.R
 import com.velodeck.agent.capture.ProjectionConsentActivity
 import com.velodeck.agent.databinding.ActivityMainBinding
@@ -47,19 +49,25 @@ import com.velodeck.agent.network.RelayConnectionState
 import com.velodeck.agent.protocol.ProtocolCodec
 import com.velodeck.agent.service.AgentForegroundService
 import com.velodeck.agent.service.AgentRuntimeState
+import com.velodeck.agent.service.AppUpdater
+import com.velodeck.agent.service.DownloadProgress
+import com.velodeck.agent.service.InstallLaunchResult
 import com.velodeck.agent.service.PersistenceGuard
 import com.velodeck.agent.service.PowerHelper
+import com.velodeck.agent.service.UpdateCheckResult
 import com.velodeck.agent.storage.AgentConfig
 import com.velodeck.agent.storage.AgentConfigStore
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var configStore: AgentConfigStore
     private val accountApiClient = AccountApiClient()
+    private val appUpdater = AppUpdater()
 
     private var advancedExpanded = false
     private var controlPasswordVisible = false
@@ -69,6 +77,12 @@ class MainActivity : AppCompatActivity() {
     private var guidedBatteryPrompted = false
     private var guidedProjectionPrompted = false
     private var clipboardClearJob: Job? = null
+
+    private var lastUpdateCheckElapsedMs: Long = 0L
+    private var latestUpdateCheck: UpdateCheckResult? = null
+    private var updateCheckInProgress = false
+    private var updateDownloadInProgress = false
+    private var pendingApkToInstall: File? = null
 
     private val notifPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -172,6 +186,7 @@ class MainActivity : AppCompatActivity() {
 
         renderIdentityAndAccount(configStore.current, AgentForegroundService.runtimeState.value)
         refreshWizardState()
+        binding.tvAppUpdateTitle.text = "应用更新 · v${BuildConfig.VERSION_NAME}"
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -198,6 +213,25 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         refreshWizardState()
         renderEndpoints(AgentForegroundService.runtimeState.value)
+
+        val pendingApk = pendingApkToInstall
+        if (pendingApk != null) {
+            val canInstall = Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                packageManager.canRequestPackageInstalls()
+            if (canInstall) {
+                pendingApkToInstall = null
+                if (pendingApk.isFile && pendingApk.length() > 0L) {
+                    triggerApkInstall(pendingApk)
+                }
+            }
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        if (!updateCheckInProgress && !updateDownloadInProgress &&
+            (lastUpdateCheckElapsedMs == 0L || now - lastUpdateCheckElapsedMs >= UPDATE_CHECK_THROTTLE_MS)
+        ) {
+            checkForAppUpdate(userInitiated = false)
+        }
     }
 
     private fun populateAdvancedFormFromConfig() {
@@ -361,6 +395,16 @@ class MainActivity : AppCompatActivity() {
             } else {
                 Toast.makeText(this, "已关闭强制竖屏锁定", Toast.LENGTH_SHORT).show()
             }
+        }
+
+        val appUpdateClickAction = View.OnClickListener {
+            handleAppUpdateTap()
+        }
+        binding.rowAppUpdate.setOnClickListener(appUpdateClickAction)
+        binding.tvAppUpdateAction.setOnClickListener(appUpdateClickAction)
+        binding.rowAppUpdate.setOnLongClickListener {
+            handleAppUpdateForceRedownload()
+            true
         }
 
         // Card 4: Collapsible Advanced Settings
@@ -605,6 +649,11 @@ class MainActivity : AppCompatActivity() {
                 autoStart = binding.switchAutoStart.isChecked,
                 autoAcceptProjection = binding.switchAutoAccept.isChecked,
             )
+        }
+
+        if (!updateDownloadInProgress) {
+            lastUpdateCheckElapsedMs = 0L
+            latestUpdateCheck = null
         }
 
         if (applyRunning) {
@@ -1127,7 +1176,253 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun handleAppUpdateTap() {
+        if (updateDownloadInProgress) {
+            Toast.makeText(this, "正在下载安装包，请稍候...", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (updateCheckInProgress) return
+
+        val pendingApk = pendingApkToInstall
+        if (pendingApk != null && pendingApk.isFile && pendingApk.length() > 0L) {
+            triggerApkInstall(pendingApk)
+            return
+        }
+
+        val known = latestUpdateCheck
+        if (known != null && known.updateAvailable) {
+            downloadAndInstallUpdate(known)
+        } else {
+            checkForAppUpdate(userInitiated = true)
+        }
+    }
+
+    private fun handleAppUpdateForceRedownload() {
+        if (updateDownloadInProgress) {
+            Toast.makeText(this, "正在下载安装包，请稍候...", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (updateCheckInProgress) return
+
+        updateCheckInProgress = true
+        binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.text_muted))
+        binding.tvAppUpdateSubtitle.text = "正在获取云端安装包信息..."
+        binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_neutral)
+        binding.tvAppUpdateAction.setTextColor(getColor(R.color.text_muted))
+        binding.tvAppUpdateAction.text = "检查中..."
+
+        lifecycleScope.launch {
+            val apiBaseUrl = configStore.current.effectiveApiBaseUrl()
+            val result = appUpdater.checkForUpdate(apiBaseUrl, BuildConfig.VERSION_NAME)
+            updateCheckInProgress = false
+
+            result.onSuccess { info ->
+                lastUpdateCheckElapsedMs = SystemClock.elapsedRealtime()
+                latestUpdateCheck = info
+                if (!info.hasAndroidApk) {
+                    binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.text_muted))
+                    binding.tvAppUpdateSubtitle.text = "云端暂未提供 Android 安装包"
+                    binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_neutral)
+                    binding.tvAppUpdateAction.setTextColor(getColor(R.color.text_secondary))
+                    binding.tvAppUpdateAction.text = "检查更新"
+                    Toast.makeText(this@MainActivity, "云端尚未上传 Android 安装包", Toast.LENGTH_SHORT).show()
+                    return@onSuccess
+                }
+                Toast.makeText(this@MainActivity, "开始重新下载云端安装包...", Toast.LENGTH_SHORT).show()
+                downloadAndInstallUpdate(info)
+            }.onFailure { err ->
+                val msg = err.message ?: "网络异常"
+                binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.status_err))
+                binding.tvAppUpdateSubtitle.text = "检查失败: $msg"
+                binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_err)
+                binding.tvAppUpdateAction.setTextColor(getColor(R.color.status_err))
+                binding.tvAppUpdateAction.text = "重试"
+                Toast.makeText(this@MainActivity, "检查更新失败：$msg", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun checkForAppUpdate(userInitiated: Boolean) {
+        if (updateCheckInProgress || updateDownloadInProgress) return
+        updateCheckInProgress = true
+
+        if (userInitiated) {
+            binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.text_muted))
+            binding.tvAppUpdateSubtitle.text = "正在检查云端最新版本..."
+            binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_neutral)
+            binding.tvAppUpdateAction.setTextColor(getColor(R.color.text_muted))
+            binding.tvAppUpdateAction.text = "检查中..."
+        }
+
+        lifecycleScope.launch {
+            val apiBaseUrl = configStore.current.effectiveApiBaseUrl()
+            val result = appUpdater.checkForUpdate(apiBaseUrl, BuildConfig.VERSION_NAME)
+            updateCheckInProgress = false
+            lastUpdateCheckElapsedMs = SystemClock.elapsedRealtime()
+
+            result.onSuccess { info ->
+                latestUpdateCheck = info
+                if (info.updateAvailable) {
+                    val versionLabel = formatVersionLabel(info.remoteVersion)
+                    binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.status_ok))
+                    binding.tvAppUpdateSubtitle.text = "发现新版本 $versionLabel · 点击直接下载安装"
+                    binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_ok)
+                    binding.tvAppUpdateAction.setTextColor(getColor(R.color.status_ok))
+                    binding.tvAppUpdateAction.text = "立即更新"
+                    if (userInitiated) {
+                        downloadAndInstallUpdate(info)
+                    }
+                } else if (!info.hasAndroidApk) {
+                    binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.text_muted))
+                    binding.tvAppUpdateSubtitle.text = "云端暂未提供 Android 安装包"
+                    binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_neutral)
+                    binding.tvAppUpdateAction.setTextColor(getColor(R.color.text_secondary))
+                    binding.tvAppUpdateAction.text = "检查更新"
+                    if (userInitiated) {
+                        Toast.makeText(this@MainActivity, "云端暂未上传 Android 安装包", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.text_muted))
+                    binding.tvAppUpdateSubtitle.text = "已是最新版本 (v${BuildConfig.VERSION_NAME})"
+                    binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_neutral)
+                    binding.tvAppUpdateAction.setTextColor(getColor(R.color.text_secondary))
+                    binding.tvAppUpdateAction.text = "检查更新"
+                    if (userInitiated) {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "当前已是最新版本 (v${BuildConfig.VERSION_NAME})",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
+            }.onFailure { err ->
+                if (userInitiated) {
+                    val msg = err.message ?: "网络异常"
+                    binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.status_err))
+                    binding.tvAppUpdateSubtitle.text = "检查失败: $msg"
+                    binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_err)
+                    binding.tvAppUpdateAction.setTextColor(getColor(R.color.status_err))
+                    binding.tvAppUpdateAction.text = "重试"
+                    Toast.makeText(this@MainActivity, "检查更新失败：$msg", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun downloadAndInstallUpdate(checkResult: UpdateCheckResult?) {
+        if (updateDownloadInProgress) return
+        updateDownloadInProgress = true
+        pendingApkToInstall = null
+
+        binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.accent_blue))
+        binding.tvAppUpdateSubtitle.text = "正在下载 0%..."
+        binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_warn)
+        binding.tvAppUpdateAction.setTextColor(getColor(R.color.status_warn))
+        binding.tvAppUpdateAction.text = "下载中..."
+
+        lifecycleScope.launch {
+            try {
+                val cfg = configStore.current
+                val apiBaseUrl = cfg.effectiveApiBaseUrl()
+                val authToken = cfg.authToken.takeIf { it.isNotBlank() }
+                val downloadResult = appUpdater.downloadApk(
+                    context = this@MainActivity,
+                    apiBaseUrl = apiBaseUrl,
+                    authToken = authToken,
+                    expectedSha256 = checkResult?.apkSha256,
+                ) { progress ->
+                    runOnUiThread {
+                        renderUpdateDownloadProgress(progress)
+                    }
+                }
+
+                downloadResult.onSuccess { apkFile ->
+                    triggerApkInstall(apkFile)
+                }.onFailure { err ->
+                    val msg = err.message ?: "网络异常"
+                    binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.status_err))
+                    binding.tvAppUpdateSubtitle.text = "下载失败: $msg"
+                    binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_err)
+                    binding.tvAppUpdateAction.setTextColor(getColor(R.color.status_err))
+                    binding.tvAppUpdateAction.text = "重试"
+                    Toast.makeText(this@MainActivity, "下载失败：$msg", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                updateDownloadInProgress = false
+            }
+        }
+    }
+
+    private fun renderUpdateDownloadProgress(progress: DownloadProgress) {
+        if (!updateDownloadInProgress) return
+        val downloadedMb = AppUpdater.formatMegabytes(progress.downloadedBytes)
+        val statusText = if (progress.totalBytes > 0L) {
+            val totalMb = AppUpdater.formatMegabytes(progress.totalBytes)
+            "正在下载 ${progress.percent}% ($downloadedMb / $totalMb MB)..."
+        } else {
+            "正在下载 $downloadedMb MB..."
+        }
+        binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.accent_blue))
+        binding.tvAppUpdateSubtitle.text = statusText
+        binding.tvAppUpdateAction.text = "下载中..."
+    }
+
+    private fun triggerApkInstall(apkFile: File) {
+        when (val result = appUpdater.launchApkInstaller(this, apkFile)) {
+            InstallLaunchResult.LAUNCHED -> {
+                pendingApkToInstall = null
+                binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.status_ok))
+                binding.tvAppUpdateSubtitle.text = "已打开系统安装器，请确认安装"
+                val hasUpdate = latestUpdateCheck?.updateAvailable == true
+                if (hasUpdate) {
+                    binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_ok)
+                    binding.tvAppUpdateAction.setTextColor(getColor(R.color.status_ok))
+                    binding.tvAppUpdateAction.text = "立即更新"
+                } else {
+                    binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_neutral)
+                    binding.tvAppUpdateAction.setTextColor(getColor(R.color.text_secondary))
+                    binding.tvAppUpdateAction.text = "检查更新"
+                }
+            }
+
+            InstallLaunchResult.NEEDS_UNKNOWN_SOURCES_PERMISSION -> {
+                pendingApkToInstall = apkFile
+                binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.status_warn))
+                binding.tvAppUpdateSubtitle.text = "请先允许安装未知应用，返回后自动安装"
+                binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_warn)
+                binding.tvAppUpdateAction.setTextColor(getColor(R.color.status_warn))
+                binding.tvAppUpdateAction.text = "继续安装"
+                Toast.makeText(
+                    this,
+                    "请开启「允许来自此来源的应用」，返回本页将自动启动安装",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+
+            is InstallLaunchResult.FAILED -> {
+                pendingApkToInstall = null
+                binding.tvAppUpdateSubtitle.setTextColor(getColor(R.color.status_err))
+                binding.tvAppUpdateSubtitle.text = "安装失败: ${result.message}"
+                binding.tvAppUpdateAction.setBackgroundResource(R.drawable.bg_pill_err)
+                binding.tvAppUpdateAction.setTextColor(getColor(R.color.status_err))
+                binding.tvAppUpdateAction.text = "重试"
+                Toast.makeText(this, "无法启动安装器：${result.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun formatVersionLabel(raw: String?): String {
+        val clean = raw?.trim().orEmpty()
+        if (clean.isEmpty()) return ""
+        return if (clean.startsWith("v", ignoreCase = true)) {
+            "v${clean.substring(1)}"
+        } else {
+            "v$clean"
+        }
+    }
+
     companion object {
         private const val SENSITIVE_CLIPBOARD_TTL_MS = 30_000L
+        private const val UPDATE_CHECK_THROTTLE_MS = 60_000L
     }
 }
