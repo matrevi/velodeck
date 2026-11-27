@@ -2879,3 +2879,35 @@ test("APK download supports .apk URL alias, Accept-Ranges, ETag, 206 Partial Con
   assert.equal(notModRes.status, 304);
   assert.equal(notModRes.headers.get("etag"), expectedEtag);
 });
+
+test("coturn.conf never uses CIDR notation or wildcard denied-peer-ip=:: that blocks all IPv4/IPv6 peers", async () => {
+  const coturnConfPath = path.resolve(
+    path.dirname(new URL(import.meta.url).pathname),
+    "../coturn.conf",
+  );
+  const raw = await fsp.readFile(coturnConfPath, "utf8");
+  const deniedLines = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("denied-peer-ip="))
+    .map((line) => line.slice("denied-peer-ip=".length).trim());
+
+  assert.ok(deniedLines.length > 0, "coturn.conf should define SSRF denied-peer-ip rules");
+  for (const rule of deniedLines) {
+    assert.notEqual(
+      rule,
+      "::",
+      "denied-peer-ip=:: is parsed by coturn as an all-IPs wildcard and blocks every public peer",
+    );
+    assert.notEqual(
+      rule,
+      "0.0.0.0",
+      "denied-peer-ip=0.0.0.0 is parsed by coturn as an all-IPs wildcard",
+    );
+    assert.equal(
+      rule.includes("/"),
+      false,
+      `coturn denied-peer-ip does not support CIDR notation: ${rule}`,
+    );
+  }
+});
