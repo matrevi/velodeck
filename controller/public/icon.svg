@@ -1,22 +1,65 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
   <defs>
-    <linearGradient id="vd-v-left" x1="112" y1="112" x2="272" y2="380" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#3B82F6" />
-      <stop offset="100%" stop-color="#6366F1" />
+    <!-- Deep OLED pitch-black radial body -->
+    <radialGradient id="vd-bg" cx="50%" cy="32%" r="72%">
+      <stop offset="0%" stop-color="#171B24" />
+      <stop offset="55%" stop-color="#0B0E14" />
+      <stop offset="100%" stop-color="#06080C" />
+    </radialGradient>
+
+    <!-- Precision-milled chamfered dark titanium rim -->
+    <linearGradient id="vd-rim" x1="48" y1="24" x2="464" y2="488" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#9CA6B8" stop-opacity="0.92" />
+      <stop offset="26%" stop-color="#3A4150" stop-opacity="0.88" />
+      <stop offset="52%" stop-color="#1A1E27" stop-opacity="0.95" />
+      <stop offset="78%" stop-color="#555F70" stop-opacity="0.85" />
+      <stop offset="100%" stop-color="#1B1F29" stop-opacity="0.95" />
     </linearGradient>
-    <linearGradient id="vd-v-right" x1="400" y1="112" x2="240" y2="380" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#60A5FA" />
-      <stop offset="55%" stop-color="#3B82F6" />
-      <stop offset="100%" stop-color="#4F46E5" />
+
+    <!-- Crisp platinum-white monogram fill -->
+    <linearGradient id="vd-mark" x1="120" y1="148" x2="396" y2="364" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="70%" stop-color="#F1F5F9" />
+      <stop offset="100%" stop-color="#DCE4EE" />
     </linearGradient>
-    <linearGradient id="vd-deck" x1="176" y1="404" x2="336" y2="404" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#3B82F6" />
-      <stop offset="100%" stop-color="#6366F1" />
-    </linearGradient>
+
+    <!-- Soft ambient emerald LED halo -->
+    <radialGradient id="vd-led-halo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#10B981" stop-opacity="0.54" />
+      <stop offset="46%" stop-color="#10B981" stop-opacity="0.16" />
+      <stop offset="100%" stop-color="#10B981" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Crisp OLED emerald LED core -->
+    <radialGradient id="vd-led-core" cx="42%" cy="38%" r="64%">
+      <stop offset="0%" stop-color="#34D399" />
+      <stop offset="62%" stop-color="#10B981" />
+      <stop offset="100%" stop-color="#059669" />
+    </radialGradient>
   </defs>
-  <rect width="512" height="512" rx="112" fill="#111318" />
-  <rect x="14" y="14" width="484" height="484" rx="98" stroke="#242936" stroke-width="8" />
-  <path d="M104 114H186L256 262L326 114H408L284 364C278 376 268 382 256 382C244 382 234 376 228 364L104 114Z" fill="url(#vd-v-left)" />
-  <path d="M326 114H408L284 364C278 376 268 382 256 382V262L326 114Z" fill="url(#vd-v-right)" />
-  <rect x="176" y="402" width="160" height="22" rx="11" fill="url(#vd-deck)" />
+
+  <!-- Base OLED squircle + precision titanium chamfer -->
+  <rect x="6" y="6" width="500" height="500" rx="116" fill="url(#vd-bg)" stroke="url(#vd-rim)" stroke-width="12" />
+  <rect x="18" y="18" width="476" height="476" rx="104" stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="2" />
+
+  <!-- Continuous geometric V -> D arch ribbon (optically centered: 94px left / 94px right) -->
+  <path
+    d="M 111 164 L 183 344 L 255 164 L 311 164 A 90 90 0 0 1 311 344 L 249 344"
+    stroke="url(#vd-mark)"
+    stroke-width="34"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Inner slanted-top D stem running strictly parallel to V's right stroke -->
+  <path
+    d="M 232 344 L 232 306 L 266 221 L 266 344 Z"
+    fill="url(#vd-mark)"
+  />
+  <!-- Rounded bottom-left shoulder join of D -->
+  <circle cx="249" cy="344" r="17" fill="url(#vd-mark)" />
+
+  <!-- 7x24 live emerald hardware status LED centered inside the D counter -->
+  <circle cx="325" cy="254" r="62" fill="url(#vd-led-halo)" />
+  <circle cx="325" cy="254" r="21" fill="url(#vd-led-core)" />
 </svg>

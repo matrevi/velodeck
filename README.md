@@ -1,8 +1,16 @@
-# VeloDeck · 极控
+<p align="center">
+  <img src="controller/public/icon.svg" width="88" height="88" alt="VeloDeck · 极控 Logo" />
+</p>
 
-**自托管 7×24 无人值守低延迟 Android 远程控制平台（60fps 硬编 · 跨网 P2P/TURN · 伪装黑屏 · WebRTC 文件直传与远程 OTA）**
+<h1 align="center">VeloDeck · 极控</h1>
 
-*Self-hosted, 24/7 unattended, low-latency Android remote control platform — 60fps hardware H.264 streaming, P2P/TURN NAT traversal, stealth black screen, WebRTC direct file transfer, and remote OTA updates.*
+<p align="center">
+  <strong>自托管 7×24 无人值守低延迟 Android 远程控制平台（60fps 硬编 · 跨网 P2P/TURN · 伪装黑屏 · WebRTC 文件直传与远程 OTA）</strong>
+</p>
+
+<p align="center">
+  <em>Self-hosted, 24/7 unattended, low-latency Android remote control platform — 60fps hardware H.264 streaming, P2P/TURN NAT traversal, stealth black screen, WebRTC direct file transfer, and remote OTA updates.</em>
+</p>
 
 - Repository: <https://github.com/matrevi/velodeck>
 

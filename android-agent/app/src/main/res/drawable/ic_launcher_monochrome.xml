@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Android 13+ Material You themed monochrome icon -->
+    <path
+        android:pathData="M30.08,39.15 L41.96,68.85 L53.84,39.15 L63.08,39.15 A14.85,14.85 0 0,1 63.08,68.85 L52.85,68.85"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="5.61" />
+
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M50.04,68.85 L50.04,62.58 L55.65,48.56 L55.65,68.85 Z" />
+
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M52.85,66.04 A2.81,2.81 0 1,1 52.84,66.04 Z" />
+
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M65.39,50.53 A3.47,3.47 0 1,1 65.38,50.53 Z" />
+</vector>

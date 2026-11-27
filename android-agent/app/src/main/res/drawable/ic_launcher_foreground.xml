@@ -1,19 +1,68 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+
+    <!-- Continuous geometric V -> D arch ribbon (strictly inside 66dp adaptive safe circle) -->
     <path
-        android:fillColor="#3B82F6"
-        android:pathData="M37,24 L71,24 C74.3,24 77,26.7 77,30 L77,78 C77,81.3 74.3,84 71,84 L37,84 C33.7,84 31,81.3 31,78 L31,30 C31,26.7 33.7,24 37,24 Z" />
+        android:pathData="M30.08,39.15 L41.96,68.85 L53.84,39.15 L63.08,39.15 A14.85,14.85 0 0,1 63.08,68.85 L52.85,68.85"
+        android:strokeColor="#F8FAFC"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="5.61" />
+
+    <!-- Inner slanted-top D stem strictly parallel to V's right stroke -->
     <path
-        android:fillColor="#0B0F17"
-        android:pathData="M38,32 L70,32 L70,72 L38,72 Z" />
+        android:fillColor="#F8FAFC"
+        android:pathData="M50.04,68.85 L50.04,62.58 L55.65,48.56 L55.65,68.85 Z" />
+
+    <!-- Rounded bottom-left shoulder join of D -->
     <path
-        android:fillColor="#10B981"
-        android:pathData="M54,44 C59.5,44 64,48.5 64,54 C64,59.5 59.5,64 54,64 C48.5,64 44,59.5 44,54 C44,48.5 48.5,44 54,44 Z" />
-    <path
-        android:fillColor="#F3F6FC"
-        android:pathData="M49,77 L59,77 L59,79.5 L49,79.5 Z" />
+        android:fillColor="#F8FAFC"
+        android:pathData="M52.85,66.04 A2.81,2.81 0 1,1 52.84,66.04 Z" />
+
+    <!-- Ambient emerald LED glow halo inside D counter -->
+    <path android:pathData="M65.39,43.77 A10.23,10.23 0 1,1 65.38,43.77 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="65.39"
+                android:centerY="54.0"
+                android:gradientRadius="10.23"
+                android:type="radial">
+                <item
+                    android:color="#8C10B981"
+                    android:offset="0.0" />
+                <item
+                    android:color="#2910B981"
+                    android:offset="0.48" />
+                <item
+                    android:color="#0010B981"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Solid emerald live status LED core -->
+    <path android:pathData="M65.39,50.53 A3.47,3.47 0 1,1 65.38,50.53 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="64.6"
+                android:centerY="53.1"
+                android:gradientRadius="4.5"
+                android:type="radial">
+                <item
+                    android:color="#FF34D399"
+                    android:offset="0.0" />
+                <item
+                    android:color="#FF10B981"
+                    android:offset="0.62" />
+                <item
+                    android:color="#FF059669"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
 </vector>
