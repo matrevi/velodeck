@@ -40,6 +40,7 @@ data class AgentConfig(
     val autoStart: Boolean,
     val autoAcceptProjection: Boolean,
     val blackScreenMode: Boolean = false,
+    val forcePortrait: Boolean = true,
     val unlockPin: String,
 ) {
     /**
@@ -220,6 +221,7 @@ class AgentConfigStore(context: Context) {
             prefs.getBoolean(KEY_AUTO_ACCEPT_PROJECTION, true)
         }
         val blackScreenMode = prefs.getBoolean(KEY_BLACK_SCREEN_MODE, false)
+        val forcePortrait = prefs.getBoolean(KEY_FORCE_PORTRAIT, true)
         val unlockPin = when (val res = readSecret(KEY_UNLOCK_PIN_ENC)) {
             is SecretReadResult.Decrypted -> {
                 if (res.needsMigration) dirty = true
@@ -246,6 +248,7 @@ class AgentConfigStore(context: Context) {
             autoStart = autoStart,
             autoAcceptProjection = autoAcceptProjection,
             blackScreenMode = blackScreenMode,
+            forcePortrait = forcePortrait,
             unlockPin = unlockPin,
         )
 
@@ -295,6 +298,7 @@ class AgentConfigStore(context: Context) {
             .putBoolean(KEY_AUTO_ACCEPT_PROJECTION, config.autoAcceptProjection)
             .putBoolean(KEY_AUTO_ACCEPT_MIGRATED_V2, true)
             .putBoolean(KEY_BLACK_SCREEN_MODE, config.blackScreenMode)
+            .putBoolean(KEY_FORCE_PORTRAIT, config.forcePortrait)
             .putString(KEY_DEVICE_SECRET_ENC, encDeviceSecret)
             .putString(KEY_ACCESS_TOKEN_ENC, encAccessToken)
             .putString(KEY_CONTROL_PASSWORD_ENC, encControlPassword)
@@ -459,6 +463,7 @@ class AgentConfigStore(context: Context) {
         private const val KEY_AUTO_ACCEPT_PROJECTION = "auto_accept_projection"
         private const val KEY_AUTO_ACCEPT_MIGRATED_V2 = "auto_accept_migrated_v2"
         private const val KEY_BLACK_SCREEN_MODE = "black_screen_mode"
+        private const val KEY_FORCE_PORTRAIT = "force_portrait"
         private const val KEY_UNLOCK_PIN_ENC = "unlock_pin_enc"
 
         fun generateControlPassword(

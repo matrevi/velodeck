@@ -58,6 +58,7 @@ class SessionCoordinator(
     private val onRemoteLockRequested: (() -> Unit)? = null,
     private val onSessionWillStart: (() -> Unit)? = null,
     private val onSetBlackScreen: ((Boolean) -> Boolean)? = null,
+    private val onForcePortraitCommand: ((Boolean) -> Boolean)? = null,
 ) : WebRtcCallbacks {
 
     private data class ActiveSession(
@@ -166,7 +167,8 @@ class SessionCoordinator(
                 val isSessionlessAllowed = message.sessionId.isBlank() && (
                     message.command is ControlCommand.Wake ||
                         message.command is ControlCommand.Unlock ||
-                        message.command is ControlCommand.BlackScreen
+                        message.command is ControlCommand.BlackScreen ||
+                        message.command is ControlCommand.ForcePortrait
                     )
                 if (!isSessionlessAllowed && !isSessionOwnedBySink(message.sessionId, sink)) {
                     rejectUnownedSession(message.sessionId, sink, message.type)
@@ -543,6 +545,11 @@ class SessionCoordinator(
             is ControlCommand.BlackScreen -> {
                 val applied = onSetBlackScreen?.invoke(cmd.enabled) ?: false
                 applied to if (applied) null else "伪装黑屏服务未就绪"
+            }
+
+            is ControlCommand.ForcePortrait -> {
+                val applied = onForcePortraitCommand?.invoke(cmd.enabled) ?: false
+                applied to if (applied) null else "强制竖屏服务未就绪"
             }
 
             else -> {

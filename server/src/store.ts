@@ -142,6 +142,9 @@ export function cloneDeviceSummary(summary: DeviceSummary): DeviceSummary {
   if (summary.blackScreenActive !== undefined) {
     copy.blackScreenActive = summary.blackScreenActive;
   }
+  if (summary.forcePortraitActive !== undefined) {
+    copy.forcePortraitActive = summary.forcePortraitActive;
+  }
   if (summary.directUrl !== undefined) {
     copy.directUrl = summary.directUrl;
   }

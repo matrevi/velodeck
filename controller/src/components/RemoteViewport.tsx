@@ -26,6 +26,7 @@ import {
   RefreshCw,
   Send,
   SlidersHorizontal,
+  Smartphone,
   Sun,
   Trash2,
   Unlock,
@@ -729,6 +730,10 @@ export function RemoteViewport({
 
   function sendBlackScreen(enabled: boolean) {
     client.sendCommand({ action: "black_screen", enabled }, targetDeviceId);
+  }
+
+  function sendForcePortrait(enabled: boolean) {
+    client.sendCommand({ action: "force_portrait", enabled }, targetDeviceId);
   }
 
   function handleWakeWithBlackScreen() {
@@ -1607,6 +1612,12 @@ export function RemoteViewport({
                   label={device?.blackScreenActive ? "关闭伪装黑屏" : "伪装黑屏"}
                   active={Boolean(device?.blackScreenActive)}
                   onClick={() => sendBlackScreen(!device?.blackScreenActive)}
+                />
+                <DockButton
+                  icon={<Smartphone className={`h-4 w-4 ${device?.forcePortraitActive ? "text-white" : "text-sky-400"}`} />}
+                  label={device?.forcePortraitActive ? "解除强制竖屏" : "强制竖屏"}
+                  active={Boolean(device?.forcePortraitActive)}
+                  onClick={() => sendForcePortrait(!device?.forcePortraitActive)}
                 />
                 <DockButton
                   icon={<Lock className="h-4 w-4" />}

@@ -97,6 +97,7 @@ data class DeviceSummary(
     val locked: Boolean,
     val screenOn: Boolean? = null,
     val blackScreenActive: Boolean? = null,
+    val forcePortraitActive: Boolean? = null,
     val directUrl: String? = null,
     val capabilities: DeviceCapabilities,
 )
@@ -154,6 +155,7 @@ sealed interface ControlCommand {
     data object Wake : ControlCommand
     data class Unlock(val pin: String? = null) : ControlCommand
     data class BlackScreen(val enabled: Boolean) : ControlCommand
+    data class ForcePortrait(val enabled: Boolean) : ControlCommand
     data class Quality(val quality: StreamQuality) : ControlCommand
     data object RequestKeyframe : ControlCommand
 }
@@ -179,6 +181,7 @@ sealed interface WireMessage {
         val locked: Boolean,
         val screenOn: Boolean? = null,
         val blackScreenActive: Boolean? = null,
+        val forcePortraitActive: Boolean? = null,
         val directUrl: String? = null,
         val capabilities: DeviceCapabilities,
     ) : WireMessage {
@@ -205,6 +208,7 @@ sealed interface WireMessage {
         val locked: Boolean? = null,
         val screenOn: Boolean? = null,
         val blackScreenActive: Boolean? = null,
+        val forcePortraitActive: Boolean? = null,
         val capabilities: PartialDeviceCapabilities? = null,
     ) : WireMessage {
         override val type: String = "agent.telemetry"
@@ -367,6 +371,7 @@ object ProtocolCodec {
             put("locked", message.locked)
             message.screenOn?.let { put("screenOn", it) }
             message.blackScreenActive?.let { put("blackScreenActive", it) }
+            message.forcePortraitActive?.let { put("forcePortraitActive", it) }
             message.directUrl?.let { put("directUrl", it) }
             put("capabilities", capabilitiesToJson(message.capabilities))
         }
@@ -391,6 +396,7 @@ object ProtocolCodec {
             message.locked?.let { put("locked", it) }
             message.screenOn?.let { put("screenOn", it) }
             message.blackScreenActive?.let { put("blackScreenActive", it) }
+            message.forcePortraitActive?.let { put("forcePortraitActive", it) }
             message.capabilities?.let { put("capabilities", partialCapabilitiesToJson(it)) }
         }
 
@@ -539,6 +545,7 @@ object ProtocolCodec {
                 locked = json.getBoolean("locked"),
                 screenOn = json.optNullableBoolean("screenOn"),
                 blackScreenActive = json.optNullableBoolean("blackScreenActive"),
+                forcePortraitActive = json.optNullableBoolean("forcePortraitActive"),
                 directUrl = json.optNullableString("directUrl"),
                 capabilities = capabilitiesFromJson(json.getJSONObject("capabilities")),
             )
@@ -561,6 +568,7 @@ object ProtocolCodec {
                 locked = json.optNullableBoolean("locked"),
                 screenOn = json.optNullableBoolean("screenOn"),
                 blackScreenActive = json.optNullableBoolean("blackScreenActive"),
+                forcePortraitActive = json.optNullableBoolean("forcePortraitActive"),
                 capabilities = json.optJSONObject("capabilities")?.let { partialCapabilitiesFromJson(it) },
             )
 
@@ -761,6 +769,11 @@ object ProtocolCodec {
             put("enabled", cmd.enabled)
         }
 
+        is ControlCommand.ForcePortrait -> JSONObject().apply {
+            put("action", "force_portrait")
+            put("enabled", cmd.enabled)
+        }
+
         is ControlCommand.Quality -> JSONObject().apply {
             put("action", "quality")
             put("quality", streamQualityToJson(cmd.quality))
@@ -838,6 +851,10 @@ object ProtocolCodec {
             )
 
             "black_screen" -> ControlCommand.BlackScreen(
+                enabled = json.optBoolean("enabled", true),
+            )
+
+            "force_portrait" -> ControlCommand.ForcePortrait(
                 enabled = json.optBoolean("enabled", true),
             )
 
@@ -928,6 +945,7 @@ object ProtocolCodec {
         put("locked", device.locked)
         device.screenOn?.let { put("screenOn", it) }
         device.blackScreenActive?.let { put("blackScreenActive", it) }
+        device.forcePortraitActive?.let { put("forcePortraitActive", it) }
         device.directUrl?.let { put("directUrl", it) }
         put("capabilities", capabilitiesToJson(device.capabilities))
     }
@@ -949,6 +967,7 @@ object ProtocolCodec {
         locked = json.getBoolean("locked"),
         screenOn = json.optNullableBoolean("screenOn"),
         blackScreenActive = json.optNullableBoolean("blackScreenActive"),
+        forcePortraitActive = json.optNullableBoolean("forcePortraitActive"),
         directUrl = json.optNullableString("directUrl"),
         capabilities = capabilitiesFromJson(json.getJSONObject("capabilities")),
     )

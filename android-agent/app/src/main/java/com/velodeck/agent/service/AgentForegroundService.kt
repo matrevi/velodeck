@@ -18,7 +18,9 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
+import android.view.Surface
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -67,6 +69,7 @@ data class AgentRuntimeState(
     val activeSessions: Int = 0,
     val webrtcSupported: Boolean = false,
     val blackScreenActive: Boolean = false,
+    val forcePortraitActive: Boolean = true,
 )
 
 class AgentForegroundService : Service() {
@@ -173,11 +176,13 @@ class AgentForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        activeInstance = this
         Log.i(TAG, "AgentForegroundService onCreate")
         ensureNotificationChannels()
         PersistenceGuard.ensureAccessibilityEnabledIfPermitted(this)
 
         configStore = AgentConfigStore.getInstance(this)
+        _runtimeState.update { it.copy(forcePortraitActive = configStore.current.forcePortrait) }
         captureManager = ScreenCaptureManager(
             context = this,
             onProjectionRevoked = {
@@ -209,6 +214,7 @@ class AgentForegroundService : Service() {
             onRemoteLockRequested = { markRemoteLockRequested() },
             onSessionWillStart = { handleSessionWillStart() },
             onSetBlackScreen = { enabled -> handleRemoteBlackScreenCommand(enabled) },
+            onForcePortraitCommand = { enabled -> setForcePortraitEnabled(enabled) },
         )
 
         relayClient = RelayClient(
@@ -329,6 +335,15 @@ class AgentForegroundService : Service() {
                 updateNotification()
             }
         }
+        serviceScope.launch {
+            configStore.configFlow.collect { cfg ->
+                if (_runtimeState.value.forcePortraitActive != cfg.forcePortrait) {
+                    _runtimeState.update { it.copy(forcePortraitActive = cfg.forcePortrait) }
+                    syncBlackScreenPresentation()
+                    sendTelemetryNow()
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -368,6 +383,11 @@ class AgentForegroundService : Service() {
 
             ACTION_EXIT_BLACK_SCREEN -> {
                 setBlackScreenActive(false, reason = "user_action")
+            }
+
+            ACTION_SET_FORCE_PORTRAIT -> {
+                val enabled = intent.getBooleanExtra(EXTRA_FORCE_PORTRAIT_ENABLED, configStore.current.forcePortrait)
+                setForcePortraitEnabled(enabled)
             }
 
             ACTION_DISCONNECT_SESSIONS -> {
@@ -488,6 +508,9 @@ class AgentForegroundService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "AgentForegroundService onDestroy")
+        if (activeInstance === this) {
+            activeInstance = null
+        }
         setBlackScreenActive(false, reason = "service_destroyed")
         _isRunning.value = false
         endpointsPopulated = false
@@ -505,6 +528,7 @@ class AgentForegroundService : Service() {
             controlCode = cfg.controlCode,
             ownerUsername = cfg.ownerUsername,
             accessibilityConnected = VeloDeckAccessibilityService.connectedFlow.value,
+            forcePortraitActive = cfg.forcePortrait,
         )
         super.onDestroy()
     }
@@ -523,11 +547,13 @@ class AgentForegroundService : Service() {
 
         val endpoints = NetworkUtils.detectEndpoints(cfg.directPort)
         endpointsPopulated = true
+        val forcePortraitChanged = _runtimeState.value.forcePortraitActive != cfg.forcePortrait
         _runtimeState.update {
             it.copy(
                 endpoints = endpoints,
                 controlCode = cfg.controlCode,
                 ownerUsername = cfg.ownerUsername,
+                forcePortraitActive = cfg.forcePortrait,
             )
         }
 
@@ -551,6 +577,12 @@ class AgentForegroundService : Service() {
 
         if (!cfg.blackScreenMode && _runtimeState.value.blackScreenActive) {
             setBlackScreenActive(false, reason = "config_disabled")
+        } else {
+            syncBlackScreenPresentation()
+        }
+
+        if (forcePortraitChanged) {
+            sendTelemetryNow()
         }
 
         updateNotification()
@@ -599,9 +631,18 @@ class AgentForegroundService : Service() {
         _runtimeState.update { it.copy(blackScreenActive = active) }
         syncBlackScreenPresentation()
         updateNotification()
-        if (::relayClient.isInitialized && ::directServer.isInitialized && ::captureManager.isInitialized) {
-            pushTelemetryUpdate()
+        sendTelemetryNow()
+    }
+
+    fun setForcePortraitEnabled(enabled: Boolean): Boolean {
+        Log.i(TAG, "Force-Portrait mode -> $enabled")
+        configStore.update { cur ->
+            if (cur.forcePortrait == enabled) cur else cur.copy(forcePortrait = enabled)
         }
+        _runtimeState.update { it.copy(forcePortraitActive = enabled) }
+        syncBlackScreenPresentation()
+        sendTelemetryNow()
+        return true
     }
 
     private fun syncBlackScreenPresentation(forceRemoteViewing: Boolean = false) {
@@ -621,7 +662,10 @@ class AgentForegroundService : Service() {
         }
 
         if (a11y != null) {
-            val applied = a11y.updateDisplayOverlay(targetMode) {
+            val applied = a11y.updateDisplayOverlay(
+                mode = targetMode,
+                forcePortrait = st.forcePortraitActive,
+            ) {
                 setBlackScreenActive(false, reason = "emergency_tap")
             }
             if (!applied && targetMode == VeloDeckAccessibilityService.DisplayOverlayMode.PURE_BLACK_IDLE) {
@@ -632,6 +676,14 @@ class AgentForegroundService : Service() {
                 BlackScreenActivity.launch(this)
             } else {
                 BlackScreenActivity.dismissIfActive()
+            }
+        }
+
+        // Belt-and-suspenders system rotation lock when WRITE_SETTINGS is granted
+        if (st.forcePortraitActive && Settings.System.canWrite(this)) {
+            runCatching {
+                Settings.System.putInt(contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0)
+                Settings.System.putInt(contentResolver, Settings.System.USER_ROTATION, Surface.ROTATION_0)
             }
         }
 
@@ -689,6 +741,7 @@ class AgentForegroundService : Service() {
             locked = PowerHelper.isDeviceLocked(this),
             screenOn = PowerHelper.isScreenOn(this),
             blackScreenActive = _runtimeState.value.blackScreenActive,
+            forcePortraitActive = _runtimeState.value.forcePortraitActive,
             directUrl = if (cfg.directEnabled) endpoints.preferredDirectWsUrl else null,
             capabilities = buildCapabilities(),
         )
@@ -716,9 +769,16 @@ class AgentForegroundService : Service() {
             locked = summary.locked,
             screenOn = summary.screenOn,
             blackScreenActive = summary.blackScreenActive,
+            forcePortraitActive = summary.forcePortraitActive,
             directUrl = summary.directUrl,
             capabilities = summary.capabilities,
         )
+    }
+
+    private fun sendTelemetryNow() {
+        if (::relayClient.isInitialized && ::directServer.isInitialized && ::captureManager.isInitialized) {
+            pushTelemetryUpdate()
+        }
     }
 
     private fun pushTelemetryUpdate() {
@@ -734,6 +794,7 @@ class AgentForegroundService : Service() {
             locked = summary.locked,
             screenOn = summary.screenOn,
             blackScreenActive = summary.blackScreenActive,
+            forcePortraitActive = summary.forcePortraitActive,
             capabilities = PartialDeviceCapabilities(
                 webrtc = cap.webrtc,
                 wsJpeg = cap.wsJpeg,
@@ -764,6 +825,7 @@ class AgentForegroundService : Service() {
                 hasProjection = captureManager.hasProjection,
                 accessibilityConnected = VeloDeckAccessibilityService.connectedFlow.value,
                 activeSessions = coordinator.activeSessionCount.value,
+                forcePortraitActive = cfg.forcePortrait,
             )
         }
     }
@@ -1062,9 +1124,14 @@ class AgentForegroundService : Service() {
         const val ACTION_DISCONNECT_SESSIONS = "com.velodeck.agent.action.DISCONNECT_SESSIONS"
         const val ACTION_ENTER_BLACK_SCREEN = "com.velodeck.agent.action.ENTER_BLACK_SCREEN"
         const val ACTION_EXIT_BLACK_SCREEN = "com.velodeck.agent.action.EXIT_BLACK_SCREEN"
+        const val ACTION_SET_FORCE_PORTRAIT = "com.velodeck.agent.action.SET_FORCE_PORTRAIT"
 
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
+        const val EXTRA_FORCE_PORTRAIT_ENABLED = "force_portrait_enabled"
+
+        @Volatile
+        private var activeInstance: AgentForegroundService? = null
 
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
@@ -1112,7 +1179,11 @@ class AgentForegroundService : Service() {
 
         fun exitBlackScreen(context: Context) {
             if (!_isRunning.value) {
-                VeloDeckAccessibilityService.instance?.hideBlackCurtain()
+                val forcePortrait = AgentConfigStore.getInstance(context).current.forcePortrait
+                VeloDeckAccessibilityService.instance?.updateDisplayOverlay(
+                    mode = VeloDeckAccessibilityService.DisplayOverlayMode.OFF,
+                    forcePortrait = forcePortrait,
+                )
                 BlackScreenActivity.dismissIfActive()
                 return
             }
@@ -1120,6 +1191,32 @@ class AgentForegroundService : Service() {
                 action = ACTION_EXIT_BLACK_SCREEN
             }
             ContextCompat.startForegroundService(context.applicationContext, intent)
+        }
+
+        fun setForcePortraitEnabled(context: Context, enabled: Boolean) {
+            AgentConfigStore.getInstance(context).update { cur ->
+                if (cur.forcePortrait == enabled) cur else cur.copy(forcePortrait = enabled)
+            }
+            _runtimeState.update { it.copy(forcePortraitActive = enabled) }
+            if (!_isRunning.value) {
+                VeloDeckAccessibilityService.instance?.updateDisplayOverlay(
+                    mode = VeloDeckAccessibilityService.DisplayOverlayMode.OFF,
+                    forcePortrait = enabled,
+                )
+                return
+            }
+            val intent = Intent(context, AgentForegroundService::class.java).apply {
+                action = ACTION_SET_FORCE_PORTRAIT
+                putExtra(EXTRA_FORCE_PORTRAIT_ENABLED, enabled)
+            }
+            ContextCompat.startForegroundService(context.applicationContext, intent)
+        }
+
+        fun requestOverlaySync() {
+            val svc = activeInstance ?: return
+            svc.mainHandler.post {
+                svc.syncBlackScreenPresentation()
+            }
         }
     }
 }

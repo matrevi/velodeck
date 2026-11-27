@@ -213,6 +213,7 @@ class MainActivity : AppCompatActivity() {
         binding.switchAutoStart.isChecked = cfg.autoStart
         binding.switchAutoAccept.isChecked = cfg.autoAcceptProjection
         binding.switchBlackScreenMode.isChecked = cfg.blackScreenMode
+        binding.switchForcePortrait.isChecked = cfg.forcePortrait
 
         val guide = RomKeepAliveHelper.getGuide(this)
         val shortBrand = guide.brandLabel.substringBefore(" (").substringBefore(" /")
@@ -344,6 +345,21 @@ class MainActivity : AppCompatActivity() {
                 }
                 Toast.makeText(this, "已进入伪装黑屏运行 · 按锁屏键立即打开", Toast.LENGTH_SHORT).show()
                 AgentForegroundService.enterBlackScreen(this)
+            }
+        }
+
+        binding.switchForcePortrait.setOnCheckedChangeListener { buttonView, isChecked ->
+            if (!buttonView.isPressed) return@setOnCheckedChangeListener
+            AgentForegroundService.setForcePortraitEnabled(this, isChecked)
+            if (isChecked) {
+                val msg = if (VeloDeckAccessibilityService.connectedFlow.value) {
+                    "已开启全局强制竖屏锁定"
+                } else {
+                    "已开启强制竖屏（开启无障碍服务后全局生效）"
+                }
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "已关闭强制竖屏锁定", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -684,9 +700,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Black-Screen running mode card state
+        // Black-Screen running mode & Force-Portrait card state
         if (binding.switchBlackScreenMode.isChecked != cfg.blackScreenMode) {
             binding.switchBlackScreenMode.isChecked = cfg.blackScreenMode
+        }
+        if (binding.switchForcePortrait.isChecked != cfg.forcePortrait) {
+            binding.switchForcePortrait.isChecked = cfg.forcePortrait
         }
         when {
             state.blackScreenActive -> {

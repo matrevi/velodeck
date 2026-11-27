@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.graphics.Path
 import android.graphics.PixelFormat
@@ -73,22 +74,32 @@ class VeloDeckAccessibilityService : AccessibilityService() {
     private var blackCurtainView: View? = null
     private var blackCurtainTapCount = 0
     private var blackCurtainLastTapMs = 0L
+    private var blackCurtainEmergencyDismiss: (() -> Unit)? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         _connectedFlow.value = true
         Log.i(TAG, "VeloDeckAccessibilityService connected")
-        // Mutual 7x24 watchdog: AccessibilityService is kept bound by system_server;
-        // if AgentForegroundService was killed by the ROM, revive it immediately.
+        // Enforce global portrait lock immediately if configured and AgentForegroundService isn't
+        // already driving another overlay mode; sync or revive AgentForegroundService as needed.
         try {
             val cfg = AgentConfigStore.getInstance(this).current
-            if (cfg.autoStart && !AgentForegroundService.isRunning.value) {
+            val serviceRunning = AgentForegroundService.isRunning.value
+            val rt = AgentForegroundService.runtimeState.value
+            if (cfg.forcePortrait && (!serviceRunning || (!rt.blackScreenActive && rt.activeSessions == 0))) {
+                updateDisplayOverlay(DisplayOverlayMode.OFF, forcePortrait = true)
+            }
+            if (serviceRunning) {
+                AgentForegroundService.requestOverlaySync()
+            } else if (cfg.autoStart) {
+                // Mutual 7x24 watchdog: AccessibilityService is kept bound by system_server;
+                // if AgentForegroundService was killed by the ROM, revive it immediately.
                 Log.i(TAG, "Reviving AgentForegroundService from AccessibilityService")
                 AgentForegroundService.start(this)
             }
         } catch (t: Throwable) {
-            Log.w(TAG, "Could not revive AgentForegroundService onServiceConnected", t)
+            Log.w(TAG, "Could not sync overlay or revive AgentForegroundService onServiceConnected", t)
         }
     }
 
@@ -119,8 +130,12 @@ class VeloDeckAccessibilityService : AccessibilityService() {
 
     /**
      * Displays a zero-extra-permission `TYPE_ACCESSIBILITY_OVERLAY` window for keep-awake,
-     * stealth minimum-backlight remote viewing, or pure #000000 OLED idle disguise:
-     * - [DisplayOverlayMode.OFF]: removes overlay completely.
+     * stealth minimum-backlight remote viewing, pure #000000 OLED idle disguise, and/or
+     * system-wide portrait orientation lock:
+     * - [DisplayOverlayMode.OFF] + `forcePortrait == false`: removes overlay completely.
+     * - [DisplayOverlayMode.OFF] + `forcePortrait == true`: 1x1 transparent touch-passthrough
+     *   overlay with `SCREEN_ORIENTATION_PORTRAIT` and WITHOUT `FLAG_KEEP_SCREEN_ON`, locking
+     *   portrait globally while preserving normal idle screen sleep.
      * - [DisplayOverlayMode.KEEP_AWAKE_ONLY]: 1x1 transparent touch-passthrough keep-screen-on
      *   layer at normal system brightness so remote sessions never auto-sleep into black frames.
      * - [DisplayOverlayMode.STEALTH_DIM]: 1x1 transparent touch-passthrough + 0.1% hardware minimum
@@ -131,24 +146,27 @@ class VeloDeckAccessibilityService : AccessibilityService() {
      */
     fun updateDisplayOverlay(
         mode: DisplayOverlayMode,
+        forcePortrait: Boolean = false,
         onEmergencyDismiss: (() -> Unit)? = null,
     ): Boolean {
-        if (mode == DisplayOverlayMode.OFF) {
+        if (!shouldAttachOverlay(mode, forcePortrait)) {
             hideBlackCurtain()
             return true
         }
         val runUpdate: () -> Boolean = {
             try {
+                blackCurtainEmergencyDismiss = onEmergencyDismiss
                 val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-                val baseFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                val keepAwake = shouldKeepScreenOn(mode)
+                var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                if (keepAwake) {
+                    flags = flags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+                }
                 val touchPassthrough = mode != DisplayOverlayMode.PURE_BLACK_IDLE
-                val flags = if (touchPassthrough) {
-                    baseFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                } else {
-                    baseFlags
+                if (touchPassthrough) {
+                    flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 }
                 val size = overlayDimensionForMode(mode)
                 val lp = WindowManager.LayoutParams(
@@ -159,6 +177,7 @@ class VeloDeckAccessibilityService : AccessibilityService() {
                     PixelFormat.TRANSLUCENT,
                 ).apply {
                     gravity = Gravity.TOP or Gravity.START
+                    screenOrientation = overlayScreenOrientation(forcePortrait)
                     screenBrightness = when (mode) {
                         DisplayOverlayMode.KEEP_AWAKE_ONLY -> WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
                         DisplayOverlayMode.STEALTH_DIM -> 0.001f
@@ -178,13 +197,14 @@ class VeloDeckAccessibilityService : AccessibilityService() {
                 }
                 val existing = blackCurtainView
                 if (existing != null && existing.isAttachedToWindow) {
+                    existing.keepScreenOn = keepAwake
                     existing.setBackgroundColor(bgColor)
                     existing.invalidate()
                     wm.updateViewLayout(existing, lp)
                 } else {
                     val v = View(this).apply {
                         setBackgroundColor(bgColor)
-                        keepScreenOn = true
+                        keepScreenOn = keepAwake
                         setOnClickListener {
                             val now = SystemClock.elapsedRealtime()
                             if (now - blackCurtainLastTapMs < 1_500L) {
@@ -195,7 +215,7 @@ class VeloDeckAccessibilityService : AccessibilityService() {
                             blackCurtainLastTapMs = now
                             if (blackCurtainTapCount >= 5) {
                                 blackCurtainTapCount = 0
-                                onEmergencyDismiss?.invoke()
+                                blackCurtainEmergencyDismiss?.invoke()
                             }
                         }
                     }
@@ -204,7 +224,7 @@ class VeloDeckAccessibilityService : AccessibilityService() {
                 }
                 true
             } catch (t: Throwable) {
-                Log.w(TAG, "Failed to update accessibility display overlay (mode=$mode)", t)
+                Log.w(TAG, "Failed to update accessibility display overlay (mode=$mode, forcePortrait=$forcePortrait)", t)
                 false
             }
         }
@@ -218,7 +238,8 @@ class VeloDeckAccessibilityService : AccessibilityService() {
 
     fun showBlackCurtain(stealthDimOnly: Boolean, onEmergencyDismiss: (() -> Unit)? = null): Boolean {
         val mode = if (stealthDimOnly) DisplayOverlayMode.STEALTH_DIM else DisplayOverlayMode.PURE_BLACK_IDLE
-        return updateDisplayOverlay(mode, onEmergencyDismiss)
+        val forcePortrait = runCatching { AgentConfigStore.getInstance(this).current.forcePortrait }.getOrDefault(false)
+        return updateDisplayOverlay(mode, forcePortrait = forcePortrait, onEmergencyDismiss = onEmergencyDismiss)
     }
 
     fun hideBlackCurtain() {
@@ -226,6 +247,7 @@ class VeloDeckAccessibilityService : AccessibilityService() {
             val view = blackCurtainView
             blackCurtainView = null
             blackCurtainTapCount = 0
+            blackCurtainEmergencyDismiss = null
             if (view != null) {
                 try {
                     val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -438,6 +460,7 @@ class VeloDeckAccessibilityService : AccessibilityService() {
             }
 
             is ControlCommand.BlackScreen,
+            is ControlCommand.ForcePortrait,
             is ControlCommand.Quality,
             is ControlCommand.RequestKeyframe,
             -> true to null
@@ -1222,9 +1245,34 @@ class VeloDeckAccessibilityService : AccessibilityService() {
         )
 
         /**
+         * Returns true when a `TYPE_ACCESSIBILITY_OVERLAY` window should remain attached:
+         * either for an active display overlay mode or for system-wide portrait orientation lock.
+         */
+        internal fun shouldAttachOverlay(mode: DisplayOverlayMode, forcePortrait: Boolean): Boolean =
+            mode != DisplayOverlayMode.OFF || forcePortrait
+
+        /**
+         * Only non-[DisplayOverlayMode.OFF] modes hold `FLAG_KEEP_SCREEN_ON`; idle portrait lock
+         * (`OFF` + `forcePortrait == true`) must allow the device to sleep normally.
+         */
+        internal fun shouldKeepScreenOn(mode: DisplayOverlayMode): Boolean =
+            mode != DisplayOverlayMode.OFF
+
+        /**
+         * Maps the global force-portrait toggle to the WindowManager `screenOrientation` value.
+         */
+        internal fun overlayScreenOrientation(forcePortrait: Boolean): Int =
+            if (forcePortrait) {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
+
+        /**
          * Only [DisplayOverlayMode.PURE_BLACK_IDLE] needs a full-screen surface to paint opaque
-         * black pixels; both [DisplayOverlayMode.KEEP_AWAKE_ONLY] and [DisplayOverlayMode.STEALTH_DIM]
-         * use a 1x1 pixel overlay so WindowManager applies `FLAG_KEEP_SCREEN_ON` and
+         * black pixels; [DisplayOverlayMode.KEEP_AWAKE_ONLY], [DisplayOverlayMode.STEALTH_DIM],
+         * and idle portrait lock ([DisplayOverlayMode.OFF] + `forcePortrait == true`) use a 1x1
+         * pixel overlay so WindowManager applies `screenOrientation`, `FLAG_KEEP_SCREEN_ON`, and
          * `screenBrightness` display-wide without allocating a full-screen RGBA8888 SurfaceFlinger layer.
          */
         internal fun overlayDimensionForMode(mode: DisplayOverlayMode): Int =

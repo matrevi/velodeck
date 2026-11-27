@@ -1,5 +1,6 @@
 package com.velodeck.agent
 
+import android.content.pm.ActivityInfo
 import android.view.WindowManager
 import com.velodeck.agent.input.VeloDeckAccessibilityService
 import com.velodeck.agent.network.AccountApiClient
@@ -126,6 +127,9 @@ class ProtocolMessagesTest {
             ControlCommand.ClipboardSet("copied text"),
             ControlCommand.Wake,
             ControlCommand.Unlock(pin = "123456"),
+            ControlCommand.BlackScreen(enabled = true),
+            ControlCommand.ForcePortrait(enabled = true),
+            ControlCommand.ForcePortrait(enabled = false),
             ControlCommand.Quality(StreamQuality.HD),
             ControlCommand.RequestKeyframe,
         )
@@ -516,6 +520,12 @@ class ProtocolMessagesTest {
         assertEquals(
             1,
             VeloDeckAccessibilityService.overlayDimensionForMode(
+                VeloDeckAccessibilityService.DisplayOverlayMode.OFF,
+            ),
+        )
+        assertEquals(
+            1,
+            VeloDeckAccessibilityService.overlayDimensionForMode(
                 VeloDeckAccessibilityService.DisplayOverlayMode.KEEP_AWAKE_ONLY,
             ),
         )
@@ -528,6 +538,157 @@ class ProtocolMessagesTest {
         assertEquals(
             WindowManager.LayoutParams.MATCH_PARENT,
             VeloDeckAccessibilityService.overlayDimensionForMode(
+                VeloDeckAccessibilityService.DisplayOverlayMode.PURE_BLACK_IDLE,
+            ),
+        )
+    }
+
+    @Test
+    fun parseAndSerialize_forcePortraitCommandAndTelemetryStateFields() {
+        // ControlCommand.ForcePortrait JSON action & round-trip
+        val enableCmd = WireMessage.ControlCmd(
+            sessionId = "sess-fp",
+            deviceId = "dev-fp",
+            seq = 11,
+            command = ControlCommand.ForcePortrait(enabled = true),
+        )
+        val enableJson = ProtocolCodec.serialize(enableCmd)
+        assertTrue(
+            "Expected action force_portrait in JSON: $enableJson",
+            enableJson.contains("\"action\":\"force_portrait\""),
+        )
+        assertTrue(
+            "Expected enabled:true in JSON: $enableJson",
+            enableJson.contains("\"enabled\":true"),
+        )
+        val decodedEnable = ProtocolCodec.parse(enableJson) as WireMessage.ControlCmd
+        assertEquals(ControlCommand.ForcePortrait(enabled = true), decodedEnable.command)
+
+        val disableCmd = enableCmd.copy(seq = 12, command = ControlCommand.ForcePortrait(enabled = false))
+        val disableJson = ProtocolCodec.serialize(disableCmd)
+        assertTrue(disableJson.contains("\"action\":\"force_portrait\""))
+        assertTrue(disableJson.contains("\"enabled\":false"))
+        val decodedDisable = ProtocolCodec.parse(disableJson) as WireMessage.ControlCmd
+        assertEquals(ControlCommand.ForcePortrait(enabled = false), decodedDisable.command)
+
+        // Omitting enabled defaults to true
+        val omittedJson = """{"type":"control.cmd","sessionId":"","deviceId":"dev-fp","command":{"action":"force_portrait"}}"""
+        val decodedOmitted = ProtocolCodec.parse(omittedJson) as WireMessage.ControlCmd
+        assertEquals(ControlCommand.ForcePortrait(enabled = true), decodedOmitted.command)
+
+        // forcePortraitActive in AgentRegister, AgentTelemetry, and DeviceSummary
+        val caps = DeviceCapabilities(
+            webrtc = true,
+            wsJpeg = true,
+            wsH264 = false,
+            wake = true,
+            unlock = true,
+            accessibility = true,
+            mediaProjection = true,
+        )
+        val reg = WireMessage.AgentRegister(
+            deviceId = "android-fp",
+            deviceSecret = "sec-fp",
+            name = "Portrait Phone",
+            model = "Pixel 9",
+            androidVersion = "16",
+            screenWidth = 1080,
+            screenHeight = 2400,
+            rotation = 0,
+            battery = 90,
+            charging = false,
+            locked = false,
+            screenOn = true,
+            blackScreenActive = false,
+            forcePortraitActive = true,
+            capabilities = caps,
+        )
+        val regJson = ProtocolCodec.serialize(reg)
+        assertTrue(regJson.contains("\"forcePortraitActive\":true"))
+        val decodedReg = ProtocolCodec.parse(regJson) as WireMessage.AgentRegister
+        assertEquals(true, decodedReg.forcePortraitActive)
+
+        val regNull = reg.copy(forcePortraitActive = null)
+        val regNullJson = ProtocolCodec.serialize(regNull)
+        assertFalse(regNullJson.contains("forcePortraitActive"))
+        assertNull((ProtocolCodec.parse(regNullJson) as WireMessage.AgentRegister).forcePortraitActive)
+
+        val telemetry = WireMessage.AgentTelemetry(
+            deviceId = "android-fp",
+            rotation = 0,
+            blackScreenActive = false,
+            forcePortraitActive = false,
+        )
+        val telemetryJson = ProtocolCodec.serialize(telemetry)
+        assertTrue(telemetryJson.contains("\"forcePortraitActive\":false"))
+        val decodedTelemetry = ProtocolCodec.parse(telemetryJson) as WireMessage.AgentTelemetry
+        assertEquals(false, decodedTelemetry.forcePortraitActive)
+
+        val summary = DeviceSummary(
+            deviceId = "android-fp",
+            name = "Portrait Phone",
+            model = "Pixel 9",
+            androidVersion = "16",
+            online = true,
+            lastSeen = 1760000000000L,
+            screenWidth = 1080,
+            screenHeight = 2400,
+            rotation = 0,
+            battery = 90,
+            charging = false,
+            locked = false,
+            screenOn = true,
+            blackScreenActive = false,
+            forcePortraitActive = true,
+            capabilities = caps,
+        )
+        val statusMsg = WireMessage.DeviceStatus(device = summary)
+        val statusJson = ProtocolCodec.serialize(statusMsg)
+        assertTrue(statusJson.contains("\"forcePortraitActive\":true"))
+        val decodedStatus = ProtocolCodec.parse(statusJson) as WireMessage.DeviceStatus
+        assertEquals(true, decodedStatus.device.forcePortraitActive)
+    }
+
+    @Test
+    fun accessibilityOverlay_forcePortraitAttachOrientationAndKeepScreenOnHelpers() {
+        val modes = VeloDeckAccessibilityService.DisplayOverlayMode.entries
+        // shouldAttachOverlay: false ONLY for (OFF, false)
+        for (mode in modes) {
+            assertTrue(VeloDeckAccessibilityService.shouldAttachOverlay(mode, forcePortrait = true))
+            assertEquals(
+                mode != VeloDeckAccessibilityService.DisplayOverlayMode.OFF,
+                VeloDeckAccessibilityService.shouldAttachOverlay(mode, forcePortrait = false),
+            )
+        }
+
+        // overlayScreenOrientation: PORTRAIT when true, UNSPECIFIED when false
+        assertEquals(
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT,
+            VeloDeckAccessibilityService.overlayScreenOrientation(forcePortrait = true),
+        )
+        assertEquals(
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED,
+            VeloDeckAccessibilityService.overlayScreenOrientation(forcePortrait = false),
+        )
+
+        // shouldKeepScreenOn: false for OFF (even when forcePortrait is on), true for active overlay modes
+        assertFalse(
+            VeloDeckAccessibilityService.shouldKeepScreenOn(
+                VeloDeckAccessibilityService.DisplayOverlayMode.OFF,
+            ),
+        )
+        assertTrue(
+            VeloDeckAccessibilityService.shouldKeepScreenOn(
+                VeloDeckAccessibilityService.DisplayOverlayMode.KEEP_AWAKE_ONLY,
+            ),
+        )
+        assertTrue(
+            VeloDeckAccessibilityService.shouldKeepScreenOn(
+                VeloDeckAccessibilityService.DisplayOverlayMode.STEALTH_DIM,
+            ),
+        )
+        assertTrue(
+            VeloDeckAccessibilityService.shouldKeepScreenOn(
                 VeloDeckAccessibilityService.DisplayOverlayMode.PURE_BLACK_IDLE,
             ),
         )

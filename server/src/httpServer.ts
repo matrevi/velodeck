@@ -19,7 +19,7 @@ import type { ServerConfig } from "./config.js";
 import { extractClientIp, isLoopbackIp, VeloDeckHub } from "./hub.js";
 import { isValidDeviceId, VeloDeckStore, StoreError } from "./store.js";
 
-const SERVER_VERSION = "1.0.2";
+const SERVER_VERSION = "1.0.3";
 const MAX_JSON_BODY_BYTES = 32 * 1024;
 const MAX_WS_PAYLOAD_BYTES = 2 * 1024 * 1024; // 2 MB
 

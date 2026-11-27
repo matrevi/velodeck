@@ -1826,6 +1826,13 @@ export class VeloDeckHub {
     if (blackScreenActive !== undefined) {
       summary.blackScreenActive = blackScreenActive;
     }
+    const forcePortraitActive =
+      typeof msg.forcePortraitActive === "boolean"
+        ? msg.forcePortraitActive
+        : prev?.forcePortraitActive;
+    if (forcePortraitActive !== undefined) {
+      summary.forcePortraitActive = forcePortraitActive;
+    }
     // Validate directUrl strictly (ws:// or wss:// with RFC1918/CGNAT private IPv4 only)
     const validatedIncomingUrl =
       msg.directUrl !== undefined ? validateDirectUrl(msg.directUrl) : undefined;
@@ -1873,6 +1880,9 @@ export class VeloDeckHub {
     if (typeof msg.screenOn === "boolean") s.screenOn = msg.screenOn;
     if (typeof msg.blackScreenActive === "boolean") {
       s.blackScreenActive = msg.blackScreenActive;
+    }
+    if (typeof msg.forcePortraitActive === "boolean") {
+      s.forcePortraitActive = msg.forcePortraitActive;
     }
     if (msg.capabilities) {
       s.capabilities = mergeCapabilities(s.capabilities, msg.capabilities);
@@ -2452,7 +2462,17 @@ export class VeloDeckHub {
       }
     }
 
-    // Allow sessionless wake / unlock commands from an authorized controller (e.g. Dashboard "唤醒" button)
+    if (cmd.action === "black_screen" || cmd.action === "force_portrait") {
+      if (typeof cmd.enabled !== "boolean") {
+        this.sendError(conn.ws, "INVALID_MESSAGE", "Invalid boolean enabled flag", {
+          sessionId: msg.sessionId,
+          deviceId: msg.deviceId,
+        });
+        return;
+      }
+    }
+
+    // Allow sessionless wake / unlock / black_screen / force_portrait commands from an authorized controller
     if (!isNonEmptyString(msg.sessionId)) {
       if (conn.role !== "controller") {
         this.sendError(conn.ws, "UNAUTHORIZED", "Controller authentication required", {
@@ -2461,7 +2481,12 @@ export class VeloDeckHub {
         return;
       }
       const action = cmd.action;
-      if (action !== "wake" && action !== "unlock" && action !== "black_screen") {
+      if (
+        action !== "wake" &&
+        action !== "unlock" &&
+        action !== "black_screen" &&
+        action !== "force_portrait"
+      ) {
         this.sendError(
           conn.ws,
           "SESSION_NOT_FOUND",

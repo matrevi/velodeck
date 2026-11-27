@@ -49,6 +49,7 @@ export interface DeviceSummary {
   locked: boolean;
   screenOn?: boolean;
   blackScreenActive?: boolean;
+  forcePortraitActive?: boolean;
   directUrl?: string;
   capabilities: DeviceCapabilities;
 }
@@ -99,6 +100,7 @@ export type ControlCommand =
   | { action: "wake" }
   | { action: "unlock"; pin?: string }
   | { action: "black_screen"; enabled: boolean }
+  | { action: "force_portrait"; enabled: boolean }
   | { action: "quality"; quality: StreamQuality }
   | { action: "request_keyframe" };
 
@@ -125,6 +127,7 @@ export interface AgentRegisterMessage {
   locked: boolean;
   screenOn?: boolean;
   blackScreenActive?: boolean;
+  forcePortraitActive?: boolean;
   directUrl?: string;
   capabilities: DeviceCapabilities;
 }
@@ -149,6 +152,7 @@ export interface AgentTelemetryMessage {
   locked?: boolean;
   screenOn?: boolean;
   blackScreenActive?: boolean;
+  forcePortraitActive?: boolean;
   capabilities?: Partial<DeviceCapabilities>;
 }
 

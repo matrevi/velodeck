@@ -1500,7 +1500,7 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
   assert.equal(infoBefore.status, 200);
   assert.deepEqual(await infoBefore.json(), {
     ok: true,
-    version: "1.0.2",
+    version: "1.0.3",
     hasAndroidApk: false,
     apkSha256: null,
     registrationMode: "first-user-then-invite",
@@ -1521,7 +1521,7 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
   assert.equal(infoAfter.status, 200);
   assert.deepEqual(await infoAfter.json(), {
     ok: true,
-    version: "1.0.2",
+    version: "1.0.3",
     hasAndroidApk: true,
     apkSha256: expectedSha256,
     registrationMode: "first-user-then-invite",
@@ -2988,4 +2988,139 @@ test("Agent p2pFileTransfer capability is preserved in controller.authed and acr
   assert.equal(authed2.type, "controller.authed");
   assert.equal(authed2.devices[0]?.capabilities.p2pFileTransfer, true);
   assert.equal(authed2.devices[0]?.capabilities.mediaProjection, false);
+});
+
+test("forcePortraitActive propagates on register/telemetry/clone and force_portrait control.cmd forwards cleanly (sessionless & in-session)", async (t) => {
+  const { server, baseUrl, wsUrl } = await startServer();
+  t.after(() => server.close());
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "portrait_user", password: "portrait-password-123" }),
+  });
+  assert.equal(regRes.status, 201);
+  const { token } = (await regRes.json()) as { token: string };
+
+  const agent = await TestWsClient.connect(wsUrl);
+  const ctrl1 = await TestWsClient.connect(wsUrl);
+  const ctrl2 = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent.close(), ctrl1.close(), ctrl2.close()]);
+  });
+
+  // 1. Agent registers with forcePortraitActive: true
+  agent.sendJson(
+    makeAgentRegister({
+      deviceId: "dev-portrait-01",
+      deviceSecret: "portrait-secret-01",
+      authToken: token,
+      forcePortraitActive: true,
+    }),
+  );
+  const agentReg = await agent.nextJson<AgentRegisteredMessage>();
+  assert.equal(agentReg.type, "agent.registered");
+
+  // Controller 1 receives forcePortraitActive: true in controller.authed
+  ctrl1.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-portrait-1",
+  });
+  const authed1 = await ctrl1.nextJson<ControllerAuthedMessage>();
+  assert.equal(authed1.type, "controller.authed");
+  assert.equal(authed1.devices.length, 1);
+  assert.equal(authed1.devices[0]?.forcePortraitActive, true);
+
+  // 2. Partial telemetry without forcePortraitActive preserves previous value,
+  //    then explicit forcePortraitActive: false updates and broadcasts device.status
+  agent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "dev-portrait-01",
+    battery: 82,
+  });
+  const status1 = await ctrl1.nextJson<DeviceStatusMessage>();
+  assert.equal(status1.type, "device.status");
+  assert.equal(status1.device.battery, 82);
+  assert.equal(status1.device.forcePortraitActive, true);
+
+  agent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "dev-portrait-01",
+    forcePortraitActive: false,
+  });
+  const status2 = await ctrl1.nextJson<DeviceStatusMessage>();
+  assert.equal(status2.type, "device.status");
+  assert.equal(status2.device.forcePortraitActive, false);
+
+  // Newly connecting controller receives cloned summary with forcePortraitActive: false
+  ctrl2.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-portrait-2",
+  });
+  const authed2 = await ctrl2.nextJson<ControllerAuthedMessage>();
+  assert.equal(authed2.devices[0]?.forcePortraitActive, false);
+
+  // 3. Invalid non-boolean enabled is rejected cleanly with INVALID_MESSAGE
+  ctrl1.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "dev-portrait-01",
+    seq: 1,
+    command: { action: "force_portrait", enabled: "yes" as unknown as boolean },
+  } satisfies ControlCmdMessage);
+  const badEnabledErr = await ctrl1.nextJson<ErrorMessage>();
+  assert.equal(badEnabledErr.type, "error");
+  assert.equal(badEnabledErr.code, "INVALID_MESSAGE");
+
+  // 4. Sessionless (out-of-band) force_portrait command forwards to agent and routes control.ack back
+  ctrl1.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "dev-portrait-01",
+    seq: 2,
+    command: { action: "force_portrait", enabled: true },
+  } satisfies ControlCmdMessage);
+  const oobCmd = await agent.nextJson<ControlCmdMessage>();
+  assert.equal(oobCmd.type, "control.cmd");
+  assert.equal(oobCmd.sessionId, "");
+  assert.equal(oobCmd.deviceId, "dev-portrait-01");
+  assert.equal(oobCmd.seq, 2);
+  assert.deepEqual(oobCmd.command, { action: "force_portrait", enabled: true });
+
+  agent.sendJson({
+    type: "control.ack",
+    sessionId: "",
+    deviceId: "dev-portrait-01",
+    seq: 2,
+    ok: true,
+    message: "force_portrait_enabled",
+  } satisfies ControlAckMessage);
+  const oobAck = await ctrl1.nextJson<ControlAckMessage>();
+  assert.equal(oobAck.type, "control.ack");
+  assert.equal(oobAck.ok, true);
+  assert.equal(oobAck.seq, 2);
+
+  // 5. In-session force_portrait command also forwards cleanly
+  ctrl1.sendJson({
+    type: "session.request",
+    sessionId: "sess-portrait-1",
+    deviceId: "dev-portrait-01",
+    preferredTransport: "ws-jpeg",
+    quality: QUALITY_PRESETS.eco,
+  } satisfies SessionRequestMessage);
+  await agent.nextJson<SessionRequestMessage>();
+
+  ctrl1.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-portrait-1",
+    deviceId: "dev-portrait-01",
+    seq: 3,
+    command: { action: "force_portrait", enabled: false },
+  } satisfies ControlCmdMessage);
+  const inSessionCmd = await agent.nextJson<ControlCmdMessage>();
+  assert.equal(inSessionCmd.type, "control.cmd");
+  assert.equal(inSessionCmd.sessionId, "sess-portrait-1");
+  assert.deepEqual(inSessionCmd.command, { action: "force_portrait", enabled: false });
 });
