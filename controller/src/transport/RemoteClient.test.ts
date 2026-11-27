@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { FRAME_TYPE_JPEG, encodeMediaFrame } from "@velodeck/protocol";
+import { FRAME_TYPE_JPEG, QUALITY_PRESETS, encodeMediaFrame } from "@velodeck/protocol";
 import {
   RemoteClient,
   isAllowedDataChannelMessage,
@@ -2091,6 +2091,181 @@ describe("RemoteClient adaptive playout delay on stats polling", () => {
     expect(fallbackPlayoutHistory).toEqual([0]);
 
     client.stopSession();
+    client.disconnect();
+  });
+});
+
+describe("RemoteClient smart auto quality preset and ws-jpeg fallback step-down", () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const originalRTC = globalThis.RTCPeerConnection;
+
+  afterEach(() => {
+    vi.useRealTimers();
+    FakeWebSocket.instances = [];
+    FakeRTCPeerConnection.instances = [];
+    globalThis.WebSocket = originalWebSocket;
+    globalThis.RTCPeerConnection = originalRTC;
+  });
+
+  it("defaults to auto preset on init/connect/startSession and sends auto: true via setQuality('auto')", async () => {
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+    globalThis.RTCPeerConnection =
+      FakeRTCPeerConnection as unknown as typeof RTCPeerConnection;
+
+    const client = new RemoteClient("ctrl-auto-quality");
+    expect(client.getState().qualityPreset).toBe("auto");
+
+    client.connectWithAccount({
+      wsUrl: "wss://velodeck.example.com/ws",
+      authToken: "jwt-valid",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      preferredTransport: "webrtc",
+    });
+    expect(client.getState().qualityPreset).toBe("auto");
+
+    const ws = FakeWebSocket.instances[0]!;
+    ws.emitOpen();
+    ws.emitJson({
+      type: "controller.authed",
+      clientId: "ctrl-auto-quality",
+      serverTime: Date.now(),
+      mode: "relay",
+      authType: "account",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      devices: [makeDeviceSummary({ mediaProjection: true, webrtc: true })],
+      iceServers: [],
+    });
+
+    client.startSession("dev-1");
+    const req = parseSentMessages(ws).find((m) => m.type === "session.request");
+    expect(req?.quality).toEqual(QUALITY_PRESETS.auto);
+    expect((req?.quality as { auto?: boolean } | undefined)?.auto).toBe(true);
+
+    const sessId = client.getState().sessionId!;
+    ws.emitJson({
+      type: "session.ready",
+      sessionId: sessId,
+      deviceId: "dev-1",
+      transport: "webrtc",
+      screenWidth: 1080,
+      screenHeight: 2400,
+      rotation: 0,
+    });
+    await Promise.resolve();
+
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    expect(pc.dc).toBeTruthy();
+
+    // Switch to hd then back to auto -> DataChannel carries QUALITY_PRESETS.auto with auto: true
+    client.setQuality("hd");
+    expect(client.getState().qualityPreset).toBe("hd");
+    const hdCmd = JSON.parse(pc.dc!.sent[pc.dc!.sent.length - 1]!) as {
+      type: string;
+      command: { action: string; quality: Record<string, unknown> };
+    };
+    expect(hdCmd.type).toBe("control.cmd");
+    expect(hdCmd.command).toEqual({ action: "quality", quality: QUALITY_PRESETS.hd });
+
+    client.setQuality("auto");
+    expect(client.getState().qualityPreset).toBe("auto");
+    const autoCmd = JSON.parse(pc.dc!.sent[pc.dc!.sent.length - 1]!) as {
+      type: string;
+      command: { action: string; quality: Record<string, unknown> };
+    };
+    expect(autoCmd.type).toBe("control.cmd");
+    expect(autoCmd.command).toEqual({ action: "quality", quality: QUALITY_PRESETS.auto });
+    expect(autoCmd.command.quality.auto).toBe(true);
+
+    client.disconnect();
+  });
+
+  it("applies clean hysteresis step-down/step-up in ws-jpeg auto mode without thrashing and leaves fixed presets untouched", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+
+    const client = new RemoteClient("ctrl-ws-auto");
+    client.connectWithAccount({
+      wsUrl: "wss://velodeck.example.com/ws",
+      authToken: "jwt-valid",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      preferredTransport: "ws-jpeg",
+    });
+
+    const ws = FakeWebSocket.instances[0]!;
+    ws.emitOpen();
+    ws.emitJson({
+      type: "controller.authed",
+      clientId: "ctrl-ws-auto",
+      serverTime: Date.now(),
+      mode: "relay",
+      authType: "account",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      devices: [makeDeviceSummary({ mediaProjection: true, webrtc: false })],
+      iceServers: [],
+    });
+
+    client.startSession("dev-1", { preferredTransport: "ws-jpeg" });
+    const sessId = client.getState().sessionId!;
+    ws.emitJson({
+      type: "session.ready",
+      sessionId: sessId,
+      deviceId: "dev-1",
+      transport: "ws-jpeg",
+      screenWidth: 1080,
+      screenHeight: 2400,
+      rotation: 0,
+    });
+
+    const qualityCmds = () =>
+      parseSentMessages(ws).filter(
+        (m) =>
+          m.type === "control.cmd" &&
+          (m.command as { action?: string } | undefined)?.action === "quality",
+      );
+
+    // Single high-RTT spike does NOT step down (no thrashing)
+    ws.emitJson({ type: "pong", ts: Date.now() - 280 });
+    expect(qualityCmds()).toHaveLength(0);
+
+    // Deadband sample resets streak
+    ws.emitJson({ type: "pong", ts: Date.now() - 150 });
+    ws.emitJson({ type: "pong", ts: Date.now() - 280 });
+    expect(qualityCmds()).toHaveLength(0);
+
+    // Second consecutive high-RTT sample steps down to eco (preserving auto: true)
+    ws.emitJson({ type: "pong", ts: Date.now() - 300 });
+    expect(qualityCmds()).toHaveLength(1);
+    expect(qualityCmds()[0]?.command).toEqual({
+      action: "quality",
+      quality: { ...QUALITY_PRESETS.eco, auto: true },
+    });
+    expect(client.getState().qualityPreset).toBe("auto");
+
+    // Low-RTT pongs within 10s cooldown do NOT step back up prematurely
+    ws.emitJson({ type: "pong", ts: Date.now() - 40 });
+    ws.emitJson({ type: "pong", ts: Date.now() - 40 });
+    ws.emitJson({ type: "pong", ts: Date.now() - 40 });
+    expect(qualityCmds()).toHaveLength(1);
+
+    // After 10s cooldown, next healthy pong steps back up to QUALITY_PRESETS.auto
+    vi.advanceTimersByTime(10_500);
+    ws.emitJson({ type: "pong", ts: Date.now() - 40 });
+    expect(qualityCmds()).toHaveLength(2);
+    expect(qualityCmds()[1]?.command).toEqual({
+      action: "quality",
+      quality: QUALITY_PRESETS.auto,
+    });
+
+    // Fixed preset ("balanced") never triggers auto-step-down
+    client.setQuality("balanced");
+    const countAfterManual = qualityCmds().length;
+    vi.advanceTimersByTime(15_000);
+    ws.emitJson({ type: "pong", ts: Date.now() - 400 });
+    ws.emitJson({ type: "pong", ts: Date.now() - 400 });
+    ws.emitJson({ type: "pong", ts: Date.now() - 400 });
+    expect(qualityCmds()).toHaveLength(countAfterManual);
+
     client.disconnect();
   });
 });

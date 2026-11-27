@@ -1590,41 +1590,11 @@ export function RemoteViewport({
               </span>
             </button>
 
-            <div>
-              <p className="mb-2 text-xs font-medium text-zinc-400">画质预设</p>
-              <div className="grid grid-cols-3 gap-2">
-                {(
-                  [
-                    { id: "eco", title: "省流", desc: "540p · 30fps" },
-                    { id: "balanced", title: "均衡", desc: "900p · 60fps" },
-                    { id: "hd", title: "高清", desc: "1080p · 60fps" },
-                  ] as Array<{ id: QualityPreset; title: string; desc: string }>
-                ).map((preset) => {
-                  const active = clientState.qualityPreset === preset.id;
-                  return (
-                    <button
-                      key={preset.id}
-                      type="button"
-                      onClick={() => client.setQuality(preset.id)}
-                      className={`rounded-lg border px-2 py-2 text-center transition ${
-                        active
-                          ? "border-[#2563EB] bg-[#2563EB] text-white"
-                          : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
-                      }`}
-                    >
-                      <div className="text-xs font-semibold">{preset.title}</div>
-                      <div
-                        className={`mt-0.5 font-mono text-[10px] ${
-                          active ? "text-blue-100" : "text-zinc-400"
-                        }`}
-                      >
-                        {preset.desc}
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            <QualityPresetSelector
+              client={client}
+              qualityPreset={clientState.qualityPreset}
+              activeTransport={clientState.activeTransport}
+            />
 
             <div>
               <p className="mb-2 text-xs font-medium text-zinc-400">传输通道</p>
@@ -1839,6 +1809,72 @@ const TelemetryCapsule = memo(function TelemetryCapsule({
           )}
         </span>
       </button>
+    </div>
+  );
+});
+
+const QualityPresetSelector = memo(function QualityPresetSelector({
+  client,
+  qualityPreset,
+  activeTransport,
+}: {
+  client: RemoteClient;
+  qualityPreset: QualityPreset;
+  activeTransport: TransportMode | null;
+}) {
+  const telemetry = useSyncExternalStore(
+    client.subscribeTelemetry,
+    client.getTelemetrySnapshot,
+  );
+
+  const wt = telemetry.webrtcTelemetry;
+  const liveShortSide =
+    wt && wt.width > 0
+      ? wt.height > 0
+        ? Math.min(wt.width, wt.height)
+        : wt.width
+      : 0;
+  const autoDesc =
+    qualityPreset === "auto" && activeTransport === "webrtc" && liveShortSide > 0
+      ? `${liveShortSide}p · ${telemetry.fps > 2 ? `${telemetry.fps}fps` : "自适应"}`
+      : "自适应网速";
+
+  const presets: Array<{ id: QualityPreset; title: string; desc: string }> = [
+    { id: "auto", title: "智能", desc: autoDesc },
+    { id: "eco", title: "省流", desc: "540p · 30fps" },
+    { id: "balanced", title: "均衡", desc: "900p · 60fps" },
+    { id: "hd", title: "高清", desc: "1080p · 60fps" },
+  ];
+
+  return (
+    <div>
+      <p className="mb-2 text-xs font-medium text-zinc-400">画质预设</p>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        {presets.map((preset) => {
+          const active = qualityPreset === preset.id;
+          return (
+            <button
+              key={preset.id}
+              type="button"
+              onClick={() => client.setQuality(preset.id)}
+              className={`rounded-lg border px-1.5 py-2 text-center transition ${
+                active
+                  ? "border-[#2563EB] bg-[#2563EB] text-white"
+                  : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+              }`}
+            >
+              <div className="text-xs font-semibold">{preset.title}</div>
+              <div
+                className={`mt-0.5 whitespace-nowrap font-mono text-[10px] ${
+                  active ? "text-blue-100" : "text-zinc-400"
+                }`}
+              >
+                {preset.desc}
+              </div>
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 });

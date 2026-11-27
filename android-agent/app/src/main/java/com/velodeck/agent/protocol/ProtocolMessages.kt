@@ -113,12 +113,21 @@ data class StreamQuality(
     val fps: Int,
     val bitrateKbps: Int,
     val jpegQuality: Int,
+    val auto: Boolean = false,
 ) {
     companion object {
+        val AUTO = StreamQuality(maxWidth = 900, fps = 60, bitrateKbps = 4500, jpegQuality = 54, auto = true)
         val ECO = StreamQuality(maxWidth = 540, fps = 30, bitrateKbps = 1600, jpegQuality = 45)
         val BALANCED = StreamQuality(maxWidth = 900, fps = 60, bitrateKbps = 4500, jpegQuality = 54)
         val HD = StreamQuality(maxWidth = 1080, fps = 60, bitrateKbps = 7500, jpegQuality = 64)
     }
+}
+
+object QualityPresets {
+    val AUTO: StreamQuality = StreamQuality.AUTO
+    val ECO: StreamQuality = StreamQuality.ECO
+    val BALANCED: StreamQuality = StreamQuality.BALANCED
+    val HD: StreamQuality = StreamQuality.HD
 }
 
 data class RtcIceCandidateInit(
@@ -977,6 +986,7 @@ object ProtocolCodec {
         put("fps", quality.fps)
         put("bitrateKbps", quality.bitrateKbps)
         put("jpegQuality", quality.jpegQuality)
+        if (quality.auto) put("auto", true)
     }
 
     fun streamQualityFromJson(json: JSONObject): StreamQuality = StreamQuality(
@@ -984,6 +994,7 @@ object ProtocolCodec {
         fps = json.optInt("fps", StreamQuality.BALANCED.fps),
         bitrateKbps = json.optInt("bitrateKbps", StreamQuality.BALANCED.bitrateKbps),
         jpegQuality = json.optInt("jpegQuality", StreamQuality.BALANCED.jpegQuality),
+        auto = json.optBoolean("auto", false),
     )
 
     fun iceServersToJson(servers: List<IceServerConfig>): JSONArray = JSONArray().apply {

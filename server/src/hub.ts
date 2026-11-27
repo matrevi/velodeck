@@ -181,7 +181,8 @@ function isValidStreamQuality(value: unknown): value is StreamQuality {
     q.bitrateKbps > 0 &&
     typeof q.jpegQuality === "number" &&
     Number.isFinite(q.jpegQuality) &&
-    q.jpegQuality > 0
+    q.jpegQuality > 0 &&
+    (q.auto === undefined || typeof q.auto === "boolean")
   );
 }
 
@@ -2337,17 +2338,19 @@ export class VeloDeckHub {
       detail: msg.preferredTransport,
     });
 
+    const forwardedQuality: StreamQuality = {
+      maxWidth: msg.quality.maxWidth,
+      fps: msg.quality.fps,
+      bitrateKbps: msg.quality.bitrateKbps,
+      jpegQuality: msg.quality.jpegQuality,
+      ...(typeof msg.quality.auto === "boolean" ? { auto: msg.quality.auto } : {}),
+    };
     const forwarded: SessionRequestMessage = {
       type: "session.request",
       sessionId: msg.sessionId,
       deviceId: msg.deviceId,
       preferredTransport: msg.preferredTransport,
-      quality: {
-        maxWidth: msg.quality.maxWidth,
-        fps: msg.quality.fps,
-        bitrateKbps: msg.quality.bitrateKbps,
-        jpegQuality: msg.quality.jpegQuality,
-      },
+      quality: forwardedQuality,
       iceServers: buildIceServers(this.config, `agent-${msg.deviceId}`, now),
     };
     this.sendJson(live.conn.ws, forwarded);

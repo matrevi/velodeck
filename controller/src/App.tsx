@@ -242,7 +242,7 @@ export function App() {
           authToken: storedAccount.authToken,
           user: storedAccount.user,
           preferredTransport: defaultTransport,
-          qualityPreset: "balanced",
+          qualityPreset: "auto",
         });
       }
       return;
@@ -298,7 +298,7 @@ export function App() {
         pending.autoStarted = true;
         client.startSession(target.deviceId, {
           preferredTransport: defaultTransport,
-          qualityPreset: "balanced",
+          qualityPreset: "auto",
         });
       }
     } else if (!clientState.activeDeviceId) {
@@ -357,7 +357,7 @@ export function App() {
       controlCode: cleanCode,
       controlPassword: input.controlPassword,
       preferredTransport: defaultTransport,
-      qualityPreset: "balanced",
+      qualityPreset: "auto",
     });
   }
 
@@ -403,7 +403,7 @@ export function App() {
       authToken: session.authToken,
       user: session.user,
       preferredTransport: defaultTransport,
-      qualityPreset: "balanced",
+      qualityPreset: "auto",
     });
 
     if (isRegister) {
@@ -466,7 +466,7 @@ export function App() {
       authToken: updatedSession.authToken,
       user: updatedSession.user,
       preferredTransport: clientState.desiredTransport ?? defaultTransport,
-      qualityPreset: clientState.qualityPreset ?? "balanced",
+      qualityPreset: clientState.qualityPreset ?? "auto",
     });
     showToast("info", "密码已修改，其他设备登录态已失效");
   }
@@ -504,7 +504,7 @@ export function App() {
         authToken: savedAccount.authToken,
         user: savedAccount.user,
         preferredTransport: defaultTransport,
-        qualityPreset: "balanced",
+        qualityPreset: "auto",
       });
     }
   }
@@ -634,7 +634,7 @@ export function App() {
         authToken: savedAccount.authToken,
         user: savedAccount.user,
         preferredTransport: clientState.desiredTransport ?? defaultTransport,
-        qualityPreset: clientState.qualityPreset ?? "balanced",
+        qualityPreset: clientState.qualityPreset ?? "auto",
       });
       return;
     }

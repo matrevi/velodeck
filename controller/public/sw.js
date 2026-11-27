@@ -1,4 +1,4 @@
-const CACHE_NAME = "velodeck-controller-v5";
+const CACHE_NAME = "velodeck-controller-v6";
 const APP_SHELL_URLS = ["/", "/index.html", "/manifest.webmanifest", "/icon.svg", "/apple-touch-icon.png"];
 const NETWORK_TIMEOUT_MS = 3000;
 

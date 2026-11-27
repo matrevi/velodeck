@@ -55,7 +55,7 @@ export function ConnectionModal({
   const [preferredTransport, setPreferredTransport] = useState<TransportMode>(() =>
     detectDefaultTransport(),
   );
-  const [qualityPreset, setQualityPreset] = useState<QualityPreset>("balanced");
+  const [qualityPreset, setQualityPreset] = useState<QualityPreset>("auto");
   const [formError, setFormError] = useState<string | null>(null);
   const profilesRef = useRef(profiles);
   profilesRef.current = profiles;
@@ -114,7 +114,7 @@ export function ConnectionModal({
     setWsUrl("");
     setAccessToken("");
     setPreferredTransport(detectDefaultTransport());
-    setQualityPreset("balanced");
+    setQualityPreset("auto");
     setShowToken(false);
     setFormError(null);
   }
@@ -391,7 +391,7 @@ export function ConnectionModal({
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div>
                   <label className="mb-1.5 block text-xs font-medium text-[#374151]">
                     首选通道
@@ -423,9 +423,10 @@ export function ConnectionModal({
                   <label className="mb-1.5 block text-xs font-medium text-[#374151]">
                     默认清晰度
                   </label>
-                  <div className="grid grid-cols-3 gap-1 rounded-lg bg-[#F1F3F6] p-1">
+                  <div className="grid grid-cols-4 gap-1 rounded-lg bg-[#F1F3F6] p-1">
                     {(
                       [
+                        { id: "auto", label: "智能" },
                         { id: "eco", label: "省流" },
                         { id: "balanced", label: "均衡" },
                         { id: "hd", label: "高清" },

@@ -12,6 +12,7 @@ import {
   isPrivateHost,
   isPrivateLanIp,
   isSameOriginWsUrl,
+  loadProfiles,
   normalizeWsUrl,
   parseQuickConnectParams,
   stripQuickConnectParamsFromUrl,
@@ -86,7 +87,7 @@ describe("normalizeWsUrl", () => {
 });
 
 describe("parseQuickConnectParams", () => {
-  it("parses Android Agent direct QR deep-link query params", () => {
+  it("parses Android Agent direct QR deep-link query params with auto quality default", () => {
     const parsed = parseQuickConnectParams(
       "?url=ws%3A%2F%2F100.88.1.9%3A8765%2Fws&token=my-secret-token&mode=direct&label=Pixel+8+Pro",
     );
@@ -97,8 +98,18 @@ describe("parseQuickConnectParams", () => {
       mode: "direct",
       label: "Pixel 8 Pro",
       preferredTransport: "webrtc",
-      qualityPreset: "balanced",
+      qualityPreset: "auto",
     });
+
+    const explicitAuto = parseQuickConnectParams(
+      "?url=wss://relay.velodeck.dev/ws&token=t&quality=auto",
+    );
+    expect(explicitAuto?.qualityPreset).toBe("auto");
+
+    const invalidQuality = parseQuickConnectParams(
+      "?url=wss://relay.velodeck.dev/ws&token=t&quality=ultra4k",
+    );
+    expect(invalidQuality?.qualityPreset).toBe("auto");
   });
 
   it("parses #fragment quick-connect params and prefers fragment over query string", () => {
@@ -352,6 +363,85 @@ describe("profile CRUD and quick-connect upsert", () => {
 
     const afterDelete = deleteProfile(updated.profiles, created.saved.id);
     expect(afterDelete).toEqual([]);
+  });
+
+  it("loads saved profiles with auto preset while keeping backward compatibility for eco/balanced/hd", () => {
+    const data = new Map<string, string>();
+    const storage = {
+      getItem: (k: string) => data.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        data.set(k, v);
+      },
+      removeItem: (k: string) => {
+        data.delete(k);
+      },
+      clear: () => {
+        data.clear();
+      },
+      key: (index: number) => Array.from(data.keys())[index] ?? null,
+      get length() {
+        return data.size;
+      },
+    } as Storage;
+
+    storage.setItem(
+      PROFILES_STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "p-auto",
+          label: "Auto",
+          mode: "relay",
+          wsUrl: "wss://relay.example.com/ws",
+          accessToken: "t1",
+          preferredTransport: "webrtc",
+          qualityPreset: "auto",
+        },
+        {
+          id: "p-eco",
+          label: "Eco",
+          mode: "direct",
+          wsUrl: "ws://192.168.1.2:8765/ws",
+          accessToken: "t2",
+          preferredTransport: "ws-jpeg",
+          qualityPreset: "eco",
+        },
+        {
+          id: "p-balanced",
+          label: "Balanced",
+          mode: "relay",
+          wsUrl: "wss://relay.example.com/ws",
+          accessToken: "t3",
+          preferredTransport: "webrtc",
+          qualityPreset: "balanced",
+        },
+        {
+          id: "p-hd",
+          label: "HD",
+          mode: "relay",
+          wsUrl: "wss://relay.example.com/ws",
+          accessToken: "t4",
+          preferredTransport: "webrtc",
+          qualityPreset: "hd",
+        },
+        {
+          id: "p-invalid",
+          label: "Bad",
+          mode: "relay",
+          wsUrl: "wss://relay.example.com/ws",
+          accessToken: "t5",
+          preferredTransport: "webrtc",
+          qualityPreset: "bogus",
+        },
+      ]),
+    );
+
+    const loaded = loadProfiles(storage);
+    expect(loaded.map((p) => [p.id, p.qualityPreset])).toEqual([
+      ["p-auto", "auto"],
+      ["p-eco", "eco"],
+      ["p-balanced", "balanced"],
+      ["p-hd", "hd"],
+    ]);
   });
 
   it("persists per-tab clientId in sessionStorage (not localStorage) to prevent multi-tab kick storms", () => {

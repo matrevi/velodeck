@@ -192,6 +192,11 @@ const WEBRTC_DISCONNECT_WATCHDOG_MS = 4_000;
 const WEBRTC_ICE_RESTART_TIMEOUT_MS = 5_000;
 const WEBRTC_STATS_INTERVAL_MS = 1_000;
 const WS_JPEG_FPS_DECAY_INTERVAL_MS = 500;
+const WS_JPEG_AUTO_COOLDOWN_MS = 10_000;
+const WS_JPEG_AUTO_STEP_DOWN_RTT_MS = 220;
+const WS_JPEG_AUTO_STEP_UP_RTT_MS = 100;
+const WS_JPEG_AUTO_CONGESTED_STREAK = 2;
+const WS_JPEG_AUTO_HEALTHY_STREAK = 3;
 const POINTER_KEEPALIVE_INTERVAL_MS = 180;
 const POINTER_KEEPALIVE_PAYLOAD = '{"type":"dc.ping"}';
 const POINTER_DC_MAX_BUFFERED_BYTES = 4_096;
@@ -512,6 +517,10 @@ export class RemoteClient {
   private noticeSeq = 0;
   private frameTimestamps: number[] = [];
   private lastFpsEmitAt = 0;
+  private wsJpegAutoTier: "balanced" | "eco" = "balanced";
+  private wsJpegAutoCongestedCount = 0;
+  private wsJpegAutoHealthyCount = 0;
+  private wsJpegAutoLastAdjustAt = 0;
 
   private telemetrySnapshot: RemoteTelemetrySnapshot = {
     rttMs: null,
@@ -561,7 +570,7 @@ export class RemoteClient {
     desiredTransport: detectDefaultTransport(),
     webrtcRoute: null,
     webrtcTelemetry: null,
-    qualityPreset: "balanced",
+    qualityPreset: "auto",
     dataChannelOpen: false,
     fileChannelOpen: false,
     fileTransfer: null,
@@ -670,6 +679,7 @@ export class RemoteClient {
     this.webrtcFallbackInFlight = false;
     this.webrtcDowngradedByAgent = false;
     this.webrtcDowngradedClientSide = false;
+    this.resetWsJpegAutoQuality();
 
     const desiredTransport =
       request.kind === "token"
@@ -678,7 +688,7 @@ export class RemoteClient {
     const qualityPreset =
       request.kind === "token"
         ? request.profile.qualityPreset
-        : request.qualityPreset ?? "balanced";
+        : request.qualityPreset ?? "auto";
     const wsUrl = getRequestWsUrl(request);
 
     this.setState({
@@ -727,6 +737,7 @@ export class RemoteClient {
     this.webrtcFallbackInFlight = false;
     this.webrtcDowngradedByAgent = false;
     this.webrtcDowngradedClientSide = false;
+    this.resetWsJpegAutoQuality();
     this.setState({
       socketStatus: "connecting",
       errorCode: null,
@@ -809,7 +820,7 @@ export class RemoteClient {
       options?.qualityPreset ??
       this.state.qualityPreset ??
       this.state.profile?.qualityPreset ??
-      "balanced";
+      "auto";
 
     if (this.state.sessionId && this.state.activeDeviceId) {
       this.sendJson({
@@ -822,6 +833,7 @@ export class RemoteClient {
 
     this.clearAutoReRequestTimer();
     this.stopWsJpegFpsTimer();
+    this.resetWsJpegAutoQuality();
     this.abortActiveFileTransferSilent();
     this.teardownPeerConnection();
     this.frameTimestamps = [];
@@ -889,6 +901,7 @@ export class RemoteClient {
     this.webrtcFallbackInFlight = false;
     this.webrtcDowngradedByAgent = false;
     this.webrtcDowngradedClientSide = false;
+    this.resetWsJpegAutoQuality();
     this.setState({
       activeDeviceId: null,
       sessionId: null,
@@ -907,12 +920,15 @@ export class RemoteClient {
 
   setQuality(preset: QualityPreset): void {
     const quality: StreamQuality = QUALITY_PRESETS[preset];
+    this.resetWsJpegAutoQuality();
     this.setState({ qualityPreset: preset });
     if (this.state.activeDeviceId && this.state.sessionId) {
       this.sendCommand({ action: "quality", quality });
       this.pushNotice(
         "info",
-        `画质已切换为 ${preset.toUpperCase()} (${quality.maxWidth}p · ${quality.fps}fps)`,
+        preset === "auto"
+          ? "画质已切换为 智能自适应（根据实时网速自动调节）"
+          : `画质已切换为 ${preset.toUpperCase()} (${quality.maxWidth}p · ${quality.fps}fps)`,
       );
     }
   }
@@ -1764,6 +1780,7 @@ export class RemoteClient {
         const rtt = Math.max(0, Date.now() - parsed.ts);
         if (this.state.sessionId) {
           this.setTelemetry({ rttMs: rtt });
+          this.evaluateWsJpegAutoQuality(rtt);
         } else {
           this.setState({ rttMs: rtt });
         }
@@ -2108,6 +2125,7 @@ export class RemoteClient {
     }
 
     this.teardownPeerConnection();
+    this.resetWsJpegAutoQuality();
     this.setState({
       ...basePatch,
       activeTransport: "ws-jpeg",
@@ -2513,6 +2531,7 @@ export class RemoteClient {
     this.webrtcFallbackInFlight = true;
     this.webrtcDowngradedClientSide = false;
     this.teardownPeerConnection();
+    this.resetWsJpegAutoQuality();
 
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.sendJson({
@@ -3465,6 +3484,73 @@ export class RemoteClient {
     } else if (now - this.lastFpsEmitAt >= 500) {
       this.lastFpsEmitAt = now;
       this.setTelemetry({ fps: this.frameTimestamps.length });
+    }
+  }
+
+  private resetWsJpegAutoQuality(): void {
+    this.wsJpegAutoTier = "balanced";
+    this.wsJpegAutoCongestedCount = 0;
+    this.wsJpegAutoHealthyCount = 0;
+    this.wsJpegAutoLastAdjustAt = 0;
+  }
+
+  /**
+   * Receiver-side fallback auto-step-down for ws-jpeg mode (or legacy Android agents):
+   * uses hysteresis (220ms step-down / 100ms step-up), consecutive streak thresholds,
+   * and a 10s cooldown to avoid thrashing. WebRTC Android v1.0.7 handles full
+   * on-device AdaptiveQoSController at 1s granularity and never enters this path.
+   */
+  private evaluateWsJpegAutoQuality(rttMs: number): void {
+    if (
+      this.state.qualityPreset !== "auto" ||
+      this.state.activeTransport !== "ws-jpeg" ||
+      this.state.sessionStatus !== "streaming" ||
+      !this.state.activeDeviceId ||
+      !this.state.sessionId
+    ) {
+      return;
+    }
+
+    const now = Date.now();
+    const cooldownElapsed =
+      this.wsJpegAutoLastAdjustAt === 0 ||
+      now - this.wsJpegAutoLastAdjustAt >= WS_JPEG_AUTO_COOLDOWN_MS;
+
+    if (rttMs >= WS_JPEG_AUTO_STEP_DOWN_RTT_MS) {
+      this.wsJpegAutoCongestedCount += 1;
+      this.wsJpegAutoHealthyCount = 0;
+      if (
+        this.wsJpegAutoTier !== "eco" &&
+        this.wsJpegAutoCongestedCount >= WS_JPEG_AUTO_CONGESTED_STREAK &&
+        cooldownElapsed
+      ) {
+        this.wsJpegAutoTier = "eco";
+        this.wsJpegAutoCongestedCount = 0;
+        this.wsJpegAutoLastAdjustAt = now;
+        this.sendCommand({
+          action: "quality",
+          quality: { ...QUALITY_PRESETS.eco, auto: true },
+        });
+      }
+    } else if (rttMs <= WS_JPEG_AUTO_STEP_UP_RTT_MS) {
+      this.wsJpegAutoHealthyCount += 1;
+      this.wsJpegAutoCongestedCount = 0;
+      if (
+        this.wsJpegAutoTier === "eco" &&
+        this.wsJpegAutoHealthyCount >= WS_JPEG_AUTO_HEALTHY_STREAK &&
+        cooldownElapsed
+      ) {
+        this.wsJpegAutoTier = "balanced";
+        this.wsJpegAutoHealthyCount = 0;
+        this.wsJpegAutoLastAdjustAt = now;
+        this.sendCommand({
+          action: "quality",
+          quality: QUALITY_PRESETS.auto,
+        });
+      }
+    } else {
+      this.wsJpegAutoCongestedCount = 0;
+      this.wsJpegAutoHealthyCount = 0;
     }
   }
 

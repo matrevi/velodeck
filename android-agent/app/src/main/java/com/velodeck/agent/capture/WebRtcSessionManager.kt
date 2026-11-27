@@ -143,10 +143,15 @@ class WebRtcSessionManager(
     private var lastAdaptedHeight: Int = 0
     private var lastStatsBytesSent: Long = 0L
     private var lastStatsTimestampMs: Long = 0L
+    private var lastLogBytesSent: Long = 0L
+    private var lastLogTimestampMs: Long = 0L
+    private var lastStatsRetransmitted: Long = -1L
     private var statsPollTick: Int = 0
     private var isActiveRouteTurn: Boolean = false
-    private val rttCongestionGuard = RttCongestionGuard()
+    private val adaptiveQos = AdaptiveQoSController()
     private var lastAppliedMaxBitrateKbps: Int = 0
+    private var lastAppliedMaxFps: Int = 0
+    private var activeAutoMaxWidth: Int = 0
 
     val isAvailable: Boolean
         get() = !initFailed.get() && ensureInitialized()
@@ -229,6 +234,7 @@ class WebRtcSessionManager(
         // Tear down any previous session sequentially on rtcExecutor without holding locks across JNI
         closeSessionInternal()
         resetAdaptiveRateState()
+        activeAutoMaxWidth = if (quality.auto) quality.maxWidth else 0
         if (cancelled.get()) {
             Log.w(TAG, "startSessionOnExecutor($sessionId) aborted after closing previous session")
             return false
@@ -299,19 +305,11 @@ class WebRtcSessionManager(
                             try {
                                 rtcExecutor.execute {
                                     if (activeSessionId == sessionId) {
-                                        val effectiveOverride = if (isActiveRouteTurn || rttCongestionGuard.scale < 1.0) {
-                                            val routeMax = LowLatencyEncoderMath.computeRouteMaxBitrateKbps(
-                                                resolveTargetBitrateKbps(activeQuality),
-                                                isActiveRouteTurn,
-                                            )
-                                            rttCongestionGuard.applyScale(routeMax, rttCongestionGuard.scale)
-                                        } else {
-                                            null
-                                        }
                                         applyVideoSenderParameters(
                                             videoSender,
                                             activeQuality,
-                                            maxKbpsOverride = effectiveOverride,
+                                            maxKbpsOverride = lastAppliedMaxBitrateKbps.takeIf { it > 0 },
+                                            maxFpsOverride = lastAppliedMaxFps.takeIf { it > 0 },
                                         )
                                         forceCaptureFrameOnExecutor()
                                         startStatsLogger(sessionId)
@@ -628,14 +626,30 @@ class WebRtcSessionManager(
                     activeQuality = quality
                     Quad(videoSource, surfaceTextureHelper, captureSurface, videoSender)
                 }
-                resetAdaptiveRateState(resetStatsTick = false)
+                resetAdaptiveRateState(resetStatsTick = false, preserveRoute = true)
                 if (src == null || sth == null || surf == null) return@execute
-                val (w, h) = captureManager.computeTargetDimensions(quality.maxWidth)
+                val initialMaxWidth = if (quality.auto && isActiveRouteTurn) {
+                    AutoResolutionTier.SMOOTH.maxWidth
+                } else {
+                    quality.maxWidth
+                }
+                val initialFps = if (quality.auto && isActiveRouteTurn) {
+                    AutoResolutionTier.SMOOTH.nominalFps
+                } else {
+                    resolveTargetFps(quality)
+                }
+                activeAutoMaxWidth = if (quality.auto) initialMaxWidth else 0
+                val (w, h) = captureManager.computeTargetDimensions(initialMaxWidth)
                 lastAdaptedWidth = w
                 lastAdaptedHeight = h
                 sth.setTextureSize(w, h)
-                src.adaptOutputFormat(w, h, resolveTargetFps(quality))
-                applyVideoSenderParameters(sender, quality)
+                src.adaptOutputFormat(w, h, initialFps)
+                applyVideoSenderParameters(
+                    sender = sender,
+                    quality = quality,
+                    maxKbpsOverride = AdaptiveQoSController.initialStartBitrateKbps(quality, isActiveRouteTurn),
+                    maxFpsOverride = initialFps,
+                )
                 captureManager.attachExternalSurface(surf, w, h)
                 encoderFactory?.requestSyncFrame()
                 forceCaptureFrameOnExecutor()
@@ -652,14 +666,24 @@ class WebRtcSessionManager(
                     Quint(activeSessionId, activeQuality, videoSource, surfaceTextureHelper, captureSurface)
                 }
                 if (sid == null || src == null || sth == null || surf == null) return@execute
-                val (w, h) = captureManager.computeTargetDimensions(quality.maxWidth)
+                val effectiveMaxWidth = if (quality.auto && activeAutoMaxWidth > 0) {
+                    activeAutoMaxWidth
+                } else {
+                    quality.maxWidth
+                }
+                val effectiveFps = if (lastAppliedMaxFps > 0) {
+                    lastAppliedMaxFps
+                } else {
+                    resolveTargetFps(quality)
+                }
+                val (w, h) = captureManager.computeTargetDimensions(effectiveMaxWidth)
                 if (w == lastAdaptedWidth && h == lastAdaptedHeight) {
                     return@execute
                 }
                 lastAdaptedWidth = w
                 lastAdaptedHeight = h
                 sth.setTextureSize(w, h)
-                src.adaptOutputFormat(w, h, resolveTargetFps(quality))
+                src.adaptOutputFormat(w, h, effectiveFps)
                 captureManager.attachExternalSurface(surf, w, h)
                 Log.i(TAG, "Adapted WebRTC capture surface after orientation/content resize (${w}x${h})")
             }
@@ -668,21 +692,16 @@ class WebRtcSessionManager(
     }
 
     private fun resolveTargetFps(quality: StreamQuality): Int {
+        // In auto mode, allow AdaptiveQoSController to control FPS (20..60) cleanly without forcing 30->60
+        if (quality.auto) {
+            return quality.fps.coerceIn(AdaptiveQoSController.MIN_AUTO_FPS, 60)
+        }
         // Automatically unlock 60fps for 720p+ interactive streams even if an older controller requests 30fps
-        val boosted = if (quality.maxWidth >= 720 && quality.fps in 24..30) 60 else quality.fps
-        return boosted.coerceIn(24, 60)
+        return AdaptiveQoSController.resolveManualTargetFps(quality)
     }
 
-    private fun resolveTargetBitrateKbps(quality: StreamQuality): Int {
-        // Generous crisp bitrates paired with Constrained High (CABAC + 8x8 DCT) & clamped PTS
-        // keep small UI text sharp at 60fps without triggering idle-gap IDR spikes.
-        return when {
-            quality.maxWidth >= 1080 -> quality.bitrateKbps.coerceIn(4_500, 8_000)
-            quality.maxWidth >= 800 -> quality.bitrateKbps.coerceIn(3_000, 5_500)
-            quality.maxWidth >= 720 -> quality.bitrateKbps.coerceIn(2_400, 4_200)
-            else -> quality.bitrateKbps.coerceIn(900, 1_800)
-        }
-    }
+    private fun resolveTargetBitrateKbps(quality: StreamQuality): Int =
+        AdaptiveQoSController.resolveManualBitrateKbps(quality)
 
     /**
      * Injects `x-google-start-bitrate`, `x-google-min-bitrate`, `x-google-max-bitrate`, and `b=AS`
@@ -693,7 +712,11 @@ class WebRtcSessionManager(
     private fun injectSdpBitrateHints(sdp: String, quality: StreamQuality): String {
         val presetMaxKbps = resolveTargetBitrateKbps(quality)
         val startKbps = LowLatencyEncoderMath.computeSdpStartBitrateKbps(presetMaxKbps)
-        val minKbps = LowLatencyEncoderMath.computeSdpMinBitrateKbps(presetMaxKbps)
+        val minKbps = if (quality.auto) {
+            LowLatencyEncoderMath.MIN_BITRATE_BPS / 1_000
+        } else {
+            LowLatencyEncoderMath.computeSdpMinBitrateKbps(presetMaxKbps)
+        }
         return Companion.injectSdpBitrateHints(
             sdp = sdp,
             minKbps = minKbps,
@@ -706,20 +729,38 @@ class WebRtcSessionManager(
         sender: RtpSender?,
         quality: StreamQuality,
         maxKbpsOverride: Int? = null,
+        maxFpsOverride: Int? = null,
     ): Boolean {
         if (sender == null) return false
         return try {
             val params = sender.parameters ?: return false
             // Match ScalingSettings.OFF cleanly: bitrate floors (300-500k) + QP_P_MAX=46 adapt
-            // smoothly on WAN/TURN without resolution reinit glitches or FPS collapses.
+            // smoothly on WAN/TURN without libwebrtc internal resolution reinit glitches.
             params.degradationPreference = RtpParameters.DegradationPreference.DISABLED
             val presetMaxKbps = resolveTargetBitrateKbps(quality)
-            val maxKbps = (maxKbpsOverride ?: presetMaxKbps).coerceAtLeast(300)
+            val defaultMaxKbps = AdaptiveQoSController.initialStartBitrateKbps(quality, isActiveRouteTurn)
+            val maxKbps = (maxKbpsOverride ?: defaultMaxKbps).coerceAtLeast(300)
             val maxBps = maxKbps * 1_000
-            // Adaptive 15% floor (300-600 kbps) clamped <= maxKbps so minBitrateBps <= maxBitrateBps ALWAYS holds
-            val minKbps = minOf(LowLatencyEncoderMath.computeSdpMinBitrateKbps(presetMaxKbps), maxKbps)
+            // Adaptive floor clamped <= maxKbps so minBitrateBps <= maxBitrateBps ALWAYS holds
+            val baseMinKbps = if (quality.auto) {
+                val targetW = if (activeAutoMaxWidth > 0) activeAutoMaxWidth else quality.maxWidth
+                LowLatencyEncoderMath.minBitrateForResolution(targetW, targetW) / 1_000
+            } else {
+                LowLatencyEncoderMath.computeSdpMinBitrateKbps(presetMaxKbps)
+            }
+            val minKbps = minOf(baseMinKbps, maxKbps)
             val minBps = minKbps * 1_000
-            val maxFps = resolveTargetFps(quality)
+            val minAllowedFps = if (quality.auto) {
+                AdaptiveQoSController.MIN_AUTO_FPS
+            } else {
+                AdaptiveQoSController.MIN_MANUAL_FPS
+            }
+            val defaultFps = if (quality.auto && isActiveRouteTurn) {
+                AutoResolutionTier.SMOOTH.nominalFps
+            } else {
+                resolveTargetFps(quality)
+            }
+            val maxFps = (maxFpsOverride ?: defaultFps).coerceIn(minAllowedFps, 60)
             for (encoding in params.encodings) {
                 encoding.maxBitrateBps = maxBps
                 encoding.minBitrateBps = minBps
@@ -730,6 +771,7 @@ class WebRtcSessionManager(
             }
             sender.parameters = params
             lastAppliedMaxBitrateKbps = maxKbps
+            lastAppliedMaxFps = maxFps
             true
         } catch (t: Throwable) {
             Log.w(TAG, "Failed to apply video sender parameters", t)
@@ -786,8 +828,12 @@ class WebRtcSessionManager(
         }
         stopStatsLogger()
         statsLogSessionId = sessionId
+        val nowMs = SystemClock.elapsedRealtime()
         lastStatsBytesSent = 0L
-        lastStatsTimestampMs = SystemClock.elapsedRealtime()
+        lastStatsTimestampMs = nowMs
+        lastLogBytesSent = 0L
+        lastLogTimestampMs = nowMs
+        lastStatsRetransmitted = -1L
         statsPollTick = 0
         val task = object : Runnable {
             override fun run() {
@@ -906,71 +952,135 @@ class WebRtcSessionManager(
                 "pending"
             }
 
-            // 1-second route-aware ceiling & RTT bufferbloat enforcement (runs on rtcExecutor)
+            // 1-second RustDesk-inspired AdaptiveQoSController evaluation (runs on rtcExecutor)
+            val nowMs = SystemClock.elapsedRealtime()
+            val tickDtMs = (nowMs - lastStatsTimestampMs).coerceAtLeast(1L)
+            val tickSendRateKbps = if (lastStatsTimestampMs > 0L && bytesSent >= lastStatsBytesSent) {
+                ((bytesSent - lastStatsBytesSent) * 8L) / tickDtMs
+            } else {
+                0L
+            }
+            lastStatsBytesSent = bytesSent
+            lastStatsTimestampMs = nowMs
+
+            val retxTotal = (retransmitted as? Number)?.toLong() ?: 0L
+            val retxDelta = if (lastStatsRetransmitted >= 0L && retxTotal >= lastStatsRetransmitted) {
+                retxTotal - lastStatsRetransmitted
+            } else {
+                0L
+            }
+            lastStatsRetransmitted = retxTotal
+
+            val currentFps = (fps as? Number)?.toDouble() ?: 0.0
+            val bweKbps = availOutBps?.let { it / 1_000L }
+
             val hasSelectedCandidates = localCand != null || remoteCand != null
             val turnRelay = if (hasSelectedCandidates) {
                 localCand?.get("candidateType") == "relay" || remoteCand?.get("candidateType") == "relay"
             } else {
                 isActiveRouteTurn
             }
-            val prevScale = rttCongestionGuard.scale
-            val scale = if (rttMsInt != null) {
-                rttCongestionGuard.onRttSample(rttMsInt)
-            } else {
-                prevScale
+            val routeChanged = hasSelectedCandidates && (turnRelay != isActiveRouteTurn)
+            if (hasSelectedCandidates) {
+                isActiveRouteTurn = turnRelay
             }
-            val quality = activeQuality
-            val presetMaxKbps = resolveTargetBitrateKbps(quality)
-            val routeMaxKbps = LowLatencyEncoderMath.computeRouteMaxBitrateKbps(presetMaxKbps, turnRelay)
-            val effectiveMaxKbps = rttCongestionGuard.applyScale(routeMaxKbps, scale)
 
-            val routeChanged = turnRelay != isActiveRouteTurn
+            val quality = activeQuality
+            val decision = adaptiveQos.onSample(
+                QosSample(
+                    rttMs = rttMsInt,
+                    bweKbps = bweKbps,
+                    sendRateKbps = tickSendRateKbps,
+                    currentFps = currentFps,
+                    retxDelta = retxDelta,
+                    isTurnRelay = turnRelay,
+                    autoMode = quality.auto,
+                    baseQuality = quality,
+                    nowElapsedMs = nowMs,
+                ),
+            )
+
             val prevAppliedMaxKbps = lastAppliedMaxBitrateKbps
+            val prevAppliedMaxFps = lastAppliedMaxFps
             val deltaThresholdKbps = maxOf(100, prevAppliedMaxKbps / 20)
-            if (routeChanged || abs(effectiveMaxKbps - prevAppliedMaxKbps) >= deltaThresholdKbps) {
+            val bitrateChanged = abs(decision.maxBitrateKbps - prevAppliedMaxKbps) >= deltaThresholdKbps
+            val fpsChanged = decision.maxFps != prevAppliedMaxFps
+
+            var surfaceResized = false
+            if (decision.resolutionChanged && quality.auto) {
+                val src = videoSource
+                val sth = surfaceTextureHelper
+                val surf = captureSurface
+                activeAutoMaxWidth = decision.targetMaxWidth
+                if (src != null && sth != null && surf != null) {
+                    val (w, h) = captureManager.computeTargetDimensions(decision.targetMaxWidth)
+                    if (w != lastAdaptedWidth || h != lastAdaptedHeight) {
+                        lastAdaptedWidth = w
+                        lastAdaptedHeight = h
+                        sth.setTextureSize(w, h)
+                        src.adaptOutputFormat(w, h, decision.maxFps)
+                        captureManager.attachExternalSurface(surf, w, h)
+                        encoderFactory?.requestSyncFrame()
+                        forceCaptureFrameOnExecutor()
+                        surfaceResized = true
+                        Log.i(
+                            TAG,
+                            "AutoQoS resolution -> ${w}x${h} @ ${decision.maxFps}fps " +
+                                "(${decision.maxBitrateKbps}kbps, reason=${decision.reason})",
+                        )
+                    } else if (fpsChanged) {
+                        src.adaptOutputFormat(w, h, decision.maxFps)
+                    }
+                }
+            } else if (fpsChanged && lastAdaptedWidth > 0 && lastAdaptedHeight > 0) {
+                videoSource?.adaptOutputFormat(lastAdaptedWidth, lastAdaptedHeight, decision.maxFps)
+            }
+
+            if (routeChanged || bitrateChanged || fpsChanged || surfaceResized) {
                 val applied = applyVideoSenderParameters(
                     sender = videoSender,
                     quality = quality,
-                    maxKbpsOverride = effectiveMaxKbps,
+                    maxKbpsOverride = decision.maxBitrateKbps,
+                    maxFpsOverride = decision.maxFps,
                 )
                 if (applied) {
-                    isActiveRouteTurn = turnRelay
                     val routeTag = if (turnRelay) "TURN" else "P2P"
-                    val reason = when {
+                    val reason = decision.reason ?: when {
                         routeChanged && turnRelay -> "TURN_CEILING"
                         routeChanged -> "P2P_UNLOCK"
-                        scale < prevScale -> "RTT_BACKOFF"
-                        scale > prevScale -> "RTT_RECOVERY"
                         else -> "ADAPT"
                     }
-                    val baseDesc = rttCongestionGuard.baselineRttMs?.let { "${it}ms" } ?: "--"
+                    val baseDesc = adaptiveQos.baselineRttMs?.let { "${it}ms" } ?: "--"
                     Log.i(
                         TAG,
-                        "Adaptive bitrate ($sessionId): $reason ${prevAppliedMaxKbps}->${effectiveMaxKbps}kbps " +
-                            "(route=$routeTag preset=${presetMaxKbps}kbps routeCap=${routeMaxKbps}kbps " +
-                            "scale=${"%.2f".format(scale)} rtt=$rttMs base=$baseDesc)",
+                        "Adaptive QoS ($sessionId): $reason ${prevAppliedMaxKbps}->${decision.maxBitrateKbps}kbps " +
+                            "${prevAppliedMaxFps}->${decision.maxFps}fps (route=$routeTag auto=${quality.auto} " +
+                            "tier=${adaptiveQos.currentTier.name} scale=${"%.2f".format(adaptiveQos.bitrateScale)} " +
+                            "rtt=$rttMs base=$baseDesc bwe=$availOutDesc retxDelta=$retxDelta)",
                     )
                 }
             }
 
             // Log full WebRtcStats summary every 3rd tick (= 3s) so logcat stays quiet
             if (statsPollTick % STATS_LOG_EVERY_N_TICKS == 0) {
-                val nowMs = SystemClock.elapsedRealtime()
-                val dtMs = (nowMs - lastStatsTimestampMs).coerceAtLeast(1L)
-                val kbps = if (bytesSent >= lastStatsBytesSent) {
-                    ((bytesSent - lastStatsBytesSent) * 8L) / dtMs
+                val logDtMs = (nowMs - lastLogTimestampMs).coerceAtLeast(1L)
+                val kbps = if (bytesSent >= lastLogBytesSent) {
+                    ((bytesSent - lastLogBytesSent) * 8L) / logDtMs
                 } else {
                     0L
                 }
-                lastStatsBytesSent = bytesSent
-                lastStatsTimestampMs = nowMs
+                lastLogBytesSent = bytesSent
+                lastLogTimestampMs = nowMs
 
                 val routeTag = if (turnRelay) "TURN" else "P2P"
+                val baseDesc = adaptiveQos.baselineRttMs?.let { "${it}ms" } ?: "--"
                 Log.i(
                     TAG,
-                    "WebRtcStats($sessionId): ${width}x${height} fps=$fps rate=${kbps}kbps cap=${effectiveMaxKbps}kbps " +
-                        "bwe=$availOutDesc rtt=$rttMs scale=${"%.2f".format(scale)} route=$routeTag " +
-                        "retx=$retransmitted limit=$qualityLimit enc=$encoderImpl pair=$pairDesc",
+                    "WebRtcStats($sessionId): ${width}x${height} fps=$fps/${decision.maxFps} rate=${kbps}kbps " +
+                        "cap=${decision.maxBitrateKbps}kbps bwe=$availOutDesc rtt=$rttMs base=$baseDesc " +
+                        "scale=${"%.2f".format(adaptiveQos.bitrateScale)} tier=${adaptiveQos.currentTier.name} " +
+                        "auto=${quality.auto} route=$routeTag retx=$retransmitted(+$retxDelta) " +
+                        "limit=$qualityLimit enc=$encoderImpl pair=$pairDesc",
                 )
             }
         } catch (_: Throwable) {
@@ -1093,12 +1203,24 @@ class WebRtcSessionManager(
         }
     }
 
-    private fun resetAdaptiveRateState(resetStatsTick: Boolean = true) {
-        isActiveRouteTurn = false
-        rttCongestionGuard.reset()
+    private fun resetAdaptiveRateState(
+        resetStatsTick: Boolean = true,
+        preserveRoute: Boolean = false,
+    ) {
+        if (!preserveRoute) {
+            isActiveRouteTurn = false
+        }
+        adaptiveQos.reset(nowElapsedMs = SystemClock.elapsedRealtime())
         lastAppliedMaxBitrateKbps = 0
+        lastAppliedMaxFps = 0
+        activeAutoMaxWidth = 0
         if (resetStatsTick) {
             statsPollTick = 0
+            lastStatsBytesSent = 0L
+            lastStatsTimestampMs = 0L
+            lastLogBytesSent = 0L
+            lastLogTimestampMs = 0L
+            lastStatsRetransmitted = -1L
         }
     }
 

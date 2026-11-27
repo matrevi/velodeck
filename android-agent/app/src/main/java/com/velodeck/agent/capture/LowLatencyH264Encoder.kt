@@ -11,6 +11,7 @@ import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import com.velodeck.agent.protocol.StreamQuality
 import org.webrtc.EglBase
 import org.webrtc.EglBase14
 import org.webrtc.EncodedImage
@@ -96,11 +97,11 @@ internal object LowLatencyEncoderMath {
     }
 
     /**
-     * Scales the maximum motion codec PTS step to match the active encoder frame rate (`24..60 fps`)
-     * so 30fps ECO streams receive `33.33ms` nominal budget instead of `16.67ms` PTS starvation.
+     * Scales the maximum motion codec PTS step to match the active encoder frame rate (`20..60 fps`)
+     * so 30fps ECO / 20fps Auto streams receive proper nominal frame budgets without PTS starvation.
      */
     fun maxFrameDeltaNsForFps(targetFps: Int): Long =
-        1_000_000_000L / targetFps.coerceIn(24, 60)
+        1_000_000_000L / targetFps.coerceIn(20, 60)
 
     /**
      * Computes the next clamped monotonic codec PTS (in nanoseconds) given the previous real frame
@@ -441,6 +442,625 @@ internal class RttCongestionGuard {
 }
 
 /**
+ * Hysteretic auto-mode resolution & ceiling tiers (RustDesk `video_qos.rs` principles).
+ */
+internal enum class AutoResolutionTier(
+    val maxWidth: Int,
+    val nominalFps: Int,
+    val p2pCeilingKbps: Int,
+    val turnCeilingKbps: Int,
+) {
+    LOW(540, 30, 1_400, 950),        // weak cellular / severe congestion
+    SMOOTH(720, 45, 2_800, 1_500),   // moderate WAN / constrained TURN
+    BALANCED(900, 60, 4_500, 2_100), // fast TURN / normal Wi-Fi
+    ULTRA(1080, 60, 7_500, 2_500);   // fast LAN P2P (>= 5.5 Mbps)
+
+    fun ceilingKbps(isTurnRelay: Boolean): Int =
+        if (isTurnRelay) turnCeilingKbps else p2pCeilingKbps
+
+    companion object {
+        fun forMaxWidth(maxWidth: Int): AutoResolutionTier = when {
+            maxWidth >= ULTRA.maxWidth -> ULTRA
+            maxWidth >= BALANCED.maxWidth -> BALANCED
+            maxWidth >= SMOOTH.maxWidth -> SMOOTH
+            else -> LOW
+        }
+    }
+}
+
+/**
+ * 1-second telemetry snapshot fed into [AdaptiveQoSController].
+ */
+internal data class QosSample(
+    val rttMs: Int?,
+    val bweKbps: Long?,
+    val sendRateKbps: Long,
+    val currentFps: Double,
+    val retxDelta: Long,
+    val isTurnRelay: Boolean,
+    val autoMode: Boolean,
+    val baseQuality: StreamQuality,
+    val nowElapsedMs: Long,
+)
+
+/**
+ * Actionable encoder/sender target emitted by [AdaptiveQoSController].
+ */
+internal data class QosDecision(
+    val maxBitrateKbps: Int,
+    val maxFps: Int,
+    val targetMaxWidth: Int,
+    val resolutionChanged: Boolean,
+    val reason: String?,
+)
+
+/**
+ * Pure, Android-free RustDesk-inspired (`src/server/video_qos.rs`) adaptive video QoS controller.
+ *
+ * Implements:
+ * 1. **20-sample sliding baseline RTT window** (`RttCalculator`): tightens immediately on lower
+ *    RTTs and naturally expires stale Wi-Fi minima after 20 fresh samples during Wi-Fi -> 5G handoff.
+ * 2. **2-stage Bitrate-First -> FPS-Second congestion control** with single-jitter immunity
+ *    (RustDesk PR #16082), immediate emergency cuts (`excess >= 220ms || rtt >= 300ms`), and
+ *    retransmission-burst awareness (`retxDelta >= 12`).
+ * 3. **Dynamic-screen guard** (`currentFps >= 3.0 || sendRateKbps >= 180`): prevents static idle
+ *    screens from inflating quality only to burst on motion.
+ * 4. **Startup acceleration** (`auto` mode): opens cleanly at `1.5-1.8 Mbps` and ramps rapidly on
+ *    2 consecutive clean samples (`excess < 40ms && retxDelta <= 2`).
+ * 5. **Fast-restore with 5-sample rollback guard**: jumps FPS/bitrate back toward pre-congestion
+ *    levels once queues clear, rolling back immediately if congestion returns within 5 samples.
+ * 6. **Hysteretic auto resolution scaling** (`autoMode == true` only, strict `8_000ms` cooldown):
+ *    switches smoothly across `LOW (540p)` / `SMOOTH (720p)` / `BALANCED (900p)` / `ULTRA (1080p)`
+ *    while manual modes (`autoMode == false`) NEVER alter user-selected resolution.
+ */
+internal class AdaptiveQoSController {
+    private val rttWindow = ArrayDeque<Int>(RTT_WINDOW_SIZE)
+
+    var baselineRttMs: Int? = null
+        private set
+    var bitrateScale: Double = 1.0
+        private set
+    var targetFps: Int = 60
+        private set
+    var currentTier: AutoResolutionTier = AutoResolutionTier.BALANCED
+        private set
+    var startupActive: Boolean = false
+        private set
+    var badStreak: Int = 0
+        private set
+    var cleanStreak: Int = 0
+        private set
+    var lowBwStreak: Int = 0
+        private set
+    var samplesSinceRestore: Int? = null
+        private set
+
+    private var initialized: Boolean = false
+    private var lastAutoMode: Boolean = false
+    private var lastBaseMaxWidth: Int = 0
+    private var lastBaseFps: Int = 60
+    private var lastBaseBitrateKbps: Int = 0
+    private var lastIsTurnRelay: Boolean = false
+    private var startupCleanStreak: Int = 0
+    private var recoveryCleanStreak: Int = 0
+    private var preCongestionScale: Double? = null
+    private var preCongestionFps: Int? = null
+    private var lastRestoreScale: Double = 1.0
+    private var lastRestoreFps: Int = 60
+    private var lastResolutionChangeMs: Long = Long.MIN_VALUE
+    private var explicitResetElapsedMs: Long = Long.MIN_VALUE
+
+    fun reset(nowElapsedMs: Long = Long.MIN_VALUE) {
+        rttWindow.clear()
+        baselineRttMs = null
+        bitrateScale = 1.0
+        targetFps = 60
+        currentTier = AutoResolutionTier.BALANCED
+        startupActive = false
+        badStreak = 0
+        cleanStreak = 0
+        lowBwStreak = 0
+        samplesSinceRestore = null
+        initialized = false
+        lastAutoMode = false
+        lastBaseMaxWidth = 0
+        lastBaseFps = 60
+        lastBaseBitrateKbps = 0
+        lastIsTurnRelay = false
+        startupCleanStreak = 0
+        recoveryCleanStreak = 0
+        preCongestionScale = null
+        preCongestionFps = null
+        lastRestoreScale = 1.0
+        lastRestoreFps = 60
+        lastResolutionChangeMs = nowElapsedMs
+        explicitResetElapsedMs = nowElapsedMs
+    }
+
+    fun onSample(sample: QosSample): QosDecision {
+        var initResolutionChanged = false
+        var reason: String? = null
+
+        val presetChanged = !initialized ||
+            sample.autoMode != lastAutoMode ||
+            (!sample.autoMode && (
+                sample.baseQuality.maxWidth != lastBaseMaxWidth ||
+                    sample.baseQuality.fps != lastBaseFps ||
+                    sample.baseQuality.bitrateKbps != lastBaseBitrateKbps
+                ))
+
+        if (presetChanged) {
+            initialized = true
+            lastAutoMode = sample.autoMode
+            lastBaseMaxWidth = sample.baseQuality.maxWidth
+            lastBaseFps = sample.baseQuality.fps
+            lastBaseBitrateKbps = sample.baseQuality.bitrateKbps
+            lastIsTurnRelay = sample.isTurnRelay
+            badStreak = 0
+            cleanStreak = 0
+            recoveryCleanStreak = 0
+            lowBwStreak = 0
+            preCongestionScale = null
+            preCongestionFps = null
+            samplesSinceRestore = null
+            startupCleanStreak = 0
+
+            if (sample.autoMode) {
+                currentTier = if (sample.isTurnRelay) {
+                    AutoResolutionTier.SMOOTH
+                } else {
+                    AutoResolutionTier.forMaxWidth(sample.baseQuality.maxWidth)
+                }
+                targetFps = currentTier.nominalFps
+                val startKbps = if (sample.isTurnRelay) {
+                    AUTO_TURN_START_BITRATE_KBPS
+                } else {
+                    AUTO_P2P_START_BITRATE_KBPS
+                }
+                val ceiling = currentTier.ceilingKbps(sample.isTurnRelay)
+                bitrateScale = roundScale(
+                    (startKbps.toDouble() / ceiling.toDouble()).coerceIn(MIN_BITRATE_SCALE, 1.0),
+                )
+                startupActive = bitrateScale < 1.0
+                if (currentTier.maxWidth != sample.baseQuality.maxWidth) {
+                    initResolutionChanged = true
+                    reason = "AUTO_INIT_${currentTier.name}"
+                    lastResolutionChangeMs = sample.nowElapsedMs
+                } else {
+                    lastResolutionChangeMs = if (explicitResetElapsedMs != Long.MIN_VALUE) {
+                        explicitResetElapsedMs
+                    } else {
+                        sample.nowElapsedMs
+                    }
+                }
+            } else {
+                currentTier = AutoResolutionTier.forMaxWidth(sample.baseQuality.maxWidth)
+                targetFps = resolveManualTargetFps(sample.baseQuality)
+                bitrateScale = 1.0
+                startupActive = false
+                lastResolutionChangeMs = sample.nowElapsedMs
+            }
+        } else if (sample.isTurnRelay != lastIsTurnRelay) {
+            // Re-normalize startup scale on P2P -> TURN handoff so startup bitrate stays in 1.5 Mbps range
+            if (sample.autoMode && sample.isTurnRelay && startupActive) {
+                val prevCeiling = currentTier.ceilingKbps(false)
+                val newCeiling = currentTier.ceilingKbps(true)
+                val prevEffective = (prevCeiling * bitrateScale).toInt()
+                val targetStart = minOf(maxOf(prevEffective, AUTO_TURN_START_BITRATE_KBPS), newCeiling)
+                bitrateScale = roundScale(
+                    (targetStart.toDouble() / newCeiling.toDouble()).coerceIn(MIN_BITRATE_SCALE, 1.0),
+                )
+                if (bitrateScale >= 1.0) {
+                    startupActive = false
+                }
+            }
+            lastIsTurnRelay = sample.isTurnRelay
+        }
+
+        // 1. Update 20-sample sliding baseline RTT window (RustDesk RttCalculator)
+        val rtt = sample.rttMs?.takeIf { it > 0 }
+        if (rtt != null) {
+            if (rttWindow.size >= RTT_WINDOW_SIZE) {
+                rttWindow.removeFirst()
+            }
+            rttWindow.addLast(rtt)
+            var minSample = Int.MAX_VALUE
+            for (v in rttWindow) {
+                if (v < minSample) minSample = v
+            }
+            baselineRttMs = minSample.coerceIn(MIN_BASELINE_RTT_MS, MAX_BASELINE_RTT_MS)
+        }
+        val baseline = baselineRttMs
+        val excessMs = if (rtt != null && baseline != null) {
+            (rtt - baseline).coerceAtLeast(0)
+        } else {
+            0
+        }
+
+        // 2. Classify motion & network sample health
+        val retxDelta = sample.retxDelta.coerceAtLeast(0L)
+        val isActiveMotion = sample.currentFps >= DYNAMIC_SCREEN_MIN_FPS ||
+            sample.sendRateKbps >= DYNAMIC_SCREEN_MIN_KBPS
+        val ceilingFps = if (sample.autoMode) {
+            currentTier.nominalFps
+        } else {
+            resolveManualTargetFps(sample.baseQuality)
+        }
+        val minFps = if (sample.autoMode) MIN_AUTO_FPS else MIN_MANUAL_FPS
+        val fpsStep = maxOf(6, round(ceilingFps * FPS_REDUCTION_RATIO).toInt())
+
+        val isSevereEmergency = rtt != null &&
+            (excessMs >= SEVERE_EXCESS_MS || rtt >= SEVERE_ABSOLUTE_RTT_MS)
+        val isBadSample = isSevereEmergency ||
+            (rtt != null && (excessMs >= BAD_EXCESS_MS || rtt >= BAD_ABSOLUTE_RTT_MS)) ||
+            retxDelta >= BAD_RETX_DELTA
+        val isStartupClean = !isBadSample &&
+            (rtt != null && excessMs < STARTUP_CLEAN_EXCESS_MS && rtt < BAD_ABSOLUTE_RTT_MS) &&
+            retxDelta <= CLEAN_MAX_RETX_DELTA
+        val isCleanSample = !isBadSample &&
+            (rtt != null && excessMs <= CLEAN_EXCESS_MS && rtt < CLEAN_MAX_ABSOLUTE_RTT_MS) &&
+            retxDelta <= CLEAN_MAX_RETX_DELTA
+
+        // 3. Bitrate-first -> FPS-second congestion control, startup accel, fast-restore & rollback guard
+        if (isBadSample) {
+            badStreak = (badStreak + 1).coerceAtMost(1_000_000)
+            cleanStreak = 0
+            recoveryCleanStreak = 0
+            startupActive = false
+            startupCleanStreak = 0
+
+            val withinRestoreGuard = samplesSinceRestore != null &&
+                samplesSinceRestore!! < RESTORE_GUARD_SAMPLES
+            if (withinRestoreGuard) {
+                bitrateScale = roundScale(
+                    minOf(bitrateScale, lastRestoreScale).coerceAtLeast(MIN_BITRATE_SCALE),
+                )
+                if (isSevereEmergency) {
+                    bitrateScale = roundScale(
+                        (bitrateScale * SEVERE_CUT_FACTOR).coerceAtLeast(MIN_BITRATE_SCALE),
+                    )
+                }
+                targetFps = minOf(targetFps, lastRestoreFps).coerceIn(minFps, ceilingFps)
+                samplesSinceRestore = null
+                preCongestionScale = null
+                preCongestionFps = null
+                reason = "RESTORE_ROLLBACK"
+            } else if (isSevereEmergency) {
+                if (preCongestionScale == null) {
+                    preCongestionScale = bitrateScale
+                    preCongestionFps = targetFps
+                }
+                bitrateScale = roundScale(
+                    (bitrateScale * SEVERE_CUT_FACTOR).coerceAtLeast(MIN_BITRATE_SCALE),
+                )
+                if (badStreak >= FPS_CUT_BAD_STREAK &&
+                    (bitrateScale <= FPS_CUT_SCALE_THRESHOLD || excessMs >= FPS_CUT_SEVERE_EXCESS_MS)
+                ) {
+                    targetFps = (targetFps - fpsStep).coerceAtLeast(minFps)
+                    reason = "EMERGENCY_BITRATE_AND_FPS_CUT"
+                } else {
+                    reason = "EMERGENCY_BITRATE_CUT"
+                }
+            } else if (badStreak == 1) {
+                // Single jitter hiccup (< 220ms excess): hold steady (RustDesk PR #16082)
+                reason = reason ?: "JITTER_HOLD"
+            } else {
+                if (preCongestionScale == null) {
+                    preCongestionScale = bitrateScale
+                    preCongestionFps = targetFps
+                }
+                val cutFactor = if (badStreak >= 3) {
+                    SUSTAINED_BAD_CUT_FACTOR
+                } else {
+                    CONFIRMED_BAD_CUT_FACTOR
+                }
+                bitrateScale = roundScale(
+                    (bitrateScale * cutFactor).coerceAtLeast(MIN_BITRATE_SCALE),
+                )
+                if (badStreak >= FPS_CUT_BAD_STREAK &&
+                    (bitrateScale <= FPS_CUT_SCALE_THRESHOLD || excessMs >= FPS_CUT_SEVERE_EXCESS_MS)
+                ) {
+                    targetFps = (targetFps - fpsStep).coerceAtLeast(minFps)
+                    reason = "CONGESTION_BITRATE_AND_FPS_CUT"
+                } else {
+                    reason = "CONGESTION_BITRATE_CUT"
+                }
+            }
+        } else {
+            badStreak = 0
+            // Advance post-restore watch counter
+            if (samplesSinceRestore != null) {
+                val nextCount = samplesSinceRestore!! + 1
+                samplesSinceRestore = if (nextCount >= RESTORE_GUARD_SAMPLES) null else nextCount
+            }
+
+            // Startup acceleration in auto mode (allowed while startupActive == true)
+            if (startupActive) {
+                if (isStartupClean) {
+                    startupCleanStreak++
+                    if (startupCleanStreak >= STARTUP_CLEAN_STREAK) {
+                        bitrateScale = roundScale((bitrateScale + STARTUP_ACCEL_STEP).coerceAtMost(1.0))
+                        reason = reason ?: "STARTUP_ACCEL"
+                        if (bitrateScale >= 1.0) {
+                            startupActive = false
+                        }
+                    }
+                } else {
+                    startupCleanStreak = 0
+                }
+            }
+
+            if (isCleanSample) {
+                if (isActiveMotion) {
+                    cleanStreak = (cleanStreak + 1).coerceAtMost(1_000_000)
+                }
+                if (isActiveMotion && !startupActive) {
+                    recoveryCleanStreak = (recoveryCleanStreak + 1).coerceAtMost(1_000_000)
+                    val savedFps = preCongestionFps
+                    val savedScale = preCongestionScale
+                    val needsFpsRestore = savedFps != null && targetFps < minOf(savedFps, ceilingFps)
+                    val needsScaleRestore = savedScale != null && bitrateScale < savedScale
+
+                    if ((needsFpsRestore || needsScaleRestore) &&
+                        recoveryCleanStreak >= FAST_RESTORE_CLEAN_STREAK
+                    ) {
+                        lastRestoreFps = targetFps
+                        lastRestoreScale = bitrateScale
+                        if (savedFps != null && targetFps < minOf(savedFps, ceilingFps)) {
+                            targetFps = minOf(savedFps, ceilingFps)
+                        }
+                        if (savedScale != null && bitrateScale < savedScale) {
+                            val boosted = maxOf(
+                                bitrateScale + FAST_RESTORE_SCALE_BOOST,
+                                (bitrateScale + savedScale) / 2.0,
+                            )
+                            bitrateScale = roundScale(minOf(savedScale, boosted).coerceAtMost(1.0))
+                        }
+                        samplesSinceRestore = 0
+                        preCongestionFps = null
+                        preCongestionScale = null
+                        recoveryCleanStreak = 0
+                        reason = "FAST_RESTORE"
+                    } else if (recoveryCleanStreak >= RECOVERY_CLEAN_STREAK) {
+                        var recovered = false
+                        if (targetFps < ceilingFps) {
+                            targetFps = (targetFps + fpsStep).coerceAtMost(ceilingFps)
+                            recovered = true
+                        }
+                        if (bitrateScale < 1.0) {
+                            bitrateScale = roundScale(
+                                (bitrateScale + RECOVERY_SCALE_STEP).coerceAtMost(1.0),
+                            )
+                            recovered = true
+                        }
+                        if (recovered) {
+                            recoveryCleanStreak = 0
+                            reason = reason ?: "RECOVERY"
+                        }
+                    }
+                }
+            } else {
+                // Moderate/hold sample: reset clean streaks without cutting
+                cleanStreak = 0
+                recoveryCleanStreak = 0
+            }
+        }
+
+        // 4. Hysteretic resolution scaling (ONLY when autoMode == true, strict 8_000ms cooldown)
+        var resolutionChanged = initResolutionChanged
+        var effectiveBitrateKbps = computeEffectiveBitrateKbps(sample, currentTier, bitrateScale)
+
+        if (sample.autoMode) {
+            val bwe = sample.bweKbps?.takeIf { it > 0L }
+            val desiredDowngradeTier: AutoResolutionTier? = when {
+                effectiveBitrateKbps < LOW_DOWNGRADE_BITRATE_KBPS ||
+                    (bwe != null && bwe < LOW_DOWNGRADE_BITRATE_KBPS) ->
+                    AutoResolutionTier.LOW
+                effectiveBitrateKbps < SMOOTH_DOWNGRADE_BITRATE_KBPS ||
+                    (bwe != null && bwe < SMOOTH_DOWNGRADE_BITRATE_KBPS) ->
+                    AutoResolutionTier.SMOOTH
+                sample.isTurnRelay && currentTier == AutoResolutionTier.ULTRA ->
+                    AutoResolutionTier.BALANCED
+                else -> null
+            }
+            val needsDowngrade = desiredDowngradeTier != null &&
+                desiredDowngradeTier.ordinal < currentTier.ordinal
+
+            if (isBadSample || needsDowngrade) {
+                lowBwStreak = (lowBwStreak + 1).coerceAtMost(1_000_000)
+            } else {
+                lowBwStreak = 0
+            }
+
+            val cooldownElapsed = lastResolutionChangeMs == Long.MIN_VALUE ||
+                (sample.nowElapsedMs - lastResolutionChangeMs) >= RESOLUTION_COOLDOWN_MS
+
+            if (!initResolutionChanged && cooldownElapsed) {
+                if (needsDowngrade && lowBwStreak >= DOWNGRADE_BAD_STREAK) {
+                    val newTier = desiredDowngradeTier!!
+                    val newCeiling = newTier.ceilingKbps(sample.isTurnRelay)
+                    currentTier = newTier
+                    targetFps = newTier.nominalFps
+                    bitrateScale = roundScale(
+                        (effectiveBitrateKbps.toDouble() / newCeiling.toDouble())
+                            .coerceIn(MIN_BITRATE_SCALE, 1.0),
+                    )
+                    effectiveBitrateKbps = computeEffectiveBitrateKbps(sample, currentTier, bitrateScale)
+                    lastResolutionChangeMs = sample.nowElapsedMs
+                    lowBwStreak = 0
+                    cleanStreak = 0
+                    recoveryCleanStreak = 0
+                    badStreak = 0
+                    preCongestionScale = null
+                    preCongestionFps = null
+                    samplesSinceRestore = null
+                    startupActive = false
+                    resolutionChanged = true
+                    reason = "AUTO_RES_DOWN_${newTier.name}"
+                } else if (isActiveMotion && isCleanSample && cleanStreak >= UPGRADE_CLEAN_STREAK && !needsDowngrade) {
+                    val bweVal = bwe ?: 0L
+                    val desiredUpgradeTier = when {
+                        !sample.isTurnRelay &&
+                            bweVal >= ULTRA_UPGRADE_BWE_KBPS &&
+                            bitrateScale >= ULTRA_UPGRADE_MIN_SCALE ->
+                            AutoResolutionTier.ULTRA
+                        (!sample.isTurnRelay &&
+                            bweVal >= BALANCED_P2P_UPGRADE_BWE_KBPS &&
+                            bitrateScale >= BALANCED_P2P_UPGRADE_MIN_SCALE) ||
+                            (sample.isTurnRelay &&
+                                bitrateScale >= BALANCED_TURN_UPGRADE_MIN_SCALE &&
+                                isCleanSample &&
+                                bweVal >= BALANCED_TURN_UPGRADE_BWE_KBPS) ->
+                            AutoResolutionTier.BALANCED
+                        bweVal >= SMOOTH_UPGRADE_BWE_KBPS &&
+                            bitrateScale >= SMOOTH_UPGRADE_MIN_SCALE ->
+                            AutoResolutionTier.SMOOTH
+                        else -> currentTier
+                    }
+                    if (desiredUpgradeTier.ordinal > currentTier.ordinal) {
+                        val nextTier = AutoResolutionTier.entries[currentTier.ordinal + 1]
+                        currentTier = nextTier
+                        targetFps = nextTier.nominalFps
+                        effectiveBitrateKbps = computeEffectiveBitrateKbps(sample, currentTier, bitrateScale)
+                        lastResolutionChangeMs = sample.nowElapsedMs
+                        cleanStreak = 0
+                        recoveryCleanStreak = 0
+                        lowBwStreak = 0
+                        preCongestionScale = null
+                        preCongestionFps = null
+                        samplesSinceRestore = null
+                        resolutionChanged = true
+                        reason = "AUTO_RES_UP_${nextTier.name}"
+                    }
+                }
+            }
+        } else {
+            lowBwStreak = 0
+        }
+
+        val finalCeilingFps = if (sample.autoMode) {
+            currentTier.nominalFps
+        } else {
+            resolveManualTargetFps(sample.baseQuality)
+        }
+        val finalTargetWidth = if (sample.autoMode) {
+            currentTier.maxWidth
+        } else {
+            sample.baseQuality.maxWidth
+        }
+        targetFps = targetFps.coerceIn(minFps, finalCeilingFps)
+
+        return QosDecision(
+            maxBitrateKbps = effectiveBitrateKbps,
+            maxFps = targetFps,
+            targetMaxWidth = finalTargetWidth,
+            resolutionChanged = resolutionChanged,
+            reason = reason,
+        )
+    }
+
+    private fun computeEffectiveBitrateKbps(
+        sample: QosSample,
+        tier: AutoResolutionTier,
+        scale: Double,
+    ): Int {
+        val routeCeilingKbps = if (sample.autoMode) {
+            tier.ceilingKbps(sample.isTurnRelay)
+        } else {
+            val presetMaxKbps = resolveManualBitrateKbps(sample.baseQuality)
+            LowLatencyEncoderMath.computeRouteMaxBitrateKbps(presetMaxKbps, sample.isTurnRelay)
+        }
+        val targetWidth = if (sample.autoMode) tier.maxWidth else sample.baseQuality.maxWidth
+        val resFloorKbps = LowLatencyEncoderMath.minBitrateForResolution(targetWidth, targetWidth) / 1_000
+        val minFloorKbps = maxOf(MIN_EFFECTIVE_BITRATE_KBPS, resFloorKbps)
+        return (routeCeilingKbps * scale)
+            .toInt()
+            .coerceIn(minFloorKbps, routeCeilingKbps.coerceAtLeast(minFloorKbps))
+    }
+
+    private fun roundScale(value: Double): Double = round(value * 1_000_000.0) / 1_000_000.0
+
+    companion object {
+        const val RTT_WINDOW_SIZE = 20
+        const val MIN_BASELINE_RTT_MS = 10
+        const val MAX_BASELINE_RTT_MS = 150
+
+        const val DYNAMIC_SCREEN_MIN_FPS = 3.0
+        const val DYNAMIC_SCREEN_MIN_KBPS = 180L
+
+        const val AUTO_P2P_START_BITRATE_KBPS = 1_800
+        const val AUTO_TURN_START_BITRATE_KBPS = 1_500
+        const val STARTUP_CLEAN_EXCESS_MS = 40
+        const val STARTUP_CLEAN_STREAK = 2
+        const val STARTUP_ACCEL_STEP = 0.30
+
+        const val SEVERE_EXCESS_MS = 220
+        const val SEVERE_ABSOLUTE_RTT_MS = 300
+        const val SEVERE_CUT_FACTOR = 0.60
+
+        const val BAD_EXCESS_MS = 65
+        const val BAD_ABSOLUTE_RTT_MS = 180
+        const val BAD_RETX_DELTA = 12L
+        const val CONFIRMED_BAD_CUT_FACTOR = 0.75
+        const val SUSTAINED_BAD_CUT_FACTOR = 0.65
+        const val MIN_BITRATE_SCALE = 0.30
+
+        const val FPS_CUT_BAD_STREAK = 3
+        const val FPS_CUT_SCALE_THRESHOLD = 0.65
+        const val FPS_CUT_SEVERE_EXCESS_MS = 250
+        const val FPS_REDUCTION_RATIO = 0.20
+        const val MIN_AUTO_FPS = 20
+        const val MIN_MANUAL_FPS = 24
+
+        const val CLEAN_EXCESS_MS = 30
+        const val CLEAN_MAX_ABSOLUTE_RTT_MS = 140
+        const val CLEAN_MAX_RETX_DELTA = 2L
+        const val FAST_RESTORE_CLEAN_STREAK = 2
+        const val FAST_RESTORE_SCALE_BOOST = 0.15
+        const val RESTORE_GUARD_SAMPLES = 5
+        const val RECOVERY_CLEAN_STREAK = 2
+        const val RECOVERY_SCALE_STEP = 0.10
+
+        const val RESOLUTION_COOLDOWN_MS = 8_000L
+        const val UPGRADE_CLEAN_STREAK = 5
+        const val DOWNGRADE_BAD_STREAK = 4
+        const val ULTRA_UPGRADE_BWE_KBPS = 5_500L
+        const val ULTRA_UPGRADE_MIN_SCALE = 0.95
+        const val BALANCED_P2P_UPGRADE_BWE_KBPS = 2_400L
+        const val BALANCED_P2P_UPGRADE_MIN_SCALE = 0.80
+        const val BALANCED_TURN_UPGRADE_BWE_KBPS = 1_800L
+        const val BALANCED_TURN_UPGRADE_MIN_SCALE = 0.90
+        const val SMOOTH_UPGRADE_BWE_KBPS = 1_100L
+        const val SMOOTH_UPGRADE_MIN_SCALE = 0.80
+        const val LOW_DOWNGRADE_BITRATE_KBPS = 950
+        const val SMOOTH_DOWNGRADE_BITRATE_KBPS = 1_550
+        const val MIN_EFFECTIVE_BITRATE_KBPS = 350
+
+        fun resolveManualTargetFps(quality: StreamQuality): Int {
+            val boosted = if (quality.maxWidth >= 720 && quality.fps in 24..30) 60 else quality.fps
+            return boosted.coerceIn(MIN_MANUAL_FPS, 60)
+        }
+
+        fun resolveManualBitrateKbps(quality: StreamQuality): Int = when {
+            quality.maxWidth >= 1080 -> quality.bitrateKbps.coerceIn(4_500, 8_000)
+            quality.maxWidth >= 800 -> quality.bitrateKbps.coerceIn(3_000, 5_500)
+            quality.maxWidth >= 720 -> quality.bitrateKbps.coerceIn(2_400, 4_200)
+            else -> quality.bitrateKbps.coerceIn(900, 1_800)
+        }
+
+        fun initialStartBitrateKbps(quality: StreamQuality, isTurnRelay: Boolean): Int {
+            if (quality.auto) {
+                return if (isTurnRelay) AUTO_TURN_START_BITRATE_KBPS else AUTO_P2P_START_BITRATE_KBPS
+            }
+            return LowLatencyEncoderMath.computeRouteMaxBitrateKbps(
+                resolveManualBitrateKbps(quality),
+                isTurnRelay,
+            )
+        }
+    }
+}
+
+/**
  * Industrial-grade zero-copy hardware H.264 [VideoEncoder] engineered specifically for
  * interactive 60fps remote Android control (inspired by scrcpy / Moonlight / Parsec):
  *
@@ -572,7 +1192,7 @@ class LowLatencyH264Encoder(
         callback = encodeCallback
         width = alignEven(settings.width.coerceAtLeast(160))
         height = alignEven(settings.height.coerceAtLeast(160))
-        targetFps = settings.maxFramerate.coerceIn(24, 60)
+        targetFps = settings.maxFramerate.coerceIn(20, 60)
         // WebRTC passes settings.startBitrate in kbps; ensure crisp initial frame on 720p+ streams
         // (use short edge so landscape 1610x720 gets the same floor as portrait 720x1610)
         val rawInitialBps = if (settings.startBitrate > 0) {
@@ -992,7 +1612,7 @@ class LowLatencyH264Encoder(
 
     override fun setRates(rcParameters: VideoEncoder.RateControlParameters): VideoCodecStatus {
         val rawFps = ceil(rcParameters.framerateFps).toInt()
-        val fps = if (rawFps >= 24) rawFps.coerceIn(24, 60) else rawFps
+        val fps = if (rawFps >= 20) rawFps.coerceIn(20, 60) else rawFps
         return setRateAllocation(rcParameters.bitrate, fps)
     }
 
@@ -1003,9 +1623,9 @@ class LowLatencyH264Encoder(
         val activeCodec = codec ?: return VideoCodecStatus.OK
         if (!running) return VideoCodecStatus.OK
 
-        // Track live target FPS (ECO 30fps <-> BALANCED/HD 60fps) so PTS clamping & reinit match
-        if (framerate >= 24) {
-            targetFps = framerate.coerceIn(24, 60)
+        // Track live target FPS (Auto 20..60fps, ECO 30fps, BALANCED/HD 60fps) so PTS clamping & reinit match
+        if (framerate >= 20) {
+            targetFps = framerate.coerceIn(20, 60)
         }
 
         val requestedBps = allocation.sum

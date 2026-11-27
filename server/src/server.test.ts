@@ -238,7 +238,7 @@ async function startServer(
   };
 }
 
-test("buildIceServers emits per-URL ordered TURN entries (UDP first, then TCP/TLS), HMAC-SHA1 credentials, static fallback, and rejects weak TURN_SECRET", () => {
+test("buildIceServers prepends deduplicated co-located STUN from TURN_URLS, emits per-URL ordered TURN entries (UDP first, then TCP/TLS), HMAC-SHA1 credentials, static fallback, and rejects weak TURN_SECRET", () => {
   const nowMs = 1_750_000_000_000;
   const ttl = 1800;
   const secret = "coturn-shared-secret-xyz-strong-01";
@@ -262,7 +262,13 @@ test("buildIceServers emits per-URL ordered TURN entries (UDP first, then TCP/TL
   );
 
   assert.equal(ephemeral.length, 4);
-  assert.deepEqual(ephemeral[0], { urls: ["stun:stun.example.com:3478"] });
+  assert.deepEqual(ephemeral[0], {
+    urls: [
+      "stun:turn.example.com:3478",
+      "stun:turn.example.com:5349",
+      "stun:stun.example.com:3478",
+    ],
+  });
 
   const expectedExpiry = Math.floor(nowMs / 1000) + ttl;
   const expectedUsername = `${expectedExpiry}:${clientId}`;
@@ -287,6 +293,51 @@ test("buildIceServers emits per-URL ordered TURN entries (UDP first, then TCP/TL
     credential: expectedCredential,
   });
 
+  // Deduplication: co-located STUN already listed in stunUrls stays first and appears only once; IPv6 preserved
+  const deduped = buildIceServers(
+    {
+      stunUrls: [
+        "stun:stun.miwifi.com:3478",
+        "stun:turn.example.com:3478",
+        "stun:stun.miwifi.com:3478",
+      ],
+      turnUrls: [
+        "turn:turn.example.com:3478?transport=udp",
+        "turn:turn.example.com:3478?transport=tcp",
+        "turn:[2001:db8::1]:3478?transport=udp",
+      ],
+      turnSecret: secret,
+      turnTtlSeconds: ttl,
+    },
+    clientId,
+    nowMs,
+  );
+  assert.deepEqual(deduped[0], {
+    urls: [
+      "stun:turn.example.com:3478",
+      "stun:[2001:db8::1]:3478",
+      "stun:stun.miwifi.com:3478",
+    ],
+  });
+
+  // Even when stunUrls is empty, co-located STUN is still derived from turnUrls
+  const turnOnlyStun = buildIceServers(
+    {
+      stunUrls: [],
+      turnUrls: [
+        "turn:203.0.113.10:3478?transport=udp",
+        "turn:203.0.113.10:3478?transport=tcp",
+      ],
+      turnSecret: secret,
+      turnTtlSeconds: ttl,
+    },
+    clientId,
+    nowMs,
+  );
+  assert.deepEqual(turnOnlyStun[0], {
+    urls: ["stun:203.0.113.10:3478"],
+  });
+
   // Static fallback when turnSecret is omitted
   const staticIce = buildIceServers(
     {
@@ -304,6 +355,9 @@ test("buildIceServers emits per-URL ordered TURN entries (UDP first, then TCP/TL
   );
 
   assert.equal(staticIce.length, 3);
+  assert.deepEqual(staticIce[0], {
+    urls: ["stun:turn.example.com:3478", "stun:stun.example.com:3478"],
+  });
   assert.deepEqual(staticIce[1], {
     urls: ["turn:turn.example.com:3478?transport=udp"],
     username: "static-user",
@@ -327,6 +381,9 @@ test("buildIceServers emits per-URL ordered TURN entries (UDP first, then TCP/TL
     nowMs,
   );
   assert.equal(weakIce.length, 1);
+  assert.deepEqual(weakIce[0], {
+    urls: ["stun:turn.example.com:3478", "stun:stun.example.com:3478"],
+  });
 
   assert.throws(
     () => loadConfig({ TURN_SECRET: "velodeck-change-me-turn-secret" }),
@@ -1519,7 +1576,7 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
   assert.equal(infoBefore.status, 200);
   assert.deepEqual(await infoBefore.json(), {
     ok: true,
-    version: "1.0.6",
+    version: "1.0.7",
     hasAndroidApk: false,
     apkSha256: null,
     registrationMode: "first-user-then-invite",
@@ -1540,7 +1597,7 @@ test("GET /api/info (APK SHA-256 + registration status) and GET /api/download/ve
   assert.equal(infoAfter.status, 200);
   assert.deepEqual(await infoAfter.json(), {
     ok: true,
-    version: "1.0.6",
+    version: "1.0.7",
     hasAndroidApk: true,
     apkSha256: expectedSha256,
     registrationMode: "first-user-then-invite",
@@ -2518,6 +2575,10 @@ test("[P0-1] Per-session fresh TURN HMAC credentials injected into session.reque
 
   const fwdReq = await agent.nextJson<SessionRequestMessage>();
   assert.ok(Array.isArray(fwdReq.iceServers) && fwdReq.iceServers.length === 3);
+  assert.deepEqual(fwdReq.iceServers[0]?.urls, [
+    "stun:203.0.113.10:3478",
+    ...DEFAULT_STUN_URLS,
+  ]);
   const agentTurnUdp = fwdReq.iceServers[1];
   const agentTurnTcp = fwdReq.iceServers[2];
   assert.ok(agentTurnUdp?.username && agentTurnUdp.credential);
@@ -3298,15 +3359,17 @@ test("black_screen and force_portrait log distinct audit events (never control.u
   } satisfies ControlCmdMessage);
   await agent.nextJson<ControlCmdMessage>();
 
-  // In-session quality validation
+  // In-session quality validation (including auto: true preservation)
   ctrl.sendJson({
     type: "session.request",
     sessionId: "sess-quality-01",
     deviceId: "dev-audit-01",
     preferredTransport: "webrtc",
-    quality: QUALITY_PRESETS.balanced,
+    quality: QUALITY_PRESETS.auto,
   } satisfies SessionRequestMessage);
-  await agent.nextJson<SessionRequestMessage>();
+  const fwdAutoReq = await agent.nextJson<SessionRequestMessage>();
+  assert.deepEqual(fwdAutoReq.quality, QUALITY_PRESETS.auto);
+  assert.equal(fwdAutoReq.quality.auto, true);
 
   // Invalid quality -> rejected with INVALID_MESSAGE
   ctrl.sendJson({
@@ -3322,12 +3385,46 @@ test("black_screen and force_portrait log distinct audit events (never control.u
   const badQualityErr = await ctrl.nextJson<ErrorMessage>();
   assert.equal(badQualityErr.code, "INVALID_MESSAGE");
 
-  // Valid quality -> forwarded cleanly
+  // Invalid non-boolean quality.auto -> rejected with INVALID_MESSAGE
   ctrl.sendJson({
     type: "control.cmd",
     sessionId: "sess-quality-01",
     deviceId: "dev-audit-01",
     seq: 4,
+    command: {
+      action: "quality",
+      quality: {
+        maxWidth: 900,
+        fps: 60,
+        bitrateKbps: 4500,
+        jpegQuality: 54,
+        auto: "yes" as unknown as boolean,
+      },
+    },
+  } satisfies ControlCmdMessage);
+  const badAutoQualityErr = await ctrl.nextJson<ErrorMessage>();
+  assert.equal(badAutoQualityErr.code, "INVALID_MESSAGE");
+
+  // Valid quality (auto: true) -> forwarded cleanly preserving auto flag
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-quality-01",
+    deviceId: "dev-audit-01",
+    seq: 5,
+    command: { action: "quality", quality: QUALITY_PRESETS.auto },
+  } satisfies ControlCmdMessage);
+  const forwardedAutoQuality = await agent.nextJson<ControlCmdMessage>();
+  assert.deepEqual(forwardedAutoQuality.command, {
+    action: "quality",
+    quality: QUALITY_PRESETS.auto,
+  });
+
+  // Valid quality (fixed preset) -> forwarded cleanly
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-quality-01",
+    deviceId: "dev-audit-01",
+    seq: 6,
     command: { action: "quality", quality: QUALITY_PRESETS.hd },
   } satisfies ControlCmdMessage);
   const forwardedQuality = await agent.nextJson<ControlCmdMessage>();

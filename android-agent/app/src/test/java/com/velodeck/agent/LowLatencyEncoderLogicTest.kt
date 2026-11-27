@@ -2,11 +2,16 @@ package com.velodeck.agent
 
 import android.media.MediaCodecInfo
 import android.os.Build
+import com.velodeck.agent.capture.AdaptiveQoSController
+import com.velodeck.agent.capture.AutoResolutionTier
 import com.velodeck.agent.capture.DisplayScaleMath
 import com.velodeck.agent.capture.LowLatencyEncoderMath
 import com.velodeck.agent.capture.LowLatencyH264EncoderFactory
+import com.velodeck.agent.capture.QosDecision
+import com.velodeck.agent.capture.QosSample
 import com.velodeck.agent.capture.RttCongestionGuard
 import com.velodeck.agent.capture.WebRtcSessionManager
+import com.velodeck.agent.protocol.StreamQuality
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -689,5 +694,518 @@ class LowLatencyEncoderLogicTest {
         assertEquals(1.0, guard.onRttSample(120), 1e-6)
         assertEquals(120, guard.baselineRttMs)
         assertEquals(0.70, guard.onRttSample(180), 1e-6)
+    }
+
+    private fun sample(
+        rttMs: Int? = 25,
+        bweKbps: Long? = 4_000L,
+        sendRateKbps: Long = 1_500L,
+        currentFps: Double = 60.0,
+        retxDelta: Long = 0L,
+        isTurnRelay: Boolean = false,
+        autoMode: Boolean = false,
+        baseQuality: StreamQuality = if (autoMode) StreamQuality.AUTO else StreamQuality.BALANCED,
+        nowElapsedMs: Long = 1_000L,
+    ): QosSample = QosSample(
+        rttMs = rttMs,
+        bweKbps = bweKbps,
+        sendRateKbps = sendRateKbps,
+        currentFps = currentFps,
+        retxDelta = retxDelta,
+        isTurnRelay = isTurnRelay,
+        autoMode = autoMode,
+        baseQuality = baseQuality,
+        nowElapsedMs = nowElapsedMs,
+    )
+
+    @Test
+    fun `AdaptiveQoSController 20-sample sliding RTT window expires stale Wi-Fi minimum on 5G handoff`() {
+        val qos = AdaptiveQoSController()
+        var now = 1_000L
+
+        // Ignore null / non-positive RTTs
+        qos.onSample(sample(rttMs = null, nowElapsedMs = now))
+        qos.onSample(sample(rttMs = 0, nowElapsedMs = now + 1_000L))
+        qos.onSample(sample(rttMs = -10, nowElapsedMs = now + 2_000L))
+        assertNull(qos.baselineRttMs)
+
+        // Establish 15ms Wi-Fi baseline across 5 samples
+        repeat(5) {
+            now += 1_000L
+            qos.onSample(sample(rttMs = 15, nowElapsedMs = now))
+        }
+        assertEquals(15, qos.baselineRttMs)
+
+        // Handoff to 70ms 5G: for first 19 samples, 15ms is still inside the 20-sample window
+        repeat(19) {
+            now += 1_000L
+            qos.onSample(sample(rttMs = 70, nowElapsedMs = now))
+            assertEquals("15ms minimum should remain until 20 fresh 5G samples push it out", 15, qos.baselineRttMs)
+        }
+        // 20th fresh 70ms sample expires the old 15ms Wi-Fi minimum -> baseline learns 70ms!
+        now += 1_000L
+        qos.onSample(sample(rttMs = 70, nowElapsedMs = now))
+        assertEquals(70, qos.baselineRttMs)
+
+        // Lower RTT tightens baseline immediately (and clamps LAN <10ms to 10ms)
+        now += 1_000L
+        qos.onSample(sample(rttMs = 28, nowElapsedMs = now))
+        assertEquals(28, qos.baselineRttMs)
+        now += 1_000L
+        qos.onSample(sample(rttMs = 4, nowElapsedMs = now))
+        assertEquals(10, qos.baselineRttMs)
+
+        // Handoff from 15ms Wi-Fi to 90ms 5G (excess=75ms >= 65ms): temporarily throttles, then recovers once 15ms expires!
+        qos.reset()
+        now = 1_000L
+        qos.onSample(sample(rttMs = 15, nowElapsedMs = now))
+        assertEquals(15, qos.baselineRttMs)
+        repeat(19) {
+            now += 1_000L
+            qos.onSample(sample(rttMs = 90, nowElapsedMs = now))
+        }
+        assertTrue("Expected congestion backoff while stale 15ms baseline persisted", qos.bitrateScale < 1.0)
+        // 20th 90ms sample expires 15ms -> baseline becomes 90ms, excess becomes 0 -> recovers back to 1.0!
+        now += 1_000L
+        qos.onSample(sample(rttMs = 90, nowElapsedMs = now))
+        assertEquals(90, qos.baselineRttMs)
+        repeat(20) {
+            now += 1_000L
+            qos.onSample(sample(rttMs = 90, nowElapsedMs = now))
+        }
+        assertEquals(1.0, qos.bitrateScale, 1e-6)
+        assertEquals(60, qos.targetFps)
+    }
+
+    @Test
+    fun `AdaptiveQoSController holds steady on single jitter spike without prematurely slashing bitrate`() {
+        val qos = AdaptiveQoSController()
+        var now = 1_000L
+
+        // Establish steady 25ms baseline
+        val steady = qos.onSample(sample(rttMs = 25, nowElapsedMs = now))
+        assertEquals(4_500, steady.maxBitrateKbps)
+        assertEquals(60, steady.maxFps)
+
+        // Single Wi-Fi jitter spike (110ms, excess=85ms < 220ms) -> hold steady (RustDesk PR #16082)
+        now += 1_000L
+        val jitter = qos.onSample(sample(rttMs = 110, nowElapsedMs = now))
+        assertEquals(1.0, qos.bitrateScale, 1e-6)
+        assertEquals(4_500, jitter.maxBitrateKbps)
+        assertEquals(60, jitter.maxFps)
+        assertEquals("JITTER_HOLD", jitter.reason)
+
+        // Returns to normal -> badStreak resets cleanly with zero quality loss
+        now += 1_000L
+        val recovered = qos.onSample(sample(rttMs = 26, nowElapsedMs = now))
+        assertEquals(0, qos.badStreak)
+        assertEquals(1.0, qos.bitrateScale, 1e-6)
+        assertEquals(4_500, recovered.maxBitrateKbps)
+        assertEquals(60, recovered.maxFps)
+
+        // Single retransmission burst (retxDelta=16) also holds steady on tick 1
+        now += 1_000L
+        val singleRetx = qos.onSample(sample(rttMs = 25, retxDelta = 16, nowElapsedMs = now))
+        assertEquals(1.0, qos.bitrateScale, 1e-6)
+        assertEquals(60, singleRetx.maxFps)
+        assertEquals("JITTER_HOLD", singleRetx.reason)
+    }
+
+    @Test
+    fun `AdaptiveQoSController cuts bitrate first on 2 bad samples and steps down FPS second on 3+ bad samples`() {
+        val qos = AdaptiveQoSController()
+        var now = 1_000L
+
+        // Baseline 25ms, manual BALANCED (900p @ 60fps, 4500 kbps)
+        qos.onSample(sample(rttMs = 25, nowElapsedMs = now))
+
+        // Bad #1: single jitter -> hold
+        now += 1_000L
+        val b1 = qos.onSample(sample(rttMs = 110, nowElapsedMs = now))
+        assertEquals(1.0, qos.bitrateScale, 1e-6)
+        assertEquals(60, b1.maxFps)
+
+        // Bad #2: confirmed congestion -> cut bitrate FIRST (x0.75 = 0.75), preserve FPS = 60!
+        now += 1_000L
+        val b2 = qos.onSample(sample(rttMs = 115, nowElapsedMs = now))
+        assertEquals(0.75, qos.bitrateScale, 1e-6)
+        assertEquals(3_375, b2.maxBitrateKbps)
+        assertEquals(60, b2.maxFps)
+        assertEquals("CONGESTION_BITRATE_CUT", b2.reason)
+
+        // Bad #3: sustained congestion -> cut bitrate x0.65 (0.4875 <= 0.65), THEN step down FPS 60 -> 48!
+        now += 1_000L
+        val b3 = qos.onSample(sample(rttMs = 120, nowElapsedMs = now))
+        assertEquals(0.4875, qos.bitrateScale, 1e-6)
+        assertEquals(48, b3.maxFps)
+        assertEquals("CONGESTION_BITRATE_AND_FPS_CUT", b3.reason)
+
+        // Bad #4: bitrate 0.4875 * 0.65 = 0.316875, FPS 48 -> 36
+        now += 1_000L
+        val b4 = qos.onSample(sample(rttMs = 125, nowElapsedMs = now))
+        assertEquals(0.316875, qos.bitrateScale, 1e-6)
+        assertEquals(36, b4.maxFps)
+
+        // Bad #5: bitrate hits floor 0.30, FPS 36 -> 24
+        now += 1_000L
+        val b5 = qos.onSample(sample(rttMs = 125, nowElapsedMs = now))
+        assertEquals(0.30, qos.bitrateScale, 1e-6)
+        assertEquals(24, b5.maxFps)
+
+        // Bad #6: manual mode never drops FPS below 24 or scale below 0.30
+        now += 1_000L
+        val b6 = qos.onSample(sample(rttMs = 130, nowElapsedMs = now))
+        assertEquals(0.30, qos.bitrateScale, 1e-6)
+        assertEquals(24, b6.maxFps)
+
+        // Auto mode allows FPS floor down to 20 (60 -> 48 -> 36 -> 24 -> 20) while within 8s resolution cooldown
+        val autoQos = AdaptiveQoSController()
+        now = 1_000L
+        // Ramp startup to 1.0 first (t=1000, 1500, 2000)
+        repeat(3) {
+            autoQos.onSample(sample(rttMs = 25, autoMode = true, nowElapsedMs = now))
+            now += 500L
+        }
+        assertEquals(1.0, autoQos.bitrateScale, 1e-6)
+        // Drive 6 consecutive bad ticks within < 8s cooldown (t=2500..7500) so tier stays BALANCED while FPS hits 20
+        var lastAuto: QosDecision = autoQos.onSample(sample(rttMs = 110, autoMode = true, nowElapsedMs = now))
+        repeat(5) {
+            now += 1_000L
+            lastAuto = autoQos.onSample(sample(rttMs = 120, autoMode = true, nowElapsedMs = now))
+        }
+        assertEquals(20, lastAuto.maxFps)
+        assertEquals(0.30, autoQos.bitrateScale, 1e-6)
+        assertEquals(900, lastAuto.targetMaxWidth)
+
+        // Once 8s cooldown elapses (t=9000) with effective bitrate 1350 < 1550 kbps, downgrades cleanly to SMOOTH 720p@45fps
+        val autoDowngraded = autoQos.onSample(sample(rttMs = 120, autoMode = true, nowElapsedMs = 9_000L))
+        assertTrue(autoDowngraded.resolutionChanged)
+        assertEquals(720, autoDowngraded.targetMaxWidth)
+        assertEquals(45, autoDowngraded.maxFps)
+
+        // Two consecutive retxDelta >= 12 samples also cut bitrate even with clean RTT
+        val retxQos = AdaptiveQoSController()
+        now = 1_000L
+        retxQos.onSample(sample(rttMs = 25, retxDelta = 0, nowElapsedMs = now))
+        now += 1_000L
+        retxQos.onSample(sample(rttMs = 25, retxDelta = 15, nowElapsedMs = now))
+        assertEquals(1.0, retxQos.bitrateScale, 1e-6)
+        now += 1_000L
+        retxQos.onSample(sample(rttMs = 25, retxDelta = 18, nowElapsedMs = now))
+        assertEquals(0.75, retxQos.bitrateScale, 1e-6)
+    }
+
+    @Test
+    fun `AdaptiveQoSController cuts bitrate immediately on tick 1 for severe emergency`() {
+        val qos = AdaptiveQoSController()
+        var now = 1_000L
+        qos.onSample(sample(rttMs = 25, nowElapsedMs = now))
+
+        // Tick 1 severe emergency via excess >= 220ms (25 + 225 = 250ms) -> immediate x0.60 cut, FPS preserved
+        now += 1_000L
+        val e1 = qos.onSample(sample(rttMs = 250, nowElapsedMs = now))
+        assertEquals(0.60, qos.bitrateScale, 1e-6)
+        assertEquals(2_700, e1.maxBitrateKbps)
+        assertEquals(60, e1.maxFps)
+        assertEquals("EMERGENCY_BITRATE_CUT", e1.reason)
+
+        // Tick 2 severe emergency -> 0.36
+        now += 1_000L
+        val e2 = qos.onSample(sample(rttMs = 260, nowElapsedMs = now))
+        assertEquals(0.36, qos.bitrateScale, 1e-6)
+        assertEquals(60, e2.maxFps)
+
+        // Tick 3 severe emergency -> floor 0.30 AND FPS steps down 60 -> 48
+        now += 1_000L
+        val e3 = qos.onSample(sample(rttMs = 270, nowElapsedMs = now))
+        assertEquals(0.30, qos.bitrateScale, 1e-6)
+        assertEquals(48, e3.maxFps)
+        assertEquals("EMERGENCY_BITRATE_AND_FPS_CUT", e3.reason)
+
+        // Absolute RTT >= 300ms also triggers immediate emergency cut even when excess < 220ms
+        qos.reset()
+        now = 1_000L
+        qos.onSample(sample(rttMs = 120, nowElapsedMs = now))
+        assertEquals(120, qos.baselineRttMs)
+        now += 1_000L
+        val absEmergency = qos.onSample(sample(rttMs = 300, nowElapsedMs = now)) // excess=180 < 220, rtt=300 >= 300
+        assertEquals(0.60, qos.bitrateScale, 1e-6)
+        assertEquals("EMERGENCY_BITRATE_CUT", absEmergency.reason)
+    }
+
+    @Test
+    fun `AdaptiveQoSController static screen guard blocks bitrate FPS and resolution inflation while idle`() {
+        val qos = AdaptiveQoSController()
+        var now = 1_000L
+        qos.onSample(sample(rttMs = 25, nowElapsedMs = now))
+
+        // Induce congestion so scale=0.4875 and fps=48
+        repeat(3) {
+            now += 1_000L
+            qos.onSample(sample(rttMs = 120, nowElapsedMs = now))
+        }
+        assertEquals(0.4875, qos.bitrateScale, 1e-6)
+        assertEquals(48, qos.targetFps)
+
+        // 10 clean samples on a static idle screen (fps < 3.0 AND sendRate < 180 kbps) -> MUST NOT step up!
+        repeat(10) {
+            now += 1_000L
+            val idle = qos.onSample(
+                sample(
+                    rttMs = 25,
+                    currentFps = 1.5,
+                    sendRateKbps = 120L,
+                    nowElapsedMs = now,
+                ),
+            )
+            assertEquals(0.4875, qos.bitrateScale, 1e-6)
+            assertEquals(48, idle.maxFps)
+        }
+
+        // Motion resumes (sendRate >= 180 or fps >= 3.0) -> fast-restore & recovery resume cleanly!
+        now += 1_000L
+        qos.onSample(sample(rttMs = 25, currentFps = 3.0, sendRateKbps = 90L, nowElapsedMs = now))
+        now += 1_000L
+        val resumed = qos.onSample(sample(rttMs = 25, currentFps = 1.0, sendRateKbps = 200L, nowElapsedMs = now))
+        assertTrue("Expected bitrate recovery once active motion resumed", qos.bitrateScale > 0.4875)
+        assertEquals(60, resumed.maxFps)
+
+        // Auto mode: static idle screen with high BWE (8000 kbps) for 15s MUST NEVER upgrade to 1080p!
+        val autoQos = AdaptiveQoSController()
+        now = 1_000L
+        repeat(15) {
+            val d = autoQos.onSample(
+                sample(
+                    rttMs = 20,
+                    bweKbps = 8_000L,
+                    currentFps = 1.0,
+                    sendRateKbps = 80L,
+                    autoMode = true,
+                    nowElapsedMs = now,
+                ),
+            )
+            assertEquals(900, d.targetMaxWidth)
+            assertFalse("Static screen must never trigger resolution upgrade", d.resolutionChanged)
+            now += 1_000L
+        }
+
+        // Once active motion resumes for 5 clean ticks (cooldown already satisfied), upgrades to 1080p!
+        var upgraded = false
+        repeat(5) {
+            val d = autoQos.onSample(
+                sample(
+                    rttMs = 20,
+                    bweKbps = 8_000L,
+                    currentFps = 60.0,
+                    sendRateKbps = 2_400L,
+                    autoMode = true,
+                    nowElapsedMs = now,
+                ),
+            )
+            if (d.resolutionChanged && d.targetMaxWidth == 1080) upgraded = true
+            now += 1_000L
+        }
+        assertTrue("Expected upgrade to 1080p after 5 clean moving ticks", upgraded)
+    }
+
+    @Test
+    fun `AdaptiveQoSController fast-restore recovers FPS and rolls back immediately on returning congestion`() {
+        val qos = AdaptiveQoSController()
+        var now = 1_000L
+        qos.onSample(sample(rttMs = 25, nowElapsedMs = now))
+
+        // Congestion episode drops scale=0.4875 and fps=48
+        repeat(3) {
+            now += 1_000L
+            qos.onSample(sample(rttMs = 120, nowElapsedMs = now))
+        }
+        assertEquals(0.4875, qos.bitrateScale, 1e-6)
+        assertEquals(48, qos.targetFps)
+
+        // 2 consecutive clean moving samples trigger fast-restore back to preCongestionFps (60)
+        now += 1_000L
+        qos.onSample(sample(rttMs = 28, nowElapsedMs = now))
+        now += 1_000L
+        val restored = qos.onSample(sample(rttMs = 27, nowElapsedMs = now))
+        assertEquals("FAST_RESTORE", restored.reason)
+        assertEquals(60, restored.maxFps)
+        assertTrue(qos.bitrateScale > 0.4875)
+        assertEquals(0, qos.samplesSinceRestore)
+
+        // 1 clean sample advances guard to 1 (< 5), then congestion returns -> IMMEDIATE rollback on tick 1!
+        now += 1_000L
+        qos.onSample(sample(rttMs = 28, nowElapsedMs = now))
+        assertEquals(1, qos.samplesSinceRestore)
+
+        now += 1_000L
+        val rolledBack = qos.onSample(sample(rttMs = 110, nowElapsedMs = now))
+        assertEquals("RESTORE_ROLLBACK", rolledBack.reason)
+        assertEquals(48, rolledBack.maxFps)
+        assertEquals(0.4875, qos.bitrateScale, 1e-6)
+        assertNull(qos.samplesSinceRestore)
+
+        // Separate scenario: 5 clean samples after fast-restore clear the guard so a later single spike holds
+        qos.reset()
+        now = 1_000L
+        qos.onSample(sample(rttMs = 25, nowElapsedMs = now))
+        repeat(3) {
+            now += 1_000L
+            qos.onSample(sample(rttMs = 120, nowElapsedMs = now))
+        }
+        repeat(2) {
+            now += 1_000L
+            qos.onSample(sample(rttMs = 26, nowElapsedMs = now))
+        }
+        assertEquals(60, qos.targetFps)
+        assertEquals(0, qos.samplesSinceRestore)
+
+        repeat(5) {
+            now += 1_000L
+            qos.onSample(sample(rttMs = 26, nowElapsedMs = now))
+        }
+        assertNull("Restore guard should clear after 5 clean samples", qos.samplesSinceRestore)
+
+        val scaleBeforeJitter = qos.bitrateScale
+        now += 1_000L
+        val lateJitter = qos.onSample(sample(rttMs = 110, nowElapsedMs = now))
+        assertEquals("JITTER_HOLD", lateJitter.reason)
+        assertEquals(60, lateJitter.maxFps)
+        assertEquals(scaleBeforeJitter, qos.bitrateScale, 1e-6)
+    }
+
+    @Test
+    fun `AdaptiveQoSController auto tiers respect 8s cooldown P2P 1080p TURN 900p cap 540p downgrade and manual immutability`() {
+        // 1. Auto P2P: startup acceleration -> 8s cooldown -> ULTRA 1080p -> 8s cooldown -> LOW 540p
+        val p2pQos = AdaptiveQoSController()
+        // Tick 1 (t=1000): starts cleanly at 900p @ 60fps, 1800 kbps (1.5-2.0 Mbps)
+        val t1 = p2pQos.onSample(sample(rttMs = 18, bweKbps = 6_500L, autoMode = true, nowElapsedMs = 1_000L))
+        assertEquals(900, t1.targetMaxWidth)
+        assertEquals(60, t1.maxFps)
+        assertEquals(1_800, t1.maxBitrateKbps)
+        assertFalse(t1.resolutionChanged)
+        assertTrue(p2pQos.startupActive)
+
+        // Tick 2 (t=2000): 2nd consecutive clean sample accelerates bitrate rapidly
+        val t2 = p2pQos.onSample(sample(rttMs = 18, bweKbps = 6_500L, autoMode = true, nowElapsedMs = 2_000L))
+        assertEquals("STARTUP_ACCEL", t2.reason)
+        assertEquals(3_150, t2.maxBitrateKbps)
+
+        // Tick 3 (t=3000): accelerates to full 900p ceiling (4500 kbps) and ends startup acceleration
+        val t3 = p2pQos.onSample(sample(rttMs = 18, bweKbps = 6_500L, autoMode = true, nowElapsedMs = 3_000L))
+        assertEquals(4_500, t3.maxBitrateKbps)
+        assertFalse(p2pQos.startupActive)
+
+        // Ticks 4..8 (t=4000..8000): cleanStreak >= 5, BWE >= 5500, but 8000 - 1000 = 7000 < 8000 -> cooldown blocks upgrade!
+        for (t in 4_000L..8_000L step 1_000L) {
+            val d = p2pQos.onSample(sample(rttMs = 18, bweKbps = 6_500L, autoMode = true, nowElapsedMs = t))
+            assertEquals("8s cooldown must block premature upgrade at t=$t", 900, d.targetMaxWidth)
+            assertFalse(d.resolutionChanged)
+        }
+
+        // Tick 9 (t=9000): 9000 - 1000 == 8000ms -> upgrades to ULTRA (1080p @ 60fps, 7500 kbps)!
+        val upUltra = p2pQos.onSample(sample(rttMs = 18, bweKbps = 6_500L, autoMode = true, nowElapsedMs = 9_000L))
+        assertTrue(upUltra.resolutionChanged)
+        assertEquals(1080, upUltra.targetMaxWidth)
+        assertEquals(60, upUltra.maxFps)
+        assertEquals(7_500, upUltra.maxBitrateKbps)
+        assertEquals(AutoResolutionTier.ULTRA, p2pQos.currentTier)
+
+        // Ticks 10..16 (t=10000..16000): BWE collapses to 700 kbps (< 950 kbps), >= 4 ticks, but cooldown (< 17000) holds!
+        for (t in 10_000L..16_000L step 1_000L) {
+            val d = p2pQos.onSample(sample(rttMs = 110, bweKbps = 700L, autoMode = true, nowElapsedMs = t))
+            assertEquals("8s cooldown must block downgrade until t=17000 (at t=$t)", 1080, d.targetMaxWidth)
+            assertFalse(d.resolutionChanged)
+        }
+
+        // Tick 17 (t=17000): 17000 - 9000 == 8000ms -> downgrades cleanly to LOW (540p @ 30fps)!
+        val downLow = p2pQos.onSample(sample(rttMs = 110, bweKbps = 700L, autoMode = true, nowElapsedMs = 17_000L))
+        assertTrue(downLow.resolutionChanged)
+        assertEquals(540, downLow.targetMaxWidth)
+        assertEquals(30, downLow.maxFps)
+        assertEquals(AutoResolutionTier.LOW, p2pQos.currentTier)
+
+        // 2. Auto TURN: starts cleanly at SMOOTH (720p @ 45fps, 1500 kbps), upgrades to BALANCED (900p @ 60fps, 2100 kbps),
+        //    and NEVER upgrades to ULTRA (1080p) even if BWE reports 9000 kbps!
+        val turnQos = AdaptiveQoSController()
+        val turnInit = turnQos.onSample(
+            sample(rttMs = 35, bweKbps = 2_400L, isTurnRelay = true, autoMode = true, nowElapsedMs = 1_000L),
+        )
+        assertEquals(720, turnInit.targetMaxWidth)
+        assertEquals(45, turnInit.maxFps)
+        assertEquals(1_500, turnInit.maxBitrateKbps)
+        assertTrue(turnInit.resolutionChanged)
+
+        // Wait 8s with clean RTT & BWE >= 1800 -> upgrades to BALANCED (900p @ 60fps, 2100 kbps)
+        var turnDecision = turnInit
+        for (t in 2_000L..9_000L step 1_000L) {
+            turnDecision = turnQos.onSample(
+                sample(rttMs = 35, bweKbps = 2_400L, isTurnRelay = true, autoMode = true, nowElapsedMs = t),
+            )
+        }
+        assertTrue(turnDecision.resolutionChanged)
+        assertEquals(900, turnDecision.targetMaxWidth)
+        assertEquals(60, turnDecision.maxFps)
+        assertEquals(2_100, turnDecision.maxBitrateKbps)
+
+        // Even with 9000 kbps BWE for 20 more seconds on TURN, NEVER exceeds 900p or 2100 kbps
+        for (t in 10_000L..30_000L step 1_000L) {
+            val d = turnQos.onSample(
+                sample(rttMs = 32, bweKbps = 9_000L, isTurnRelay = true, autoMode = true, nowElapsedMs = t),
+            )
+            assertEquals(900, d.targetMaxWidth)
+            assertEquals(2_100, d.maxBitrateKbps)
+            assertFalse(d.resolutionChanged)
+        }
+
+        // 3. Switching from P2P ULTRA (1080p) to TURN steps down to BALANCED (900p) after >= 4 ticks + 8s cooldown
+        val switchQos = AdaptiveQoSController()
+        for (t in 1_000L..9_000L step 1_000L) {
+            switchQos.onSample(sample(rttMs = 15, bweKbps = 7_000L, isTurnRelay = false, autoMode = true, nowElapsedMs = t))
+        }
+        assertEquals(AutoResolutionTier.ULTRA, switchQos.currentTier)
+        var turnStepDown = switchQos.onSample(
+            sample(rttMs = 35, bweKbps = 2_400L, isTurnRelay = true, autoMode = true, nowElapsedMs = 10_000L),
+        )
+        for (t in 11_000L..17_000L step 1_000L) {
+            turnStepDown = switchQos.onSample(
+                sample(rttMs = 35, bweKbps = 2_400L, isTurnRelay = true, autoMode = true, nowElapsedMs = t),
+            )
+        }
+        assertTrue(turnStepDown.resolutionChanged)
+        assertEquals(900, turnStepDown.targetMaxWidth)
+        assertEquals(AutoResolutionTier.BALANCED, switchQos.currentTier)
+
+        // 4. Manual mode (autoMode = false) NEVER changes resolution on high BWE or severe congestion
+        val manualQos = AdaptiveQoSController()
+        for (t in 1_000L..15_000L step 1_000L) {
+            val d = manualQos.onSample(
+                sample(
+                    rttMs = 15,
+                    bweKbps = 9_500L,
+                    isTurnRelay = false,
+                    autoMode = false,
+                    baseQuality = StreamQuality.BALANCED,
+                    nowElapsedMs = t,
+                ),
+            )
+            assertEquals(900, d.targetMaxWidth)
+            assertFalse(d.resolutionChanged)
+            assertEquals(4_500, d.maxBitrateKbps)
+        }
+        for (t in 16_000L..30_000L step 1_000L) {
+            val d = manualQos.onSample(
+                sample(
+                    rttMs = 260,
+                    bweKbps = 500L,
+                    isTurnRelay = true,
+                    autoMode = false,
+                    baseQuality = StreamQuality.BALANCED,
+                    nowElapsedMs = t,
+                ),
+            )
+            assertEquals("Manual BALANCED must NEVER alter resolution", 900, d.targetMaxWidth)
+            assertFalse(d.resolutionChanged)
+            assertTrue("TURN ceiling + backoff must still apply in manual mode", d.maxBitrateKbps <= 2_100)
+        }
     }
 }

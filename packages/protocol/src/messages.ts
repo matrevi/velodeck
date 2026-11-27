@@ -65,9 +65,12 @@ export interface StreamQuality {
   fps: number;
   bitrateKbps: number;
   jpegQuality: number;
+  /** When true, agent dynamically adapts bitrate, FPS, and resolution tier to live link speed/RTT. */
+  auto?: boolean;
 }
 
-export const QUALITY_PRESETS: Record<"eco" | "balanced" | "hd", StreamQuality> = {
+export const QUALITY_PRESETS: Record<"auto" | "eco" | "balanced" | "hd", StreamQuality> = {
+  auto: { maxWidth: 900, fps: 60, bitrateKbps: 4500, jpegQuality: 54, auto: true },
   eco: { maxWidth: 540, fps: 30, bitrateKbps: 1600, jpegQuality: 45 },
   balanced: { maxWidth: 900, fps: 60, bitrateKbps: 4500, jpegQuality: 54 },
   hd: { maxWidth: 1080, fps: 60, bitrateKbps: 7500, jpegQuality: 64 },

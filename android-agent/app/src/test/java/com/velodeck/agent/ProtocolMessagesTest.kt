@@ -11,6 +11,7 @@ import com.velodeck.agent.protocol.DeviceCapabilities
 import com.velodeck.agent.protocol.DeviceSummary
 import com.velodeck.agent.protocol.IceServerConfig
 import com.velodeck.agent.protocol.ProtocolCodec
+import com.velodeck.agent.protocol.QualityPresets
 import com.velodeck.agent.protocol.RemoteKey
 import com.velodeck.agent.protocol.StreamQuality
 import com.velodeck.agent.protocol.TransportMode
@@ -789,5 +790,61 @@ class ProtocolMessagesTest {
                 nextForcePortrait = false,
             ),
         )
+    }
+
+    @Test
+    fun parseAndSerialize_streamQualityAutoModeRoundTripAndBackwardsCompat() {
+        assertEquals(
+            StreamQuality(maxWidth = 900, fps = 60, bitrateKbps = 4500, jpegQuality = 54, auto = true),
+            StreamQuality.AUTO,
+        )
+        assertEquals(StreamQuality.AUTO, QualityPresets.AUTO)
+        assertFalse(StreamQuality.ECO.auto)
+        assertFalse(StreamQuality.BALANCED.auto)
+        assertFalse(StreamQuality.HD.auto)
+
+        // SessionRequest with AUTO serializes "auto":true and round-trips cleanly
+        val autoReq = WireMessage.SessionRequest(
+            sessionId = "sess-auto",
+            deviceId = "android-01",
+            preferredTransport = TransportMode.WEBRTC,
+            quality = QualityPresets.AUTO,
+        )
+        val autoReqJson = ProtocolCodec.serialize(autoReq)
+        assertTrue("Expected \"auto\":true in JSON: $autoReqJson", autoReqJson.contains("\"auto\":true"))
+        val decodedAutoReq = ProtocolCodec.parse(autoReqJson) as WireMessage.SessionRequest
+        assertEquals(StreamQuality.AUTO, decodedAutoReq.quality)
+        assertTrue(decodedAutoReq.quality.auto)
+
+        // ControlCommand.Quality with AUTO round-trips cleanly
+        val autoCmd = WireMessage.ControlCmd(
+            sessionId = "sess-auto",
+            deviceId = "android-01",
+            seq = 42,
+            command = ControlCommand.Quality(StreamQuality.AUTO),
+        )
+        val autoCmdJson = ProtocolCodec.serialize(autoCmd)
+        assertTrue(autoCmdJson.contains("\"auto\":true"))
+        val decodedAutoCmd = ProtocolCodec.parse(autoCmdJson) as WireMessage.ControlCmd
+        assertEquals(ControlCommand.Quality(StreamQuality.AUTO), decodedAutoCmd.command)
+
+        // Non-auto presets omit "auto" for wire backward compatibility and default to auto=false
+        val manualCmd = WireMessage.ControlCmd(
+            sessionId = "sess-manual",
+            deviceId = "android-01",
+            seq = 43,
+            command = ControlCommand.Quality(StreamQuality.BALANCED),
+        )
+        val manualJson = ProtocolCodec.serialize(manualCmd)
+        assertFalse("Non-auto StreamQuality should omit \"auto\" field: $manualJson", manualJson.contains("\"auto\""))
+        val decodedManual = ProtocolCodec.parse(manualJson) as WireMessage.ControlCmd
+        assertEquals(ControlCommand.Quality(StreamQuality.BALANCED), decodedManual.command)
+        assertFalse((decodedManual.command as ControlCommand.Quality).quality.auto)
+
+        // Legacy payload without "auto" key parses with auto=false
+        val legacyJson = """{"type":"control.cmd","sessionId":"s1","deviceId":"d1","command":{"action":"quality","quality":{"maxWidth":1080,"fps":60,"bitrateKbps":7500,"jpegQuality":64}}}"""
+        val decodedLegacy = ProtocolCodec.parse(legacyJson) as WireMessage.ControlCmd
+        assertEquals(StreamQuality.HD, (decodedLegacy.command as ControlCommand.Quality).quality)
+        assertFalse((decodedLegacy.command as ControlCommand.Quality).quality.auto)
     }
 }

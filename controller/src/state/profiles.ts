@@ -1,7 +1,7 @@
 import type { TransportMode } from "@velodeck/protocol";
 
 export type ConnectionMode = "relay" | "direct";
-export type QualityPreset = "eco" | "balanced" | "hd";
+export type QualityPreset = "auto" | "eco" | "balanced" | "hd";
 
 export interface ConnectionProfile {
   id: string;
@@ -400,9 +400,12 @@ export function parseQuickConnectParams(
   const preferredTransport: TransportMode =
     rawTransport === "ws-jpeg" ? "ws-jpeg" : "webrtc";
   const qualityPreset: QualityPreset =
-    rawQuality === "eco" || rawQuality === "hd" || rawQuality === "balanced"
+    rawQuality === "auto" ||
+    rawQuality === "eco" ||
+    rawQuality === "balanced" ||
+    rawQuality === "hd"
       ? rawQuality
-      : "balanced";
+      : "auto";
 
   const host = parsedResolved.hostname;
   const fallbackLabel = host
@@ -486,7 +489,8 @@ function isValidProfile(value: unknown): value is ConnectionProfile {
     typeof candidate.wsUrl === "string" &&
     typeof candidate.accessToken === "string" &&
     (candidate.preferredTransport === "webrtc" || candidate.preferredTransport === "ws-jpeg") &&
-    (candidate.qualityPreset === "eco" ||
+    (candidate.qualityPreset === "auto" ||
+      candidate.qualityPreset === "eco" ||
       candidate.qualityPreset === "balanced" ||
       candidate.qualityPreset === "hd")
   );
