@@ -20,8 +20,11 @@ import {
   Layers,
   Lock,
   LogOut,
+  Monitor,
   Moon,
   Package,
+  Pin,
+  Plus,
   Power,
   RefreshCw,
   Send,
@@ -44,6 +47,13 @@ import type {
   RemoteKey,
   TransportMode,
 } from "@velodeck/protocol";
+import {
+  getDesktopBridge,
+  isDesktopApp,
+  isMacDesktop,
+  type DesktopWindowPreset,
+  type DesktopWindowState,
+} from "../desktop/bridge";
 import { GestureRecognizer, clientPointToNormalized } from "../gestures/GestureMapper";
 import {
   detectDefaultApiBase,
@@ -70,6 +80,12 @@ interface RemoteViewportProps {
   apiBase?: string;
   authToken?: string;
   serverInfo?: ServerInfo;
+  desktopWindowState?: DesktopWindowState;
+  onToggleAlwaysOnTop?: () => Promise<void> | void;
+  onSetWindowPreset?: (preset: DesktopWindowPreset) => Promise<void> | void;
+  onOpenNewWindow?: () => Promise<void> | void;
+  onShowToast?: (level: "info" | "warn" | "error", text: string) => void;
+  suppressKeyboard?: boolean;
   onExit: () => void;
 }
 
@@ -106,8 +122,18 @@ export function RemoteViewport({
   apiBase,
   authToken,
   serverInfo,
+  desktopWindowState,
+  onToggleAlwaysOnTop,
+  onSetWindowPreset,
+  onOpenNewWindow,
+  onShowToast,
+  suppressKeyboard = false,
   onExit,
 }: RemoteViewportProps) {
+  const desktopBridge = useMemo(() => getDesktopBridge(), []);
+  const desktopApp = isDesktopApp();
+  const macDesktop = isMacDesktop();
+
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -126,6 +152,8 @@ export function RemoteViewport({
   const [dockExpanded, setDockExpanded] = useState(false);
   const [activePanel, setActivePanel] = useState<UtilityPanel>("none");
   const [ripples, setRipples] = useState<TouchRipple[]>([]);
+  const [mouseNavHint, setMouseNavHint] = useState<string | null>(null);
+  const [screenshotCopied, setScreenshotCopied] = useState(false);
   const [hasCanvasFrame, setHasCanvasFrame] = useState(false);
   const [hasVideoFrame, setHasVideoFrame] = useState(false);
   const [nowTs, setNowTs] = useState(() => Date.now());
@@ -156,6 +184,8 @@ export function RemoteViewport({
   const rippleSeqRef = useRef(0);
   const rippleTimersRef = useRef(new Set<number>());
   const copiedClipTimerRef = useRef<number | null>(null);
+  const mouseNavTimerRef = useRef<number | null>(null);
+  const screenshotCopiedTimerRef = useRef<number | null>(null);
   const wheelAccumRef = useRef<{
     dx: number;
     dy: number;
@@ -191,7 +221,7 @@ export function RemoteViewport({
     return () => window.clearInterval(id);
   }, [clientState.nextReconnectAt]);
 
-  // Clean up transient timers (wheel, ripples, clipboard badge) on unmount
+  // Clean up transient timers (wheel, ripples, clipboard badge, mouse hint, screenshot flash) on unmount
   useEffect(() => {
     return () => {
       if (wheelAccumRef.current.timer !== null) {
@@ -201,6 +231,14 @@ export function RemoteViewport({
       if (copiedClipTimerRef.current !== null) {
         window.clearTimeout(copiedClipTimerRef.current);
         copiedClipTimerRef.current = null;
+      }
+      if (mouseNavTimerRef.current !== null) {
+        window.clearTimeout(mouseNavTimerRef.current);
+        mouseNavTimerRef.current = null;
+      }
+      if (screenshotCopiedTimerRef.current !== null) {
+        window.clearTimeout(screenshotCopiedTimerRef.current);
+        screenshotCopiedTimerRef.current = null;
       }
       if (kbTextTimerRef.current !== null) {
         window.clearTimeout(kbTextTimerRef.current);
@@ -476,7 +514,7 @@ export function RemoteViewport({
 
   // P1-6: Desktop keyboard & paste shortcuts when streaming and no utility sheet is open
   useEffect(() => {
-    if (!isStreamingReady || activePanel !== "none") {
+    if (!isStreamingReady || activePanel !== "none" || suppressKeyboard) {
       if (kbTextTimerRef.current !== null) {
         window.clearTimeout(kbTextTimerRef.current);
         kbTextTimerRef.current = null;
@@ -565,7 +603,7 @@ export function RemoteViewport({
       }
       kbTextBufRef.current = "";
     };
-  }, [client, targetDeviceId, isStreamingReady, activePanel, dockExpanded]);
+  }, [client, targetDeviceId, isStreamingReady, activePanel, dockExpanded, suppressKeyboard]);
 
   // P0-3: Always read live rendered content dimensions directly from active <video> or <canvas>
   function getRenderedContentSize(): { width: number; height: number } {
@@ -611,6 +649,17 @@ export function RemoteViewport({
     rippleTimersRef.current.add(timerId);
   }
 
+  function flashMouseNavHint(label: string) {
+    setMouseNavHint(label);
+    if (mouseNavTimerRef.current !== null) {
+      window.clearTimeout(mouseNavTimerRef.current);
+    }
+    mouseNavTimerRef.current = window.setTimeout(() => {
+      mouseNavTimerRef.current = null;
+      setMouseNavHint(null);
+    }, 850);
+  }
+
   function buildPointerInput(e: React.PointerEvent<HTMLDivElement>) {
     const surface = surfaceRef.current;
     if (!surface) return null;
@@ -633,6 +682,10 @@ export function RemoteViewport({
   }
 
   function handlePointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.pointerType === "mouse" && e.button === 1) {
+      e.preventDefault();
+      return;
+    }
     if (e.button !== 0 && e.pointerType === "mouse") return;
 
     // P1-4: Retry video playback on user gesture if browser autoplay policy paused it
@@ -663,6 +716,7 @@ export function RemoteViewport({
   }
 
   function handlePointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.button !== 0 && e.pointerType === "mouse") return;
     const input = buildPointerInput(e);
     if (!input) return;
     recognizer.onPointerUp(input);
@@ -670,6 +724,29 @@ export function RemoteViewport({
 
   function handlePointerCancel(e: React.PointerEvent<HTMLDivElement>) {
     recognizer.onPointerCancel(e.pointerId);
+  }
+
+  function handleMouseDown(e: React.MouseEvent<HTMLDivElement>) {
+    if (e.button === 1) {
+      e.preventDefault();
+    }
+  }
+
+  function handleContextMenu(e: React.MouseEvent<HTMLDivElement>) {
+    e.preventDefault();
+    if (!isStreamingReady) return;
+    addRipple(e.clientX, e.clientY);
+    client.sendCommand({ action: "key", key: "back" }, targetDeviceId);
+    flashMouseNavHint("返回");
+  }
+
+  function handleAuxClick(e: React.MouseEvent<HTMLDivElement>) {
+    if (e.button !== 1) return;
+    e.preventDefault();
+    if (!isStreamingReady) return;
+    addRipple(e.clientX, e.clientY);
+    client.sendCommand({ action: "key", key: "home" }, targetDeviceId);
+    flashMouseNavHint("主页");
   }
 
   // P0-3 & P0-4: Accurate letterbox wheel coordinates + normalized deltaMode + strict non-overlapping cooldown
@@ -768,6 +845,136 @@ export function RemoteViewport({
   function sendForcePortrait(enabled: boolean) {
     client.sendCommand({ action: "force_portrait", enabled }, targetDeviceId);
   }
+
+  function captureCurrentFramePngDataUrl(): string | null {
+    const video = videoRef.current;
+    if (
+      clientState.activeTransport === "webrtc" &&
+      video &&
+      video.videoWidth > 0 &&
+      video.videoHeight > 0
+    ) {
+      const offscreen = document.createElement("canvas");
+      offscreen.width = video.videoWidth;
+      offscreen.height = video.videoHeight;
+      const ctx = offscreen.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
+      return offscreen.toDataURL("image/png");
+    }
+
+    const canvas = canvasRef.current;
+    if (
+      hasCanvasFrameRef.current &&
+      canvas &&
+      canvas.width > 0 &&
+      canvas.height > 0
+    ) {
+      const offscreen = document.createElement("canvas");
+      offscreen.width = canvas.width;
+      offscreen.height = canvas.height;
+      const ctx = offscreen.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(canvas, 0, 0, offscreen.width, offscreen.height);
+      return offscreen.toDataURL("image/png");
+    }
+
+    return null;
+  }
+
+  async function handleCaptureScreenshot(mode: "copy" | "save") {
+    if (!desktopBridge) return;
+    const dataUrl = captureCurrentFramePngDataUrl();
+    if (!dataUrl) {
+      onShowToast?.("warn", "当前暂无可截取的远程画面");
+      return;
+    }
+
+    try {
+      if (mode === "copy") {
+        const res = await desktopBridge.copyScreenshotPng(dataUrl);
+        if (res.ok) {
+          setScreenshotCopied(true);
+          if (screenshotCopiedTimerRef.current !== null) {
+            window.clearTimeout(screenshotCopiedTimerRef.current);
+          }
+          screenshotCopiedTimerRef.current = window.setTimeout(() => {
+            screenshotCopiedTimerRef.current = null;
+            setScreenshotCopied(false);
+          }, 1400);
+          onShowToast?.("info", "已复制高清截图到剪贴板");
+        } else {
+          onShowToast?.("error", res.error || "复制高清截图失败");
+        }
+        return;
+      }
+
+      const rawLabel = device?.name || device?.model || "velodeck";
+      const safeName =
+        rawLabel
+          .replace(/[^a-zA-Z0-9\u4e00-\u9fa5_-]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 32) || "velodeck";
+      const now = new Date();
+      const pad = (n: number) => String(n).padStart(2, "0");
+      const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+      const suggestedName = `${safeName}-${stamp}.png`;
+
+      const res = await desktopBridge.saveScreenshotPng(dataUrl, suggestedName);
+      if (res.cancelled) return;
+      if (res.ok) {
+        onShowToast?.(
+          "info",
+          res.savedPath ? `截图已保存至 ${res.savedPath}` : "高清截图已保存",
+        );
+      } else {
+        onShowToast?.("error", res.error || "保存截图失败");
+      }
+    } catch {
+      onShowToast?.(
+        "error",
+        mode === "copy" ? "复制高清截图失败" : "保存截图失败",
+      );
+    }
+  }
+
+  const desktopCommandHandlersRef = useRef({
+    toggleBlackScreen: () => {},
+    toggleForcePortrait: () => {},
+    copyScreenshot: () => {},
+    saveScreenshot: () => {},
+  });
+
+  desktopCommandHandlersRef.current = {
+    toggleBlackScreen: () => sendBlackScreen(!device?.blackScreenActive),
+    toggleForcePortrait: () => sendForcePortrait(!device?.forcePortraitActive),
+    copyScreenshot: () => {
+      void handleCaptureScreenshot("copy");
+    },
+    saveScreenshot: () => {
+      void handleCaptureScreenshot("save");
+    },
+  };
+
+  useEffect(() => {
+    if (!desktopBridge) return;
+    return desktopBridge.onCommand((command) => {
+      switch (command) {
+        case "toggle-black-screen":
+          desktopCommandHandlersRef.current.toggleBlackScreen();
+          break;
+        case "toggle-force-portrait":
+          desktopCommandHandlersRef.current.toggleForcePortrait();
+          break;
+        case "copy-screenshot":
+          desktopCommandHandlersRef.current.copyScreenshot();
+          break;
+        case "save-screenshot":
+          desktopCommandHandlersRef.current.saveScreenshot();
+          break;
+      }
+    });
+  }, [desktopBridge]);
 
   function handleWakeWithBlackScreen() {
     client.sendCommand({ action: "wake" }, targetDeviceId);
@@ -1032,14 +1239,120 @@ export function RemoteViewport({
     return "正在拉取设备画面...";
   })();
 
+  const isAlwaysOnTop = Boolean(desktopWindowState?.alwaysOnTop);
+  const isPhonePreset = desktopWindowState?.preset === "phone";
+
   return (
     <div
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
-      className="fixed inset-0 z-40 h-[100dvh] w-screen overflow-hidden bg-black text-white select-none"
+      className={`fixed inset-0 z-40 h-[100dvh] w-screen overflow-hidden bg-black text-white select-none ${
+        desktopApp ? "flex flex-col" : ""
+      }`}
     >
+      {/* Native Desktop Top HUD Bar (shown ONLY in Electron Desktop App) */}
+      {desktopApp && (
+        <header
+          className={`desktop-drag-region relative z-50 flex h-10 shrink-0 items-center justify-between gap-2 border-b border-[#232732] bg-[#111318] ${
+            macDesktop ? "pl-[76px] pr-2.5" : "px-3"
+          }`}
+        >
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <span className="hidden truncate text-xs font-medium text-zinc-300 sm:inline">
+              {device?.name || "远端设备"}
+            </span>
+          </div>
+
+          <div className="desktop-no-drag flex shrink-0 items-center gap-1.5">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => void onToggleAlwaysOnTop?.()}
+                title={isAlwaysOnTop ? "取消置顶浮窗" : "置顶浮窗"}
+                aria-label={isAlwaysOnTop ? "取消置顶浮窗" : "置顶浮窗"}
+                aria-pressed={isAlwaysOnTop}
+                className={`desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border transition ${
+                  isAlwaysOnTop
+                    ? "border-[#2563EB] bg-[#2563EB] text-white"
+                    : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                }`}
+              >
+                <Pin className="h-3.5 w-3.5" />
+              </button>
+
+              <button
+                type="button"
+                onClick={() =>
+                  void onSetWindowPreset?.(
+                    isPhonePreset ? "dashboard" : "phone",
+                  )
+                }
+                title={
+                  isPhonePreset
+                    ? "切换为宽屏控制台比例 (1100×760)"
+                    : "切换为手机竖屏比例 (430×880)"
+                }
+                aria-label={
+                  isPhonePreset ? "切换为宽屏比例" : "切换为手机比例"
+                }
+                className="desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border border-[#2C313D] bg-white/8 text-zinc-300 transition hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+              >
+                {isPhonePreset ? (
+                  <Monitor className="h-3.5 w-3.5" />
+                ) : (
+                  <Smartphone className="h-3.5 w-3.5" />
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={(e) =>
+                  void handleCaptureScreenshot(e.shiftKey ? "save" : "copy")
+                }
+                title="高清截图到剪贴板（Shift+点击另存为 PNG）"
+                aria-label="高清截图到剪贴板"
+                className={`desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border transition ${
+                  screenshotCopied
+                    ? "border-emerald-500/50 bg-emerald-500/20 text-emerald-300"
+                    : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                }`}
+              >
+                {screenshotCopied ? (
+                  <Check className="h-3.5 w-3.5" />
+                ) : (
+                  <Camera className="h-3.5 w-3.5" />
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void onOpenNewWindow?.()}
+                title="新窗口（多机同控）"
+                aria-label="新窗口（多机同控）"
+                className="desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border border-[#2C313D] bg-white/8 text-zinc-300 transition hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+              >
+                <Plus className="h-3.5 w-3.5" />
+              </button>
+            </div>
+
+            <TelemetryCapsule
+              client={client}
+              socketStatus={clientState.socketStatus}
+              sessionStatus={clientState.sessionStatus}
+              activeTransport={clientState.activeTransport}
+              desiredTransport={clientState.desiredTransport}
+              isStreamingReady={isStreamingReady}
+              device={device}
+              dockExpanded={dockExpanded}
+              onToggleDock={handleToggleDock}
+              inline
+            />
+          </div>
+        </header>
+      )}
+
       {/* Pitch-Black OLED Remote Screen Surface */}
       <div
         ref={surfaceRef}
@@ -1047,8 +1360,13 @@ export function RemoteViewport({
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel}
+        onMouseDown={handleMouseDown}
+        onContextMenu={handleContextMenu}
+        onAuxClick={handleAuxClick}
         onWheel={handleWheel}
-        className="relative h-full w-full touch-none"
+        className={`relative w-full touch-none ${
+          desktopApp ? "min-h-0 flex-1" : "h-full"
+        }`}
       >
         <video
           ref={videoRef}
@@ -1101,6 +1419,19 @@ export function RemoteViewport({
             className="animate-touch-ripple pointer-events-none absolute h-10 w-10 rounded-full border-2 border-[#60A5FA] bg-[#2563EB]/20"
           />
         ))}
+
+        {mouseNavHint && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-5 z-20 flex justify-center">
+            <span className="animate-sheet-up inline-flex items-center gap-1.5 rounded-md border border-[#2C313D] bg-[#111318] px-2.5 py-1 text-[11px] font-medium text-zinc-100 shadow-[0_8px_24px_rgba(0,0,0,0.65)]">
+              {mouseNavHint === "返回" ? (
+                <ArrowLeft className="h-3 w-3 text-[#60A5FA]" />
+              ) : (
+                <Home className="h-3 w-3 text-[#60A5FA]" />
+              )}
+              <span>{mouseNavHint}</span>
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Drag & Drop File Transfer Overlay */}
@@ -1128,7 +1459,11 @@ export function RemoteViewport({
       {(isFileTransferActive || apkFetchState.active) && activePanel !== "files" && (
         <div
           className="pointer-events-none fixed inset-x-0 top-0 z-50 flex justify-center px-3 sm:justify-start"
-          style={{ paddingTop: "max(3.5rem, calc(env(safe-area-inset-top) + 2.8rem))" }}
+          style={{
+            paddingTop: desktopApp
+              ? "3.25rem"
+              : "max(3.5rem, calc(env(safe-area-inset-top) + 2.8rem))",
+          }}
         >
           <button
             type="button"
@@ -1147,18 +1482,20 @@ export function RemoteViewport({
         </div>
       )}
 
-      {/* Crisp Solid-Ink Top Telemetry Capsule (isolated leaf subscription — zero viewport re-renders at 1Hz) */}
-      <TelemetryCapsule
-        client={client}
-        socketStatus={clientState.socketStatus}
-        sessionStatus={clientState.sessionStatus}
-        activeTransport={clientState.activeTransport}
-        desiredTransport={clientState.desiredTransport}
-        isStreamingReady={isStreamingReady}
-        device={device}
-        dockExpanded={dockExpanded}
-        onToggleDock={handleToggleDock}
-      />
+      {/* Crisp Solid-Ink Top Telemetry Capsule (Web / iOS PWA mode; Desktop renders inline in HUD bar) */}
+      {!desktopApp && (
+        <TelemetryCapsule
+          client={client}
+          socketStatus={clientState.socketStatus}
+          sessionStatus={clientState.sessionStatus}
+          activeTransport={clientState.activeTransport}
+          desiredTransport={clientState.desiredTransport}
+          isStreamingReady={isStreamingReady}
+          device={device}
+          dockExpanded={dockExpanded}
+          onToggleDock={handleToggleDock}
+        />
+      )}
 
       {/* Screen-Off Notice Banner (when physical phone genuinely entered Display.STATE_OFF) */}
       {isStreamingReady && !showOverlay && device?.screenOn === false && (
@@ -1705,6 +2042,7 @@ interface TelemetryCapsuleProps {
   device: DeviceSummary | null;
   dockExpanded: boolean;
   onToggleDock: () => void;
+  inline?: boolean;
 }
 
 const TelemetryCapsule = memo(function TelemetryCapsule({
@@ -1717,6 +2055,7 @@ const TelemetryCapsule = memo(function TelemetryCapsule({
   device,
   dockExpanded,
   onToggleDock,
+  inline = false,
 }: TelemetryCapsuleProps) {
   const telemetry = useSyncExternalStore(
     client.subscribeTelemetry,
@@ -1765,53 +2104,69 @@ const TelemetryCapsule = memo(function TelemetryCapsule({
     bitrateKbps,
   );
 
+  const capsuleButton = (
+    <button
+      type="button"
+      onClick={onToggleDock}
+      className={
+        inline
+          ? "desktop-no-drag flex h-7 items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-md border border-[#2C313D] bg-white/8 px-2 text-xs text-zinc-200 transition hover:border-[#3F4656] hover:bg-white/14"
+          : "pointer-events-auto flex max-w-[calc(100vw-1.5rem)] items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-full border border-[#2C313D] bg-[#111318] px-2.5 py-1.5 text-xs text-zinc-200 shadow-[0_8px_24px_rgba(0,0,0,0.55)] transition hover:border-[#3F4656] sm:gap-2 sm:px-3"
+      }
+    >
+      <span className={`h-2 w-2 shrink-0 rounded-full ${statusDotClass}`} />
+      <span className="shrink-0 font-mono text-[11px] text-white">
+        {telemetry.rttMs !== null ? `${telemetry.rttMs}ms` : "--ms"}
+      </span>
+      <span className="shrink-0 text-zinc-600">·</span>
+      <span className="shrink-0 font-mono text-[11px] text-zinc-300">
+        {isIdleWebRtc ? (
+          <>
+            <span className="sm:hidden">静止</span>
+            <span className="hidden sm:inline">静止节能</span>
+          </>
+        ) : (
+          `${telemetry.fps} FPS`
+        )}
+      </span>
+      <span
+        className={`${inline ? "hidden sm:inline" : ""} shrink-0 rounded bg-[#2563EB]/25 px-1.5 py-0.5 text-[10px] font-semibold text-[#93C5FD]`}
+      >
+        <span className="sm:hidden">{transportShort}</span>
+        <span className="hidden sm:inline">{transportFull}</span>
+      </span>
+      {device && (
+        <span
+          className={`${inline ? "hidden md:inline-flex" : "inline-flex"} shrink-0 items-center gap-0.5 font-mono text-[11px] text-zinc-300`}
+        >
+          {device.charging ? (
+            <BatteryCharging className="h-3.5 w-3.5 text-emerald-400" />
+          ) : (
+            <Battery className="h-3.5 w-3.5 text-zinc-400" />
+          )}
+          {device.battery}%
+        </span>
+      )}
+      <span className="ml-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-white/10 text-zinc-200">
+        {dockExpanded ? (
+          <ChevronDown className="h-3.5 w-3.5" />
+        ) : (
+          <SlidersHorizontal className="h-3 w-3" />
+        )}
+      </span>
+    </button>
+  );
+
+  if (inline) {
+    return capsuleButton;
+  }
+
   return (
     <div
       className="pointer-events-none fixed inset-x-0 top-0 z-50 flex justify-center px-3 sm:justify-end"
       style={{ paddingTop: "max(0.75rem, env(safe-area-inset-top))" }}
     >
-      <button
-        type="button"
-        onClick={onToggleDock}
-        className="pointer-events-auto flex max-w-[calc(100vw-1.5rem)] items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-full border border-[#2C313D] bg-[#111318] px-2.5 py-1.5 text-xs text-zinc-200 shadow-[0_8px_24px_rgba(0,0,0,0.55)] transition hover:border-[#3F4656] sm:gap-2 sm:px-3"
-      >
-        <span className={`h-2 w-2 shrink-0 rounded-full ${statusDotClass}`} />
-        <span className="shrink-0 font-mono text-[11px] text-white">
-          {telemetry.rttMs !== null ? `${telemetry.rttMs}ms` : "--ms"}
-        </span>
-        <span className="shrink-0 text-zinc-600">·</span>
-        <span className="shrink-0 font-mono text-[11px] text-zinc-300">
-          {isIdleWebRtc ? (
-            <>
-              <span className="sm:hidden">静止</span>
-              <span className="hidden sm:inline">静止节能</span>
-            </>
-          ) : (
-            `${telemetry.fps} FPS`
-          )}
-        </span>
-        <span className="shrink-0 rounded bg-[#2563EB]/25 px-1.5 py-0.5 text-[10px] font-semibold text-[#93C5FD]">
-          <span className="sm:hidden">{transportShort}</span>
-          <span className="hidden sm:inline">{transportFull}</span>
-        </span>
-        {device && (
-          <span className="inline-flex shrink-0 items-center gap-0.5 font-mono text-[11px] text-zinc-300">
-            {device.charging ? (
-              <BatteryCharging className="h-3.5 w-3.5 text-emerald-400" />
-            ) : (
-              <Battery className="h-3.5 w-3.5 text-zinc-400" />
-            )}
-            {device.battery}%
-          </span>
-        )}
-        <span className="ml-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-white/10 text-zinc-200">
-          {dockExpanded ? (
-            <ChevronDown className="h-3.5 w-3.5" />
-          ) : (
-            <SlidersHorizontal className="h-3 w-3" />
-          )}
-        </span>
-      </button>
+      {capsuleButton}
     </div>
   );
 });

@@ -1,0 +1,51 @@
+appId: com.velodeck.desktop
+productName: VeloDeck
+artifactName: "VeloDeck-${version}-${os}-${arch}.${ext}"
+asar: true
+
+directories:
+  output: release
+  buildResources: assets
+
+files:
+  - dist/**/*
+  - renderer-dist/**/*
+  - assets/**/*
+  - build-config.json
+  - package.json
+
+mac:
+  category: public.app-category.utilities
+  icon: assets/icon.icns
+  darkModeSupport: true
+  identity: null
+  target:
+    - target: dmg
+      arch:
+        - arm64
+
+dmg:
+  title: "VeloDeck ${version}"
+
+win:
+  icon: assets/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: VeloDeck
+
+linux:
+  icon: assets/icon.png
+  category: Utility
+  target:
+    - AppImage

@@ -1,0 +1,73 @@
+name: Build Desktop App (macOS & Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      default_server_url_override:
+        description: "Optional default server URL baked into app (leave blank to read VELODECK_API_URL secret, or leave empty for runtime setup)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-desktop:
+    name: Build VeloDeck Desktop (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS-arm64
+            os: macos-14
+            dist_cmd: dist:desktop:mac
+            artifact_name: velodeck-desktop-macos-arm64
+          - label: Windows-x64
+            os: windows-latest
+            dist_cmd: dist:desktop:win
+            artifact_name: velodeck-desktop-windows-x64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build & package desktop installer
+        shell: bash
+        env:
+          INPUT_SERVER_URL: ${{ inputs.default_server_url_override }}
+          SECRET_SERVER_URL: ${{ secrets.VELODECK_API_URL }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          DEFAULT_API="${INPUT_SERVER_URL:-$SECRET_SERVER_URL}"
+          if [ -n "$DEFAULT_API" ]; then
+            echo "::add-mask::$DEFAULT_API"
+          fi
+          VELODECK_DEFAULT_API_BASE="$DEFAULT_API" pnpm run "${{ matrix.dist_cmd }}"
+
+      - name: Upload desktop installer artifacts (private to Actions run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            desktop/release/*.dmg
+            desktop/release/*.exe
+            desktop/release/*.blockmap
+          retention-days: 14

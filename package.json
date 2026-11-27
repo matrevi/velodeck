@@ -4,13 +4,17 @@
   "private": true,
   "packageManager": "pnpm@11.22.0",
   "scripts": {
-    "build": "pnpm -r build",
+    "build": "pnpm --filter @velodeck/protocol build && pnpm --filter @velodeck/controller build && pnpm --filter @velodeck/server build",
     "build:protocol": "pnpm --filter @velodeck/protocol build",
     "build:server": "pnpm --filter @velodeck/server build",
     "build:controller": "pnpm --filter @velodeck/controller build",
+    "build:desktop": "pnpm --filter @velodeck/protocol build && pnpm --filter @velodeck/controller build && pnpm --filter @velodeck/desktop build",
     "test": "pnpm -r test",
     "dev:server": "pnpm --filter @velodeck/server dev",
     "dev:controller": "pnpm --filter @velodeck/controller dev",
+    "dev:desktop": "pnpm --filter @velodeck/desktop dev",
+    "dist:desktop:mac": "pnpm --filter @velodeck/protocol build && pnpm --filter @velodeck/controller build && pnpm --filter @velodeck/desktop dist:mac",
+    "dist:desktop:win": "pnpm --filter @velodeck/protocol build && pnpm --filter @velodeck/controller build && pnpm --filter @velodeck/desktop dist:win",
     "sync:android-web": "node scripts/sync-controller-to-android.mjs"
   }
 }

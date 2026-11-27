@@ -49,6 +49,7 @@ const HTML_CONTENT_SECURITY_POLICY = [
 
 const BUILTIN_ALLOWED_ORIGINS = new Set([
   "capacitor://localhost",
+  "app://velodeck",
   "https://localhost",
   "http://localhost",
 ]);

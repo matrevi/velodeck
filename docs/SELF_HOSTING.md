@@ -305,10 +305,15 @@ curl -fsS http://127.0.0.1:8080/api/info
    - **屏幕共享（MediaProjection）授权**（持久化保活，无人远控时零流量挂起）
 3. **可选 ADB 永久自愈加固（免 Root）**：如果手机偶尔连接电脑，可运行 `./scripts/enable-unattended-permanent.sh` 授予 `WRITE_SECURE_SETTINGS`，实现无障碍服务被系统关闭时自动恢复（OPPO/一加/Realme 需先在开发者选项中开启「禁止权限监控」）。
 
-### 5.2 控制端（iPhone / 桌面浏览器）
+### 5.2 控制端（原生电脑客户端 / iPhone / 桌面浏览器）
 
-- 直接访问 `https://remote.example.com`（或 `http://203.0.113.10`）登录账号即可控制。
-- **iPhone 用户**：在 Safari 点底部「分享」→ **「添加到主屏幕」**，即可以全屏独立 App 形态使用。
+- **原生电脑客户端（macOS / Windows）**：
+  - 本地编译打包：`pnpm install && pnpm dist:desktop:mac`（输出 `desktop/release/VeloDeck-*-mac-arm64.dmg`）或 `pnpm dist:desktop:win`（输出 `.exe` 安装包与绿色便携版）。
+  - 云端自动打包：在 Fork 仓库进入 **Actions → Build Desktop App (macOS & Windows) → Run workflow**，可一键云端同时编译 macOS `.dmg` 与 Windows `.exe`（支持读取 `VELODECK_API_URL` Secret 预置默认服务器，或留空在 App 内随时填写切换）。
+  - 服务端已原生信任 `Origin: app://velodeck`，无需额外配置 `ALLOWED_ORIGINS`。
+- **iPhone / 桌面浏览器**：
+  - 直接访问 `https://remote.example.com`（或 `http://203.0.113.10`）登录账号即可控制。
+  - **iPhone 用户**：在 Safari 点底部「分享」→ **「添加到主屏幕」**，即可以全屏独立 App 形态使用。
 - **画质建议**：默认保持 **「智能（auto）」** 档位即可根据当前网络是局域网 P2P 还是云端 TURN 自动调配分辨率、帧率与码率。
 
 ---

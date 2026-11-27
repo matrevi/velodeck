@@ -32,6 +32,11 @@ import {
   type SavedAccountSession,
   type ServerInfo,
 } from "../state/auth";
+import {
+  formatServerHostLabel,
+  isDesktopApp,
+  isMacDesktop,
+} from "../desktop/bridge";
 import { isAllowedDirectUrl } from "../state/profiles";
 import type { RemoteClientState } from "../transport/RemoteClient";
 import { SecuritySettingsModal } from "./SecuritySettingsModal";
@@ -42,6 +47,7 @@ interface DashboardViewProps {
   apiBase: string;
   serverInfo: ServerInfo;
   profileCount: number;
+  desktopServerUrl?: string;
   onOpenConnections: (editProfileId?: string) => void;
   onOpenControlCode: () => void;
   onLogoutAccount: () => void;
@@ -56,6 +62,8 @@ interface DashboardViewProps {
   onUnbindDevice: (device: DeviceSummary) => Promise<void>;
   onReconnect: () => void;
   onSwitchToDirectUrl?: (device: DeviceSummary) => void;
+  onOpenServerSettings?: () => void;
+  onOpenNewWindow?: () => void;
 }
 
 function formatLastSeen(ts: number): string {
@@ -117,6 +125,7 @@ export function DashboardView({
   apiBase,
   serverInfo,
   profileCount,
+  desktopServerUrl,
   onOpenConnections,
   onOpenControlCode,
   onLogoutAccount,
@@ -128,7 +137,12 @@ export function DashboardView({
   onUnbindDevice,
   onReconnect,
   onSwitchToDirectUrl,
+  onOpenServerSettings,
+  onOpenNewWindow,
 }: DashboardViewProps) {
+  const desktopApp = isDesktopApp();
+  const macDesktop = isMacDesktop();
+  const desktopServerHost = formatServerHostLabel(desktopServerUrl ?? apiBase);
   const [showIosBanner, setShowIosBanner] = useState(false);
   const [wakingDeviceId, setWakingDeviceId] = useState<string | null>(null);
   const [copiedCodeDeviceId, setCopiedCodeDeviceId] = useState<string | null>(null);
@@ -195,27 +209,64 @@ export function DashboardView({
   return (
     <div className="flex min-h-[100dvh] flex-col bg-[#F4F5F7] text-[#111318]">
       {/* Committed Deep-Ink Hardware Shell Header */}
-      <header className="safe-top sticky top-0 z-30 border-b border-[#232732] bg-[#111318] text-white">
-        <div className="mx-auto flex h-14 max-w-5xl items-center justify-between gap-2.5 px-4 sm:px-6">
+      <header
+        className={`${desktopApp ? "desktop-drag-region" : "safe-top"} sticky top-0 z-30 border-b border-[#232732] bg-[#111318] text-white`}
+      >
+        <div
+          className={`mx-auto flex h-14 max-w-5xl items-center justify-between gap-2.5 ${
+            macDesktop ? "pl-[80px] pr-4 sm:pl-[80px] sm:pr-6" : "px-4 sm:px-6"
+          }`}
+        >
           <div className="flex min-w-0 items-center gap-2.5">
             <img
               src="./icon.svg"
               alt="VeloDeck 极控"
               className="h-7 w-7 shrink-0 rounded-lg bg-[#1C212C] ring-1 ring-white/20"
             />
-            <span className="text-[15px] font-semibold tracking-tight text-white">
+            <span className="truncate text-[15px] font-semibold tracking-tight text-white">
               VeloDeck 极控
             </span>
             {renderShellStatus(clientState)}
           </div>
 
           <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+            {desktopApp && onOpenServerSettings && (
+              <button
+                type="button"
+                onClick={onOpenServerSettings}
+                title="配置自托管服务器地址 (⌘/Ctrl+,)"
+                className="btn-shell desktop-no-drag inline-flex h-8 max-w-[190px] items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
+              >
+                <span
+                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                    desktopServerHost ? "bg-emerald-400" : "bg-amber-400"
+                  }`}
+                />
+                <span className="truncate font-mono">
+                  {desktopServerHost
+                    ? `服务器: ${desktopServerHost}`
+                    : "未配置服务器 · 点击设置"}
+                </span>
+              </button>
+            )}
+            {desktopApp && onOpenNewWindow && (
+              <button
+                type="button"
+                onClick={onOpenNewWindow}
+                title="新窗口（多机同控）"
+                aria-label="新窗口（多机同控）"
+                className="btn-shell desktop-no-drag inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs font-medium"
+              >
+                <Plus className="h-3.5 w-3.5 text-blue-400" />
+                <span className="hidden md:inline">新窗口</span>
+              </button>
+            )}
             {isAccountMode ? (
               <>
                 <button
                   type="button"
                   onClick={onOpenControlCode}
-                  className="btn-shell inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
+                  className="btn-shell desktop-no-drag inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
                 >
                   <KeyRound className="h-3.5 w-3.5 text-blue-400" />
                   <span>控制码</span>
@@ -224,7 +275,7 @@ export function DashboardView({
                   <button
                     type="button"
                     onClick={() => setSecurityModalOpen(true)}
-                    className="btn-shell inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
+                    className="btn-shell desktop-no-drag inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
                     title="账号安全设置"
                   >
                     <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
@@ -234,7 +285,7 @@ export function DashboardView({
                 <button
                   type="button"
                   onClick={onLogoutAccount}
-                  className="btn-shell inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium hover:text-rose-300"
+                  className="btn-shell desktop-no-drag inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium hover:text-rose-300"
                   title="退出账号"
                 >
                   <LogOut className="h-3.5 w-3.5" />
@@ -246,7 +297,7 @@ export function DashboardView({
                 <button
                   type="button"
                   onClick={onOpenControlCode}
-                  className="btn-shell inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
+                  className="btn-shell desktop-no-drag inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
                 >
                   <KeyRound className="h-3.5 w-3.5 text-blue-400" />
                   <span className="hidden sm:inline">控制码 / 账号</span>
@@ -254,7 +305,7 @@ export function DashboardView({
                 <button
                   type="button"
                   onClick={() => onOpenConnections()}
-                  className="btn-shell inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
+                  className="btn-shell desktop-no-drag inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
                 >
                   <Plus className="h-3.5 w-3.5 text-blue-400" />
                   <span>{profileCount > 0 ? "切换连接" : "添加连接"}</span>

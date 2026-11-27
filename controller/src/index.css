@@ -64,6 +64,22 @@ a {
   padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
 }
 
+/* Electron desktop window drag regions */
+.desktop-drag-region {
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+.desktop-no-drag,
+.desktop-drag-region button,
+.desktop-drag-region a,
+.desktop-drag-region input,
+.desktop-drag-region select,
+.desktop-drag-region textarea,
+.desktop-drag-region [role="button"] {
+  -webkit-app-region: no-drag;
+}
+
 /* Grounded daylight utility panel: solid paper-white, hairline border, subtle real downward shadow */
 .panel {
   background-color: var(--bg-surface);

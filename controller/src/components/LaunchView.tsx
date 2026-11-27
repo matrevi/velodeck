@@ -36,6 +36,11 @@ import {
   type SavedAccountSession,
   type ServerInfo,
 } from "../state/auth";
+import {
+  formatServerHostLabel,
+  isDesktopApp,
+  isMacDesktop,
+} from "../desktop/bridge";
 import { isPrivateHost } from "../state/profiles";
 import type { RemoteClientState } from "../transport/RemoteClient";
 
@@ -51,6 +56,7 @@ export interface LaunchViewProps {
     controlCode: string;
     deviceName?: string;
   } | null;
+  desktopServerUrl?: string;
   onConnectWithCode: (input: {
     controlCode: string;
     controlPassword: string;
@@ -62,6 +68,7 @@ export interface LaunchViewProps {
   onAccountAuthed: (auth: AuthResponse, isRegister: boolean) => void;
   onReturnToAccountDashboard: () => void;
   onOpenConnections: () => void;
+  onOpenServerSettings?: () => void;
 }
 
 export function LaunchView({
@@ -73,6 +80,7 @@ export function LaunchView({
   profileCount,
   clientState,
   codeOfflineNotice,
+  desktopServerUrl,
   onConnectWithCode,
   onCancelCodeConnect,
   onRetryCodeConnect,
@@ -80,7 +88,11 @@ export function LaunchView({
   onAccountAuthed,
   onReturnToAccountDashboard,
   onOpenConnections,
+  onOpenServerSettings,
 }: LaunchViewProps) {
+  const desktopApp = isDesktopApp();
+  const macDesktop = isMacDesktop();
+  const desktopServerHost = formatServerHostLabel(desktopServerUrl ?? apiBase);
   const [activeTab, setActiveTab] = useState<"code" | "account">(initialTab);
   const [showIosBanner, setShowIosBanner] = useState(false);
   const [copiedSha256, setCopiedSha256] = useState(false);
@@ -179,6 +191,11 @@ export function LaunchView({
   function handleCodeSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!isCodeReady || isCodeConnecting) return;
+    if (desktopApp && !apiBase) {
+      setLocalCodeHint("请先配置自托管服务器地址后再连接设备");
+      onOpenServerSettings?.();
+      return;
+    }
     setLocalCodeHint(null);
     onConnectWithCode({
       controlCode: codeDigits,
@@ -214,6 +231,11 @@ export function LaunchView({
     e.preventDefault();
     const trimmedUsername = username.trim();
     if (!trimmedUsername || !accountPassword || authSubmitting) return;
+    if (desktopApp && !apiBase) {
+      setAuthError("请先配置自托管服务器地址后再登录或注册");
+      onOpenServerSettings?.();
+      return;
+    }
 
     if (authMode === "register") {
       if (isRegistrationClosed) {
@@ -264,15 +286,21 @@ export function LaunchView({
   return (
     <div className="flex min-h-[100dvh] flex-col bg-[#F4F5F7] text-[#111318]">
       {/* Committed Deep-Ink Hardware Shell Header */}
-      <header className="safe-top sticky top-0 z-30 border-b border-[#232732] bg-[#111318] text-white">
-        <div className="mx-auto flex h-14 max-w-5xl items-center justify-between gap-3 px-4 sm:px-6">
-          <div className="flex items-center gap-2.5">
+      <header
+        className={`${desktopApp ? "desktop-drag-region" : "safe-top"} sticky top-0 z-30 border-b border-[#232732] bg-[#111318] text-white`}
+      >
+        <div
+          className={`mx-auto flex h-14 max-w-5xl items-center justify-between gap-3 ${
+            macDesktop ? "pl-[80px] pr-4 sm:pl-[80px] sm:pr-6" : "px-4 sm:px-6"
+          }`}
+        >
+          <div className="flex min-w-0 items-center gap-2.5">
             <img
               src="./icon.svg"
               alt="VeloDeck 极控"
-              className="h-7 w-7 rounded-lg bg-[#1C212C] ring-1 ring-white/20"
+              className="h-7 w-7 shrink-0 rounded-lg bg-[#1C212C] ring-1 ring-white/20"
             />
-            <span className="text-[15px] font-semibold tracking-tight text-white">
+            <span className="truncate text-[15px] font-semibold tracking-tight text-white">
               VeloDeck 极控
             </span>
             <span className="hidden text-xs text-zinc-500 sm:inline">/</span>
@@ -281,12 +309,31 @@ export function LaunchView({
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
+            {desktopApp && onOpenServerSettings && (
+              <button
+                type="button"
+                onClick={onOpenServerSettings}
+                title="配置自托管服务器地址 (⌘/Ctrl+,)"
+                className="btn-shell desktop-no-drag inline-flex h-8 max-w-[220px] items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
+              >
+                <span
+                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                    desktopServerHost ? "bg-emerald-400" : "bg-amber-400"
+                  }`}
+                />
+                <span className="truncate font-mono">
+                  {desktopServerHost
+                    ? `服务器: ${desktopServerHost}`
+                    : "未配置服务器 · 点击设置"}
+                </span>
+              </button>
+            )}
             {savedAccount && (
               <button
                 type="button"
                 onClick={onReturnToAccountDashboard}
-                className="btn-shell inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
+                className="btn-shell desktop-no-drag inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
               >
                 <ArrowLeft className="h-3.5 w-3.5 text-blue-400" />
                 <span className="max-w-[130px] truncate">
@@ -297,7 +344,7 @@ export function LaunchView({
             <button
               type="button"
               onClick={onOpenConnections}
-              className="btn-shell inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
+              className="btn-shell desktop-no-drag inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"
             >
               <Server className="h-3.5 w-3.5 text-zinc-400" />
               <span>局域网 / 自建</span>
@@ -313,6 +360,31 @@ export function LaunchView({
 
       {/* Main Operational Workspace */}
       <main className="safe-bottom mx-auto flex w-full max-w-5xl flex-1 flex-col px-4 py-6 sm:px-6 lg:py-10">
+        {/* Desktop First-Run Self-Hosted Server Setup Callout */}
+        {desktopApp && !apiBase && onOpenServerSettings && (
+          <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#BFDBFE] bg-[#EFF6FF] px-4 py-3.5 text-xs text-[#1E3A8A]">
+            <div className="flex min-w-0 items-start gap-2.5">
+              <Server className="mt-0.5 h-4 w-4 shrink-0 text-[#2563EB]" />
+              <div className="min-w-0">
+                <p className="font-semibold text-[#111318]">
+                  尚未配置自托管 VeloDeck 服务器地址
+                </p>
+                <p className="mt-0.5 text-[#374151]">
+                  使用桌面端控制码或账号登录前，请先填写你的自托管服务器地址（如 https://remote.example.com 或公网 IP）。
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={onOpenServerSettings}
+              className="btn-primary inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg px-3.5 text-xs font-medium"
+            >
+              <Server className="h-3.5 w-3.5" />
+              配置自托管服务器地址
+            </button>
+          </div>
+        )}
+
         {/* Optional iOS Add-to-Home-Screen Utility Strip */}
         {showIosBanner && (
           <div className="mb-5 flex items-center gap-3 rounded-lg border border-[#D8E2F8] bg-[#EFF4FF] px-3.5 py-2.5 text-xs text-[#1E3A8A]">

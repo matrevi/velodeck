@@ -3462,3 +3462,68 @@ test("black_screen and force_portrait log distinct audit events (never control.u
   assert.ok(events.includes("control.force_portrait"), `expected control.force_portrait in ${events.join(",")}`);
   assert.equal(events.includes("control.unlock"), false, "black_screen/force_portrait must NEVER be logged as control.unlock");
 });
+
+test("Built-in Electron origin (app://velodeck) is natively trusted for HTTP CORS and WS upgrades while untrusted custom schemes are rejected", async (t) => {
+  // No ALLOWED_ORIGINS configured
+  const { server, baseUrl, wsUrl } = await startServer({ allowedOrigins: [] });
+  t.after(() => server.close());
+
+  // 1. GET /api/info with Origin: app://velodeck -> 200 with Access-Control-Allow-Origin
+  const infoRes = await fetch(`${baseUrl}/api/info`, {
+    headers: { Origin: "app://velodeck" },
+  });
+  assert.equal(infoRes.status, 200);
+  assert.equal(infoRes.headers.get("access-control-allow-origin"), "app://velodeck");
+
+  // Trailing slash normalizes cleanly to app://velodeck
+  const infoSlashRes = await fetch(`${baseUrl}/api/info`, {
+    headers: { Origin: "app://velodeck/" },
+  });
+  assert.equal(infoSlashRes.status, 200);
+  assert.equal(infoSlashRes.headers.get("access-control-allow-origin"), "app://velodeck/");
+
+  // 2. OPTIONS /api/auth/login with Origin: app://velodeck -> 204 with CORS headers
+  const optRes = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "OPTIONS",
+    headers: { Origin: "app://velodeck" },
+  });
+  assert.equal(optRes.status, 204);
+  assert.equal(optRes.headers.get("access-control-allow-origin"), "app://velodeck");
+  assert.match(optRes.headers.get("access-control-allow-methods") ?? "", /POST/);
+
+  // 3. WebSocket /ws upgrade with Origin: app://velodeck is accepted
+  const electronWs = await TestWsClient.connect(wsUrl, { Origin: "app://velodeck" });
+  await electronWs.close();
+
+  // 4. Untrusted custom scheme Origin: app://evil.example is rejected for HTTP CORS and WS upgrade
+  const evilInfoRes = await fetch(`${baseUrl}/api/info`, {
+    headers: { Origin: "app://evil.example" },
+  });
+  assert.equal(evilInfoRes.status, 200);
+  assert.equal(evilInfoRes.headers.get("access-control-allow-origin"), null);
+
+  const evilOptRes = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "OPTIONS",
+    headers: { Origin: "app://evil.example" },
+  });
+  assert.equal(evilOptRes.status, 403);
+  assert.equal(evilOptRes.headers.get("access-control-allow-origin"), null);
+
+  const evilWsStatus = await new Promise<number>((resolve, reject) => {
+    const ws = new WebSocket(wsUrl, {
+      headers: { Origin: "app://evil.example" },
+    });
+    ws.once("unexpected-response", (_req, res) => {
+      resolve(res.statusCode ?? 0);
+      ws.terminate();
+    });
+    ws.once("open", () => {
+      ws.close();
+      reject(new Error("Expected untrusted custom scheme WS upgrade to be rejected"));
+    });
+    ws.once("error", () => {
+      // Handled by unexpected-response
+    });
+  });
+  assert.equal(evilWsStatus, 403);
+});

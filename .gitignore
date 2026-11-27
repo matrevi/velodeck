@@ -39,5 +39,12 @@ controller/android/
 controller/dist/
 controller/.impeccable/
 
+# Desktop (Electron)
+desktop/dist/
+desktop/renderer-dist/
+desktop/release/
+desktop/build-config.json
+desktop/.env.local
+
 # Coverage
 coverage/

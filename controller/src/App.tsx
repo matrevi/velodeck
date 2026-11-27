@@ -1,10 +1,23 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { normalizeControlCode, type DeviceSummary } from "@velodeck/protocol";
 import { ConnectionModal } from "./components/ConnectionModal";
 import { DashboardView } from "./components/DashboardView";
 import { LaunchView } from "./components/LaunchView";
 import { QuickConnectConfirmModal } from "./components/QuickConnectConfirmModal";
 import { RemoteViewport } from "./components/RemoteViewport";
+import { ServerConfigModal } from "./components/ServerConfigModal";
+import {
+  deriveRelayWsUrlFromApiBase,
+  formatServerHostLabel,
+  getDesktopBridge,
+  loadCachedDesktopServerUrl,
+  loadCachedRecentDesktopServers,
+  normalizeServerBaseUrl,
+  saveCachedDesktopServerUrl,
+  saveCachedRecentDesktopServers,
+  type DesktopWindowPreset,
+  type DesktopWindowState,
+} from "./desktop/bridge";
 import {
   changePasswordApi,
   clearAccountSession,
@@ -66,6 +79,7 @@ interface PendingQuickConnect {
 
 export function App() {
   const client = useMemo(() => new RemoteClient(), []);
+  const desktopBridge = useMemo(() => getDesktopBridge(), []);
   const defaultApiBase = useMemo(() => detectDefaultApiBase(window.location), []);
   const defaultRelayWsUrl = useMemo(
     () => detectDefaultRelayWsUrl(window.location),
@@ -75,6 +89,25 @@ export function App() {
     () => detectDefaultTransport(window.location),
     [],
   );
+
+  const [desktopServerUrl, setDesktopServerUrl] = useState<string>(() => {
+    if (!desktopBridge) return "";
+    return (
+      loadCachedDesktopServerUrl() ||
+      normalizeServerBaseUrl(desktopBridge.defaultServerUrl || "") ||
+      ""
+    );
+  });
+  const [recentServers, setRecentServers] = useState<string[]>(() =>
+    desktopBridge ? loadCachedRecentDesktopServers() : [],
+  );
+  const [serverConfigModalOpen, setServerConfigModalOpen] = useState(false);
+  const [desktopWindowState, setDesktopWindowState] =
+    useState<DesktopWindowState>({
+      alwaysOnTop: false,
+      preset: "dashboard",
+      isFullScreen: false,
+    });
 
   const [clientState, setClientState] = useState<RemoteClientState>(() =>
     client.getState(),
@@ -134,9 +167,18 @@ export function App() {
   const pendingCodeRef = useRef<PendingCodeConnect | null>(null);
   const quickUrlStrippedRef = useRef(false);
 
-  const activeApiBase = savedAccount?.apiBase ?? defaultApiBase;
+  const effectiveDefaultApiBase = desktopBridge
+    ? desktopServerUrl
+    : defaultApiBase;
+  const effectiveDefaultWsUrl = desktopBridge
+    ? deriveRelayWsUrlFromApiBase(desktopServerUrl)
+    : defaultRelayWsUrl;
+  const activeApiBase = savedAccount?.apiBase || effectiveDefaultApiBase;
 
-  function showToast(level: ToastMessage["level"], text: string) {
+  const effectiveDefaultWsUrlRef = useRef(effectiveDefaultWsUrl);
+  effectiveDefaultWsUrlRef.current = effectiveDefaultWsUrl;
+
+  const showToast = useCallback((level: ToastMessage["level"], text: string) => {
     const id = ++toastSeqRef.current;
     if (toastTimerRef.current !== null) {
       window.clearTimeout(toastTimerRef.current);
@@ -146,7 +188,7 @@ export function App() {
       toastTimerRef.current = null;
       setToast((curr) => (curr?.id === id ? null : curr));
     }, 3200);
-  }
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -156,6 +198,62 @@ export function App() {
       }
     };
   }, []);
+
+  // Hydrate desktop server config & window state from Electron preload IPC
+  useEffect(() => {
+    if (!desktopBridge) return;
+    let cancelled = false;
+
+    void desktopBridge
+      .getServerConfig()
+      .then((cfg) => {
+        if (cancelled || !cfg) return;
+        const normalized = normalizeServerBaseUrl(cfg.serverUrl || "");
+        setDesktopServerUrl(normalized);
+        saveCachedDesktopServerUrl(normalized);
+        const cleanRecent = (cfg.recentServers ?? [])
+          .map((u) => normalizeServerBaseUrl(u))
+          .filter(Boolean);
+        setRecentServers(cleanRecent);
+        saveCachedRecentDesktopServers(cleanRecent);
+      })
+      .catch(() => {
+        // Keep synchronous localStorage cache if IPC is temporarily unavailable
+      });
+
+    void desktopBridge
+      .getWindowState()
+      .then((state) => {
+        if (!cancelled && state) {
+          setDesktopWindowState(state);
+        }
+      })
+      .catch(() => {});
+
+    const unsubWindow = desktopBridge.onWindowStateChange((state) => {
+      if (!cancelled && state) {
+        setDesktopWindowState(state);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      unsubWindow();
+    };
+  }, [desktopBridge]);
+
+  // Desktop shortcut: Cmd/Ctrl + , opens Server Settings modal
+  useEffect(() => {
+    if (!desktopBridge) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === ",") {
+        e.preventDefault();
+        setServerConfigModalOpen(true);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [desktopBridge]);
 
   function applyQuickConnectImport(quick: QuickConnectParams) {
     const currentProfiles = loadProfiles();
@@ -197,6 +295,10 @@ export function App() {
 
   // Fetch server info (/api/info) for APK status, SHA-256 fingerprint, and registration policy
   useEffect(() => {
+    if (desktopBridge && !activeApiBase) {
+      setServerInfo({ hasAndroidApk: false });
+      return;
+    }
     let cancelled = false;
     void fetchServerInfo(activeApiBase).then((info) => {
       if (!cancelled) {
@@ -206,12 +308,13 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeApiBase]);
+  }, [activeApiBase, desktopBridge]);
 
   // Re-fetch /api/info whenever WebSocket (re)connects so long-lived open tabs
   // automatically pick up updated server version & APK SHA-256 after a server upgrade.
   useEffect(() => {
     if (clientState.socketStatus !== "connected") return;
+    if (desktopBridge && !activeApiBase) return;
     let cancelled = false;
     void fetchServerInfo(activeApiBase).then((info) => {
       if (!cancelled) {
@@ -221,7 +324,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeApiBase, clientState.socketStatus]);
+  }, [activeApiBase, clientState.socketStatus, desktopBridge]);
 
   // Boot: 1) QR/URL quick-connect params (with security check) -> 2) saved account session -> 3) LaunchView
   // StrictMode-safe: uses initialQuickRef parsed once on mount and reconnects whenever client is still idle.
@@ -251,9 +354,10 @@ export function App() {
     if (storedAccount) {
       setSavedAccount(storedAccount);
       setViewMode("dashboard");
-      if (client.getState().socketStatus === "idle") {
+      const targetWsUrl = storedAccount.wsUrl || effectiveDefaultWsUrlRef.current;
+      if (client.getState().socketStatus === "idle" && targetWsUrl) {
         client.connectWithAccount({
-          wsUrl: storedAccount.wsUrl || defaultRelayWsUrl,
+          wsUrl: targetWsUrl,
           authToken: storedAccount.authToken,
           user: storedAccount.user,
           preferredTransport: defaultTransport,
@@ -264,7 +368,7 @@ export function App() {
     }
 
     setViewMode("launch");
-  }, [client, defaultRelayWsUrl, defaultTransport]);
+  }, [client, defaultTransport]);
 
   // Auto-open device viewport if QR deep-link requested a specific deviceId
   useEffect(() => {
@@ -351,6 +455,13 @@ export function App() {
     const cleanCode = sanitizeControlCodeInput(input.controlCode);
     if (cleanCode.length !== 9 || !input.controlPassword.trim()) return;
 
+    const targetWsUrl = savedAccount?.wsUrl || effectiveDefaultWsUrl;
+    if (desktopBridge && !targetWsUrl) {
+      showToast("warn", "请先配置自托管服务器地址");
+      setServerConfigModalOpen(true);
+      return;
+    }
+
     const updatedRecent = saveRecentCodeEntry({
       controlCode: cleanCode,
       controlPassword: input.controlPassword,
@@ -368,7 +479,7 @@ export function App() {
     };
 
     client.connectWithControlCode({
-      wsUrl: savedAccount?.wsUrl || defaultRelayWsUrl,
+      wsUrl: targetWsUrl,
       controlCode: cleanCode,
       controlPassword: input.controlPassword,
       preferredTransport: defaultTransport,
@@ -406,8 +517,8 @@ export function App() {
     const session: SavedAccountSession = {
       authToken: auth.token,
       user: auth.user,
-      wsUrl: defaultRelayWsUrl,
-      apiBase: defaultApiBase,
+      wsUrl: effectiveDefaultWsUrl,
+      apiBase: effectiveDefaultApiBase,
     };
     saveAccountSession(session);
     setSavedAccount(session);
@@ -477,7 +588,7 @@ export function App() {
 
     // Reconnect active WebSocket with rotated JWT so future reconnects stay valid
     client.connectWithAccount({
-      wsUrl: updatedSession.wsUrl || defaultRelayWsUrl,
+      wsUrl: updatedSession.wsUrl || effectiveDefaultWsUrl,
       authToken: updatedSession.authToken,
       user: updatedSession.user,
       preferredTransport: clientState.desiredTransport ?? defaultTransport,
@@ -515,7 +626,7 @@ export function App() {
       clientState.socketStatus === "error"
     ) {
       client.connectWithAccount({
-        wsUrl: savedAccount.wsUrl || defaultRelayWsUrl,
+        wsUrl: savedAccount.wsUrl || effectiveDefaultWsUrl,
         authToken: savedAccount.authToken,
         user: savedAccount.user,
         preferredTransport: defaultTransport,
@@ -644,8 +755,16 @@ export function App() {
       return;
     }
     if (savedAccount) {
+      const targetWsUrl = savedAccount.wsUrl || effectiveDefaultWsUrl;
+      if (!targetWsUrl) {
+        if (desktopBridge) {
+          showToast("warn", "请先配置自托管服务器地址");
+          setServerConfigModalOpen(true);
+        }
+        return;
+      }
       client.connectWithAccount({
-        wsUrl: savedAccount.wsUrl || defaultRelayWsUrl,
+        wsUrl: targetWsUrl,
         authToken: savedAccount.authToken,
         user: savedAccount.user,
         preferredTransport: clientState.desiredTransport ?? defaultTransport,
@@ -659,6 +778,139 @@ export function App() {
       client.connect(activeProfile);
     }
   }
+
+  const reconnectHandlerRef = useRef<() => void>(() => {});
+  reconnectHandlerRef.current = handleDashboardReconnect;
+
+  useEffect(() => {
+    if (!desktopBridge) return;
+    return desktopBridge.onCommand((command) => {
+      if (command === "open-server-settings") {
+        setServerConfigModalOpen(true);
+      } else if (command === "reconnect") {
+        reconnectHandlerRef.current();
+      }
+    });
+  }, [desktopBridge]);
+
+  async function handleSaveDesktopServer(rawUrl: string) {
+    const normalized = normalizeServerBaseUrl(rawUrl);
+    if (!normalized) return;
+
+    const previousServerUrl = normalizeServerBaseUrl(desktopServerUrl);
+    const serverChanged = normalized !== previousServerUrl;
+
+    saveCachedDesktopServerUrl(normalized);
+    setDesktopServerUrl(normalized);
+
+    if (desktopBridge) {
+      try {
+        const updated = await desktopBridge.setServerConfig(normalized);
+        const cleanRecent = (updated.recentServers ?? [])
+          .map((u) => normalizeServerBaseUrl(u))
+          .filter(Boolean);
+        setRecentServers(cleanRecent);
+        saveCachedRecentDesktopServers(cleanRecent);
+      } catch {
+        const fallbackRecent = [
+          normalized,
+          ...recentServers.filter((u) => u !== normalized),
+        ].slice(0, 10);
+        setRecentServers(fallbackRecent);
+        saveCachedRecentDesktopServers(fallbackRecent);
+      }
+    }
+
+    const hostLabel = formatServerHostLabel(normalized) || normalized;
+    const accountApiBase = savedAccount
+      ? normalizeServerBaseUrl(savedAccount.apiBase)
+      : "";
+    const hasStaleAccount =
+      savedAccount !== null && accountApiBase !== normalized;
+
+    if (serverChanged && hasStaleAccount) {
+      pendingCodeRef.current = null;
+      setCodeOfflineNotice(null);
+      clearAccountSession();
+      clearSessionPasswords();
+      setSavedAccount(null);
+      setRecentCodes(loadRecentCodes());
+      client.disconnect();
+      setViewMode("launch");
+      showToast("info", `已切换至服务器 ${hostLabel}，请登录账号或输入控制码`);
+    } else if (serverChanged) {
+      if (client.getState().authType === "code") {
+        pendingCodeRef.current = null;
+        setCodeOfflineNotice(null);
+        client.disconnect();
+      }
+      showToast("info", `已切换至服务器 ${hostLabel}`);
+    } else {
+      showToast("info", `已保存服务器 ${hostLabel}`);
+    }
+
+    void fetchServerInfo(normalized).then((info) => {
+      setServerInfo(info);
+    });
+  }
+
+  async function handleRemoveRecentServer(serverUrl: string) {
+    const normalized = normalizeServerBaseUrl(serverUrl) || serverUrl;
+    if (desktopBridge) {
+      try {
+        const updated = await desktopBridge.removeRecentServer(normalized);
+        const cleanRecent = (updated.recentServers ?? [])
+          .map((u) => normalizeServerBaseUrl(u))
+          .filter(Boolean);
+        setRecentServers(cleanRecent);
+        saveCachedRecentDesktopServers(cleanRecent);
+        return;
+      } catch {
+        // Fall back to local removal
+      }
+    }
+    const next = recentServers.filter((u) => u !== normalized);
+    setRecentServers(next);
+    saveCachedRecentDesktopServers(next);
+  }
+
+  const handleToggleAlwaysOnTop = useCallback(async () => {
+    if (!desktopBridge) return;
+    try {
+      const next = await desktopBridge.setAlwaysOnTop(
+        !desktopWindowState.alwaysOnTop,
+      );
+      setDesktopWindowState(next);
+      showToast(
+        "info",
+        next.alwaysOnTop ? "已开启窗口置顶浮窗" : "已取消窗口置顶",
+      );
+    } catch {
+      showToast("error", "切换窗口置顶失败");
+    }
+  }, [desktopBridge, desktopWindowState.alwaysOnTop, showToast]);
+
+  const handleSetWindowPreset = useCallback(
+    async (preset: DesktopWindowPreset) => {
+      if (!desktopBridge) return;
+      try {
+        const next = await desktopBridge.setWindowPreset(preset);
+        setDesktopWindowState(next);
+      } catch {
+        showToast("error", "切换窗口比例失败");
+      }
+    },
+    [desktopBridge, showToast],
+  );
+
+  const handleOpenNewWindow = useCallback(async () => {
+    if (!desktopBridge) return;
+    try {
+      await desktopBridge.openNewWindow();
+    } catch {
+      showToast("error", "打开新窗口失败");
+    }
+  }, [desktopBridge, showToast]);
 
   function handleExitViewport() {
     if (clientState.authType === "code") {
@@ -690,6 +942,14 @@ export function App() {
             clientState.authType === "account" ? savedAccount?.authToken : undefined
           }
           serverInfo={serverInfo}
+          desktopWindowState={desktopBridge ? desktopWindowState : undefined}
+          onToggleAlwaysOnTop={
+            desktopBridge ? handleToggleAlwaysOnTop : undefined
+          }
+          onSetWindowPreset={desktopBridge ? handleSetWindowPreset : undefined}
+          onOpenNewWindow={desktopBridge ? handleOpenNewWindow : undefined}
+          onShowToast={showToast}
+          suppressKeyboard={serverConfigModalOpen || modalOpen}
           onExit={handleExitViewport}
         />
       ) : viewMode === "launch" ? (
@@ -702,6 +962,7 @@ export function App() {
           profileCount={profiles.length}
           clientState={clientState}
           codeOfflineNotice={codeOfflineNotice}
+          desktopServerUrl={desktopBridge ? desktopServerUrl : undefined}
           onConnectWithCode={handleConnectWithCode}
           onCancelCodeConnect={handleCancelCodeConnect}
           onRetryCodeConnect={handleRetryCodeConnect}
@@ -712,6 +973,9 @@ export function App() {
             setEditProfileId(null);
             setModalOpen(true);
           }}
+          onOpenServerSettings={
+            desktopBridge ? () => setServerConfigModalOpen(true) : undefined
+          }
         />
       ) : (
         <DashboardView
@@ -720,6 +984,7 @@ export function App() {
           apiBase={activeApiBase}
           serverInfo={serverInfo}
           profileCount={profiles.length}
+          desktopServerUrl={desktopBridge ? desktopServerUrl : undefined}
           onOpenConnections={(editId) => {
             setEditProfileId(editId ?? null);
             setModalOpen(true);
@@ -734,6 +999,23 @@ export function App() {
           onUnbindDevice={handleUnbindDevice}
           onReconnect={handleDashboardReconnect}
           onSwitchToDirectUrl={handleSwitchToDirectUrl}
+          onOpenServerSettings={
+            desktopBridge ? () => setServerConfigModalOpen(true) : undefined
+          }
+          onOpenNewWindow={
+            desktopBridge ? () => void handleOpenNewWindow() : undefined
+          }
+        />
+      )}
+
+      {desktopBridge && (
+        <ServerConfigModal
+          open={serverConfigModalOpen}
+          currentServerUrl={desktopServerUrl}
+          recentServers={recentServers}
+          onClose={() => setServerConfigModalOpen(false)}
+          onSaveServer={handleSaveDesktopServer}
+          onRemoveRecentServer={handleRemoveRecentServer}
         />
       )}
 

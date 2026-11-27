@@ -15,7 +15,8 @@ COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json ./
 COPY packages/protocol/package.json ./packages/protocol/package.json
 COPY controller/package.json ./controller/package.json
 COPY server/package.json ./server/package.json
-RUN pnpm install --frozen-lockfile --registry="$NPM_REGISTRY" --config.strictDepBuilds=false && pnpm rebuild esbuild
+COPY desktop/package.json ./desktop/package.json
+RUN pnpm install --frozen-lockfile --filter '!@velodeck/desktop' --registry="$NPM_REGISTRY" --config.strictDepBuilds=false && pnpm rebuild esbuild
 
 COPY packages/protocol ./packages/protocol
 COPY controller ./controller
@@ -30,6 +31,7 @@ COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY packages/protocol/package.json ./packages/protocol/package.json
 COPY controller/package.json ./controller/package.json
 COPY server/package.json ./server/package.json
+COPY desktop/package.json ./desktop/package.json
 RUN pnpm install --prod --frozen-lockfile --filter @velodeck/server... --registry="$NPM_REGISTRY"
 
 FROM node:22-alpine AS runtime
