@@ -208,7 +208,11 @@ velodeck.apiUrl=https://your-server.example.com
 - **桌面鼠键直控**：鼠标滚轮滚动、**右键 = 返回**、**中键 = 桌面**、直接键入与 `Cmd/Ctrl+V` 粘贴
 - **高清截图 & 多机同控**：`Cmd/Ctrl+Shift+C` 一键截屏到剪贴板、`Cmd/Ctrl+Shift+S` 保存 PNG、`Cmd/Ctrl+N` 多开窗口同时控制多台手机
 - **系统托盘 & 服务器切换器**：`Cmd/Ctrl+,` 随时切换自托管服务器（自动适配域名 HTTPS 与纯 IP）
-- **双向电脑被控端（Desktop Host）**：同一款软件内一键开启 **「本机被控」**，即可获得 9 位本机控制码 + 无人值守密码或一键绑定当前账号，让你的 **iPhone 浏览器/PWA 或另一台电脑** 60fps 远程观看并操控这台 Mac / Windows（支持 macOS 原生 Swift `CGEvent` / Windows Win32 `SendInput` 鼠键与中文输入、多显示器热切换、iPhone 直点/触控板双模式、WebRTC 文件直传、空闲自动停采零占用）
+- **双向电脑被控端（Desktop Host · 专业版）**：同一款软件内一键开启 **「本机被控」**，即可获得 9 位本机控制码 + 无人值守密码或一键绑定当前账号，让你的 **iPhone 浏览器/PWA 或另一台电脑** 远程观看并操控这台 Mac / Windows：
+  - **高刷原画 & 多编码器**：支持 `30 / 60 / 90 / 120 fps`、`1080p / 2K / 4K` 原画、`auto / H.264 / HEVC (H.265) / AV1 / VP9` 编码切换，局域网 P2P 码率上限可达 30 Mbps（云端 TURN 保持低延迟抗缓冲膨胀）
+  - **实时系统音频同步**：基于 macOS ScreenCaptureKit / Windows WASAPI 原生 loopback 采集（免装虚拟声卡）+ Opus 传输，远控端支持静音与音量调节
+  - **7×24 无人值守与安全**：开机自启、防休眠保活、远程电源管理（锁屏 / 睡眠 / 重启 / 关机，含二次确认与审计）、隐私防窥黑屏（`setContentProtection` 幕布 + `Cmd/Ctrl+Alt+Esc` 紧急解除）
+  - **双向文件管理器 & 高效操控**：经 WebRTC 加密通道直接浏览/下载/上传电脑任意目录文件、双向剪贴板自动同步、自适应 macOS/Windows 的组合键面板（含粘滞修饰键）、手机端 **1×–4× 双指捏合缩放**与直点/触控板双模式、多显示器热切换
 
 ```bash
 # 本地运行或打包 macOS / Windows 安装包

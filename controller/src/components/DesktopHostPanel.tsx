@@ -4,6 +4,7 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Clipboard,
   Copy,
   ExternalLink,
   Eye,
@@ -12,7 +13,9 @@ import {
   Link2,
   Loader2,
   Monitor,
+  Moon,
   Pencil,
+  Power,
   PowerOff,
   RefreshCw,
   RotateCcw,
@@ -20,6 +23,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Unlink,
+  Volume2,
   X,
 } from "lucide-react";
 import { formatControlCode } from "@velodeck/protocol";
@@ -40,6 +44,7 @@ export interface DesktopHostHandlers {
   onDisconnectSession: () => Promise<void>;
   onRefreshPermissions: () => Promise<void>;
   onOpenPermissionSettings: (kind: "accessibility" | "screen") => Promise<void>;
+  onSetPrivacyScreen?: (enabled: boolean) => Promise<void>;
 }
 
 export interface DesktopHostPanelProps {
@@ -140,6 +145,7 @@ export function DesktopHostPanel({
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(hostState.deviceName);
   const [savingName, setSavingName] = useState(false);
+  const [busySettingKey, setBusySettingKey] = useState<string | null>(null);
 
   // Auto-expand collapsible dashboard card when host becomes active or receives an incoming session
   useEffect(() => {
@@ -306,6 +312,29 @@ export function DesktopHostPanel({
     }
   }
 
+  async function handleToggleProConfig(
+    key: "autoLaunch" | "preventSleep" | "audioCaptureEnabled" | "clipboardAutoSync",
+    nextValue: boolean,
+  ) {
+    if (busySettingKey) return;
+    setBusySettingKey(key);
+    try {
+      await handlers.onUpdateConfig({ [key]: nextValue });
+    } finally {
+      setBusySettingKey(null);
+    }
+  }
+
+  async function handleTogglePrivacyScreen() {
+    if (busySettingKey || !handlers.onSetPrivacyScreen) return;
+    setBusySettingKey("privacyScreenActive");
+    try {
+      await handlers.onSetPrivacyScreen(!hostState.privacyScreenActive);
+    } finally {
+      setBusySettingKey(null);
+    }
+  }
+
   const showBody = !collapsible || expanded;
 
   const content = (
@@ -349,7 +378,7 @@ export function DesktopHostPanel({
               )}
             </div>
             <p className="mt-0.5 truncate text-xs text-[#6B7280]">
-              允许其他手机或电脑远程控制这台电脑（支持 60fps WebRTC 与键鼠直通）
+              允许其他手机或电脑远程控制这台电脑（支持高刷 WebRTC、系统音频与键鼠直通）
             </p>
           </div>
         </div>
@@ -763,6 +792,87 @@ export function DesktopHostPanel({
             </div>
           </div>
 
+          {/* Pro Unattended Host Settings */}
+          <div className="overflow-hidden rounded-lg border border-[#E2E6EC] bg-white">
+            <div className="flex items-center justify-between border-b border-[#ECEFF4] bg-[#F8F9FB] px-3.5 py-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-[#6B7280]">
+                无人值守与专业采集设置
+              </span>
+              {hostState.privacyScreenActive && (
+                <span className="inline-flex items-center gap-1 rounded border border-[#93C5FD] bg-[#EFF6FF] px-1.5 py-0.5 text-[10px] font-semibold text-[#1D4ED8]">
+                  <EyeOff className="h-3 w-3" />
+                  隐私防窥中
+                </span>
+              )}
+            </div>
+
+            <div className="divide-y divide-[#ECEFF4]">
+              <HostSettingToggleRow
+                icon={<Power className="h-3.5 w-3.5 text-[#4B5563]" />}
+                title="开机自启（Login Item）"
+                description="登录系统后自动静默拉起 VeloDeck 本机被控服务"
+                checked={Boolean(hostState.autoLaunch)}
+                busy={busySettingKey === "autoLaunch"}
+                disabled={Boolean(busySettingKey)}
+                onToggle={() =>
+                  void handleToggleProConfig("autoLaunch", !hostState.autoLaunch)
+                }
+              />
+
+              <HostSettingToggleRow
+                icon={<Moon className="h-3.5 w-3.5 text-[#4B5563]" />}
+                title="7×24 防休眠保活"
+                description="阻止电脑自动休眠断网，保障全天候无人值守远程接入"
+                checked={Boolean(hostState.preventSleep)}
+                busy={busySettingKey === "preventSleep"}
+                disabled={Boolean(busySettingKey)}
+                onToggle={() =>
+                  void handleToggleProConfig("preventSleep", !hostState.preventSleep)
+                }
+              />
+
+              <HostSettingToggleRow
+                icon={<Volume2 className="h-3.5 w-3.5 text-[#4B5563]" />}
+                title="系统音频同步采集"
+                description="远控会话建立时同步采集并传输本机系统声音"
+                checked={Boolean(hostState.audioCaptureEnabled)}
+                busy={busySettingKey === "audioCaptureEnabled"}
+                disabled={Boolean(busySettingKey)}
+                onToggle={() =>
+                  void handleToggleProConfig(
+                    "audioCaptureEnabled",
+                    !hostState.audioCaptureEnabled,
+                  )
+                }
+              />
+
+              <HostSettingToggleRow
+                icon={<Clipboard className="h-3.5 w-3.5 text-[#4B5563]" />}
+                title="双向剪贴板自动同步"
+                description="在本机与远控端之间自动实时同步复制的文本内容"
+                checked={hostState.clipboardAutoSync !== false}
+                busy={busySettingKey === "clipboardAutoSync"}
+                disabled={Boolean(busySettingKey)}
+                onToggle={() =>
+                  void handleToggleProConfig(
+                    "clipboardAutoSync",
+                    hostState.clipboardAutoSync === false,
+                  )
+                }
+              />
+
+              <HostSettingToggleRow
+                icon={<EyeOff className="h-3.5 w-3.5 text-[#4B5563]" />}
+                title="隐私防窥黑屏"
+                description="开启后本机屏幕显示纯黑，按 Cmd/Ctrl+Opt/Alt+Esc 可随时紧急解除"
+                checked={Boolean(hostState.privacyScreenActive)}
+                busy={busySettingKey === "privacyScreenActive"}
+                disabled={Boolean(busySettingKey) || !handlers.onSetPrivacyScreen}
+                onToggle={() => void handleTogglePrivacyScreen()}
+              />
+            </div>
+          </div>
+
           {/* Multi-Monitor Display Selector */}
           {hostState.displays.length > 0 && (
             <div>
@@ -924,4 +1034,60 @@ export function DesktopHostPanel({
   }
 
   return <section className="panel overflow-hidden rounded-xl">{content}</section>;
+}
+
+function HostSettingToggleRow({
+  icon,
+  title,
+  description,
+  checked,
+  busy,
+  disabled,
+  onToggle,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  description: string;
+  checked: boolean;
+  busy: boolean;
+  disabled: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 px-3.5 py-2.5">
+      <div className="flex min-w-0 flex-1 items-start gap-2.5">
+        <span className="mt-0.5 shrink-0">{icon}</span>
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-medium text-[#111318]">{title}</p>
+          <p className="mt-0.5 text-[11px] leading-snug text-[#6B7280]">
+            {description}
+          </p>
+        </div>
+      </div>
+
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={title}
+        disabled={disabled}
+        onClick={onToggle}
+        className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#2563EB] disabled:cursor-not-allowed disabled:opacity-50 ${
+          checked
+            ? "border-[#2563EB] bg-[#2563EB]"
+            : "border-[#CBD2DC] bg-[#E5E7EB]"
+        }`}
+      >
+        <span
+          className={`inline-flex h-4.5 w-4.5 transform items-center justify-center rounded-full bg-white shadow-xs transition-transform ${
+            checked ? "translate-x-5" : "translate-x-0.5"
+          }`}
+        >
+          {busy && (
+            <Loader2 className="h-2.5 w-2.5 animate-spin text-[#2563EB]" />
+          )}
+        </span>
+      </button>
+    </div>
+  );
 }

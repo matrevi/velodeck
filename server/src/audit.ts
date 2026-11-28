@@ -31,7 +31,9 @@ export type AuditEvent =
   | "control.wake"
   | "control.unlock"
   | "control.black_screen"
-  | "control.force_portrait";
+  | "control.force_portrait"
+  | "control.privacy_screen"
+  | "control.power";
 
 export interface AuditRecordInput {
   event: AuditEvent;

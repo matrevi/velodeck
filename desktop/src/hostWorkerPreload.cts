@@ -8,6 +8,7 @@ export interface HostWorkerDisplayInfo {
   width: number;
   height: number;
   primary: boolean;
+  scaleFactor?: number;
 }
 
 export interface HostWorkerPermissions {
@@ -30,6 +31,8 @@ export interface HostWorkerConfig {
   displays: HostWorkerDisplayInfo[];
   activeDisplayId: string;
   permissions: HostWorkerPermissions;
+  audioCaptureEnabled: boolean;
+  privacyScreenActive: boolean;
 }
 
 export type HostWorkerCommand =
@@ -40,6 +43,8 @@ export type HostWorkerCommand =
       reconnect: boolean;
       switchDisplayId?: string;
     }
+  | { type: "clipboard-push"; text: string }
+  | { type: "privacy-state-changed"; active: boolean }
   | { type: "disconnect-session"; reason?: string }
   | { type: "stop" };
 
@@ -51,6 +56,8 @@ export interface HostWorkerStateReport {
   activeTransport?: "webrtc" | "ws-jpeg" | null;
   activeDisplayId?: string;
   lastError?: string | null;
+  privacyScreenActive?: boolean;
+  audioEnabled?: boolean;
 }
 
 export interface HostCaptureSourceResult {
@@ -61,19 +68,55 @@ export interface HostCaptureSourceResult {
   error?: string;
 }
 
+export interface HostFsDownloadOpenResult {
+  ok: boolean;
+  fileName?: string;
+  size?: number;
+  mimeType?: string;
+  error?: string;
+}
+
+export interface HostFsDownloadChunkResult {
+  ok: boolean;
+  chunk?: Uint8Array;
+  done?: boolean;
+  sha256?: string;
+  size?: number;
+  error?: string;
+}
+
 export interface VeloDeckHostWorkerBridge {
   ready(): void;
   onCommand(cb: (command: HostWorkerCommand) => void): () => void;
   reportState(report: HostWorkerStateReport): void;
-  requestCaptureSource(displayId?: string): Promise<HostCaptureSourceResult>;
+  requestCaptureSource(
+    displayId?: string,
+    wantAudio?: boolean,
+  ): Promise<HostCaptureSourceResult>;
   dispatchControl(
     cmd: Record<string, unknown>,
     displayId?: string,
   ): Promise<{ ok: boolean; message?: string }>;
   setClipboard(text: string): Promise<boolean>;
+  setPrivacyScreen(
+    enabled: boolean,
+  ): Promise<{ ok: boolean; active: boolean; message?: string }>;
+  executePower(
+    operation: string,
+  ): Promise<{ ok: boolean; message?: string }>;
   fileTransferText(sessionId: string, text: string): Promise<string | null>;
   fileTransferBinary(sessionId: string, chunk: Uint8Array): Promise<string | null>;
   fileTransferAbort(sessionId: string): void;
+  fsRequest(
+    request: Record<string, unknown>,
+  ): Promise<Record<string, unknown>>;
+  fsDownloadOpen(
+    sessionId: string,
+    reqId: string,
+    filePath: string,
+  ): Promise<HostFsDownloadOpenResult>;
+  fsDownloadReadChunk(reqId: string): Promise<HostFsDownloadChunkResult>;
+  fsDownloadCancel(reqId: string): void;
 }
 
 const workerBridge: VeloDeckHostWorkerBridge = Object.freeze({
@@ -101,8 +144,14 @@ const workerBridge: VeloDeckHostWorkerBridge = Object.freeze({
     ipcRenderer.send("velodeck-host:state", report);
   },
 
-  requestCaptureSource(displayId?: string): Promise<HostCaptureSourceResult> {
-    return ipcRenderer.invoke("velodeck-host:get-capture-source", displayId ?? "");
+  requestCaptureSource(
+    displayId?: string,
+    wantAudio?: boolean,
+  ): Promise<HostCaptureSourceResult> {
+    return ipcRenderer.invoke("velodeck-host:get-capture-source", {
+      displayId: displayId ?? "",
+      wantAudio: Boolean(wantAudio),
+    });
   },
 
   dispatchControl(
@@ -119,6 +168,18 @@ const workerBridge: VeloDeckHostWorkerBridge = Object.freeze({
     return ipcRenderer.invoke("velodeck-host:clipboard-set", text);
   },
 
+  setPrivacyScreen(
+    enabled: boolean,
+  ): Promise<{ ok: boolean; active: boolean; message?: string }> {
+    return ipcRenderer.invoke("velodeck-host:privacy-screen", Boolean(enabled));
+  },
+
+  executePower(
+    operation: string,
+  ): Promise<{ ok: boolean; message?: string }> {
+    return ipcRenderer.invoke("velodeck-host:power", operation);
+  },
+
   fileTransferText(sessionId: string, text: string): Promise<string | null> {
     return ipcRenderer.invoke("velodeck-host:file-text", { sessionId, text });
   },
@@ -129,6 +190,32 @@ const workerBridge: VeloDeckHostWorkerBridge = Object.freeze({
 
   fileTransferAbort(sessionId: string): void {
     ipcRenderer.send("velodeck-host:file-abort", sessionId);
+  },
+
+  fsRequest(
+    request: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return ipcRenderer.invoke("velodeck-host:fs-request", request);
+  },
+
+  fsDownloadOpen(
+    sessionId: string,
+    reqId: string,
+    filePath: string,
+  ): Promise<HostFsDownloadOpenResult> {
+    return ipcRenderer.invoke("velodeck-host:fs-download-open", {
+      sessionId,
+      reqId,
+      filePath,
+    });
+  },
+
+  fsDownloadReadChunk(reqId: string): Promise<HostFsDownloadChunkResult> {
+    return ipcRenderer.invoke("velodeck-host:fs-download-read", reqId);
+  },
+
+  fsDownloadCancel(reqId: string): void {
+    ipcRenderer.send("velodeck-host:fs-download-cancel", reqId);
   },
 });
 

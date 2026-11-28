@@ -279,9 +279,41 @@ public static class VeloDeckWinInput {
                 case "F10": return 0x79;
                 case "F11": return 0x7A;
                 case "F12": return 0x7B;
+                case "F13": return 0x7C;
+                case "F14": return 0x7D;
+                case "F15": return 0x7E;
+                case "F16": return 0x7F;
+                case "F17": return 0x80;
+                case "F18": return 0x81;
+                case "F19": return 0x82;
+                case "F20": return 0x83;
+                case "PrintScreen": return 0x2C;
+                case "ScrollLock": return 0x91;
+                case "Pause": return 0x13;
+                case "NumLock": return 0x90;
+                case "ContextMenu": return 0x5D;
+                case "Numpad0": return 0x60;
+                case "Numpad1": return 0x61;
+                case "Numpad2": return 0x62;
+                case "Numpad3": return 0x63;
+                case "Numpad4": return 0x64;
+                case "Numpad5": return 0x65;
+                case "Numpad6": return 0x66;
+                case "Numpad7": return 0x67;
+                case "Numpad8": return 0x68;
+                case "Numpad9": return 0x69;
+                case "NumpadMultiply": return 0x6A;
+                case "NumpadAdd": return 0x6B;
+                case "NumpadSubtract": return 0x6D;
+                case "NumpadDecimal": return 0x6E;
+                case "NumpadDivide": return 0x6F;
                 case "AudioVolumeMute": return 0xAD;
                 case "AudioVolumeDown": return 0xAE;
                 case "AudioVolumeUp": return 0xAF;
+                case "MediaNextTrack": return 0xB0;
+                case "MediaPreviousTrack": return 0xB1;
+                case "MediaStop": return 0xB2;
+                case "MediaPlayPause": return 0xB3;
             }
         }
         if (!string.IsNullOrEmpty(key)) {
@@ -301,6 +333,24 @@ public static class VeloDeckWinInput {
                 case "arrowup": return 0x26;
                 case "arrowright": return 0x27;
                 case "arrowdown": return 0x28;
+                case "f1": return 0x70;
+                case "f2": return 0x71;
+                case "f3": return 0x72;
+                case "f4": return 0x73;
+                case "f5": return 0x74;
+                case "f6": return 0x75;
+                case "f7": return 0x76;
+                case "f8": return 0x77;
+                case "f9": return 0x78;
+                case "f10": return 0x79;
+                case "f11": return 0x7A;
+                case "f12": return 0x7B;
+                case "f13": return 0x7C;
+                case "f14": return 0x7D;
+                case "f15": return 0x7E;
+                case "audiovolumemute": return 0xAD;
+                case "audiovolumedown": return 0xAE;
+                case "audiovolumeup": return 0xAF;
             }
             if (lower.Length == 1) {
                 char c = char.ToUpperInvariant(lower[0]);

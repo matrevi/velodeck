@@ -3,6 +3,8 @@ export type TransportMode = "webrtc" | "ws-jpeg";
 export type DeviceType = "android" | "desktop";
 export type DevicePlatform = "android" | "darwin" | "win32" | "linux";
 export type MouseButton = "left" | "right" | "middle";
+export type VideoCodecPreference = "auto" | "h264" | "hevc" | "av1" | "vp9";
+export type DesktopPowerOperation = "lock" | "sleep" | "restart" | "shutdown";
 
 export interface DisplayInfo {
   id: string;
@@ -49,6 +51,11 @@ export interface DeviceCapabilities {
   mediaProjection: boolean;
   rootOrShizuku?: boolean;
   p2pFileTransfer?: boolean;
+  desktopAudio?: boolean;
+  privacyScreen?: boolean;
+  fileManager?: boolean;
+  powerControl?: boolean;
+  highRefresh?: boolean;
 }
 
 export interface DeviceSummary {
@@ -69,6 +76,8 @@ export interface DeviceSummary {
   screenOn?: boolean;
   blackScreenActive?: boolean;
   forcePortraitActive?: boolean;
+  privacyScreenActive?: boolean;
+  audioEnabled?: boolean;
   directUrl?: string;
   deviceType?: DeviceType;
   osPlatform?: DevicePlatform;
@@ -90,6 +99,8 @@ export interface StreamQuality {
   jpegQuality: number;
   /** When true, agent dynamically adapts bitrate, FPS, and resolution tier to live link speed/RTT. */
   auto?: boolean;
+  codec?: VideoCodecPreference;
+  audioEnabled?: boolean;
 }
 
 export const QUALITY_PRESETS: Record<"auto" | "eco" | "balanced" | "hd", StreamQuality> = {
@@ -97,6 +108,17 @@ export const QUALITY_PRESETS: Record<"auto" | "eco" | "balanced" | "hd", StreamQ
   eco: { maxWidth: 540, fps: 30, bitrateKbps: 1600, jpegQuality: 45 },
   balanced: { maxWidth: 900, fps: 60, bitrateKbps: 4500, jpegQuality: 54 },
   hd: { maxWidth: 1080, fps: 60, bitrateKbps: 7500, jpegQuality: 64 },
+};
+
+export const DESKTOP_QUALITY_PRESETS: Record<
+  "auto" | "eco" | "balanced" | "hd" | "ultra",
+  StreamQuality
+> = {
+  auto: { maxWidth: 1920, fps: 60, bitrateKbps: 8000, jpegQuality: 58, auto: true, codec: "auto" },
+  eco: { maxWidth: 1280, fps: 60, bitrateKbps: 3000, jpegQuality: 50, codec: "auto" },
+  balanced: { maxWidth: 1920, fps: 60, bitrateKbps: 8000, jpegQuality: 60, codec: "auto" },
+  hd: { maxWidth: 2560, fps: 90, bitrateKbps: 16000, jpegQuality: 68, codec: "auto" },
+  ultra: { maxWidth: 3840, fps: 120, bitrateKbps: 30000, jpegQuality: 74, codec: "auto" },
 };
 
 export interface RtcIceCandidateInit {
@@ -134,7 +156,10 @@ export type ControlCommand =
   | { action: "mouse_up"; x: number; y: number; button: MouseButton }
   | { action: "mouse_wheel"; x: number; y: number; deltaX: number; deltaY: number }
   | { action: "key_event"; phase: "down" | "up" | "press"; code: string; key: string; modifiers?: KeyModifiers }
-  | { action: "select_display"; displayId: string };
+  | { action: "select_display"; displayId: string }
+  | { action: "privacy_screen"; enabled: boolean }
+  | { action: "audio_toggle"; enabled: boolean }
+  | { action: "power"; operation: DesktopPowerOperation };
 
 export interface AgentRegisterMessage {
   type: "agent.register";
@@ -160,6 +185,8 @@ export interface AgentRegisterMessage {
   screenOn?: boolean;
   blackScreenActive?: boolean;
   forcePortraitActive?: boolean;
+  privacyScreenActive?: boolean;
+  audioEnabled?: boolean;
   directUrl?: string;
   deviceType?: DeviceType;
   osPlatform?: DevicePlatform;
@@ -189,6 +216,8 @@ export interface AgentTelemetryMessage {
   screenOn?: boolean;
   blackScreenActive?: boolean;
   forcePortraitActive?: boolean;
+  privacyScreenActive?: boolean;
+  audioEnabled?: boolean;
   deviceType?: DeviceType;
   osPlatform?: DevicePlatform;
   displays?: DisplayInfo[];

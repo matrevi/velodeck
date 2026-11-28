@@ -14,13 +14,17 @@ import {
   CornerDownLeft,
   Delete,
   Download,
+  EyeOff,
   FileUp,
+  FolderOpen,
+  Gauge,
   Hand,
   Home,
   Keyboard,
   Layers,
   Lock,
   LogOut,
+  Maximize2,
   Monitor,
   Moon,
   MousePointer2,
@@ -30,6 +34,7 @@ import {
   Plus,
   Power,
   RefreshCw,
+  RotateCw,
   Send,
   SlidersHorizontal,
   Smartphone,
@@ -39,18 +44,27 @@ import {
   Upload,
   Volume1,
   Volume2,
+  VolumeX,
   X,
   XCircle,
   Zap,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
-import type {
-  ControlCommand,
-  DeviceSummary,
-  MediaFrame,
-  MouseButton,
-  RemoteKey,
-  TransportMode,
+import {
+  DESKTOP_QUALITY_PRESETS,
+  type ControlCommand,
+  type DesktopPowerOperation,
+  type DeviceSummary,
+  type MediaFrame,
+  type MouseButton,
+  type RemoteKey,
+  type StreamQuality,
+  type TransportMode,
+  type VideoCodecPreference,
 } from "@velodeck/protocol";
+import { DesktopShortcutBar } from "./DesktopShortcutBar";
+import { RemoteFileBrowser } from "./RemoteFileBrowser";
 import {
   getDesktopBridge,
   isDesktopApp,
@@ -73,6 +87,7 @@ import {
 import type { QualityPreset } from "../state/profiles";
 import {
   isWebRtcStaticIdle,
+  type DesktopQualityPreset,
   type FileTransferPurpose,
   type FileTransferState,
   type RemoteClient,
@@ -104,7 +119,14 @@ interface TouchRipple {
   y: number;
 }
 
-type UtilityPanel = "none" | "unlock" | "text" | "files" | "more";
+type UtilityPanel =
+  | "none"
+  | "unlock"
+  | "text"
+  | "files"
+  | "shortcuts"
+  | "quality"
+  | "more";
 
 type VideoElementWithRVFC = HTMLVideoElement & {
   requestVideoFrameCallback?: (cb: () => void) => number;
@@ -123,6 +145,10 @@ const DESKTOP_TRACKPAD_SENSITIVITY = 1.4;
 const DESKTOP_MULTI_CLICK_WINDOW_MS = 400;
 const DESKTOP_MULTI_CLICK_MAX_DIST_PX = 8;
 const DESKTOP_TWO_FINGER_SCROLL_SCALE = 2.2;
+const DESKTOP_MIN_ZOOM = 1;
+const DESKTOP_MAX_ZOOM = 4;
+const DESKTOP_PINCH_DIST_THRESHOLD_PX = 14;
+const DESKTOP_SCROLL_MID_THRESHOLD_PX = 12;
 
 type DesktopTouchInputMode = "direct" | "trackpad";
 
@@ -260,6 +286,7 @@ export function RemoteViewport({
   const macDesktop = isMacDesktop();
 
   const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const mediaStageRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasCtxRef = useRef<CanvasRenderingContext2D | null>(null);
@@ -297,6 +324,14 @@ export function RemoteViewport({
   const [inputText, setInputText] = useState("");
   const [submitAfterText, setSubmitAfterText] = useState(false);
   const [copiedRemoteClip, setCopiedRemoteClip] = useState(false);
+  const [autoClipboardSync, setAutoClipboardSync] = useState(true);
+  const [audioMuted, setAudioMuted] = useState(true);
+  const [audioVolume, setAudioVolume] = useState(1);
+  const [viewZoom, setViewZoom] = useState(1);
+  const [viewPan, setViewPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [remoteBrowserDir, setRemoteBrowserDir] = useState("");
+  const [pendingPowerOp, setPendingPowerOp] =
+    useState<DesktopPowerOperation | null>(null);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [autoInstallApk, setAutoInstallApk] = useState(true);
   const [apkFetchState, setApkFetchState] = useState<{
@@ -343,6 +378,10 @@ export function RemoteViewport({
   const targetDeviceId = clientState.activeDeviceId ?? device?.deviceId ?? "";
 
   const virtualCursorRef = useRef<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
+  const viewZoomRef = useRef(1);
+  const viewPanRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const lastSyncedClipAtRef = useRef(0);
+  const lastLocalPushedClipRef = useRef("");
   const lastDesktopPointerNormRef = useRef<{ x: number; y: number }>({
     x: 0.5,
     y: 0.5,
@@ -365,10 +404,21 @@ export function RemoteViewport({
   >(new Map());
   const desktopTouchRef = useRef<{
     pointers: Map<number, DesktopTouchPointer>;
-    mode: "idle" | "single" | "drag" | "two_finger_scroll" | "long_pressed";
+    mode:
+      | "idle"
+      | "single"
+      | "drag"
+      | "two_finger_pending"
+      | "two_finger_scroll"
+      | "two_finger_zoom_pan"
+      | "long_pressed";
     longPressTimer: number | null;
     lastTap: { at: number; clientX: number; clientY: number } | null;
     lastMoveSentAt: number;
+    twoFingerStartDist: number;
+    twoFingerLastDist: number;
+    twoFingerStartMidX: number;
+    twoFingerStartMidY: number;
     twoFingerMidX: number;
     twoFingerMidY: number;
     dragStarted: boolean;
@@ -378,6 +428,10 @@ export function RemoteViewport({
     longPressTimer: null,
     lastTap: null,
     lastMoveSentAt: 0,
+    twoFingerStartDist: 0,
+    twoFingerLastDist: 0,
+    twoFingerStartMidX: 0,
+    twoFingerStartMidY: 0,
     twoFingerMidX: 0,
     twoFingerMidY: 0,
     dragStarted: false,
@@ -528,6 +582,123 @@ export function RemoteViewport({
     hasCanvasFrameRef.current = false;
     setHasCanvasFrame(false);
   }, [clientState.sessionId]);
+
+  // Reset desktop zoom, audio mute, and power confirmation when target device or session changes
+  useEffect(() => {
+    viewZoomRef.current = 1;
+    viewPanRef.current = { x: 0, y: 0 };
+    setViewZoom(1);
+    setViewPan({ x: 0, y: 0 });
+    setPendingPowerOp(null);
+  }, [clientState.sessionId, isDesktopTarget]);
+
+  useEffect(() => {
+    setAudioMuted(true);
+    setRemoteBrowserDir("");
+    lastSyncedClipAtRef.current = 0;
+    lastLocalPushedClipRef.current = "";
+  }, [targetDeviceId]);
+
+  // Keep <video> muted & volume synchronized (Android stays strictly muted)
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    if (!videoEl) return;
+    videoEl.muted = !isDesktopTarget || audioMuted;
+    videoEl.volume = Math.max(0, Math.min(1, audioVolume));
+  }, [isDesktopTarget, audioMuted, audioVolume, clientState.mediaStream]);
+
+  // Auto two-way clipboard sync for desktop targets: remote -> local system clipboard
+  useEffect(() => {
+    if (
+      !isDesktopTarget ||
+      !autoClipboardSync ||
+      !clientState.remoteClipboard ||
+      clientState.lastClipboardAt <= 0 ||
+      clientState.lastClipboardAt === lastSyncedClipAtRef.current
+    ) {
+      return;
+    }
+    const text = clientState.remoteClipboard;
+    lastSyncedClipAtRef.current = clientState.lastClipboardAt;
+    lastLocalPushedClipRef.current = text;
+
+    let cancelled = false;
+    const writeToLocal = async () => {
+      try {
+        if (typeof desktopBridge?.writeClipboardText === "function") {
+          const ok = await desktopBridge.writeClipboardText(text);
+          if (ok && !cancelled) {
+            onShowToast?.("info", "已自动同步远端剪贴板");
+          }
+          return;
+        }
+        if (
+          typeof navigator !== "undefined" &&
+          navigator.clipboard &&
+          typeof navigator.clipboard.writeText === "function" &&
+          (typeof document === "undefined" || document.hasFocus())
+        ) {
+          await navigator.clipboard.writeText(text);
+          if (!cancelled) {
+            onShowToast?.("info", "已自动同步远端剪贴板");
+          }
+        }
+      } catch {
+        // Browser may reject clipboard write without active focus/permission
+      }
+    };
+
+    void writeToLocal();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    isDesktopTarget,
+    autoClipboardSync,
+    clientState.remoteClipboard,
+    clientState.lastClipboardAt,
+    desktopBridge,
+    onShowToast,
+  ]);
+
+  // Auto two-way clipboard sync (Electron Desktop App only, zero prompt): local -> remote on focus
+  useEffect(() => {
+    if (
+      !isDesktopTarget ||
+      !autoClipboardSync ||
+      typeof desktopBridge?.readClipboardText !== "function"
+    ) {
+      return;
+    }
+    const syncLocalToRemote = async () => {
+      if (clientState.sessionStatus !== "streaming" || !targetDeviceId) return;
+      try {
+        const localText = await desktopBridge.readClipboardText!();
+        if (
+          localText &&
+          localText !== lastLocalPushedClipRef.current &&
+          localText !== clientState.remoteClipboard
+        ) {
+          lastLocalPushedClipRef.current = localText;
+          client.sendCommand({ action: "clipboard_set", text: localText }, targetDeviceId);
+        }
+      } catch {
+        // Ignore clipboard read failures
+      }
+    };
+    window.addEventListener("focus", syncLocalToRemote);
+    return () => {
+      window.removeEventListener("focus", syncLocalToRemote);
+    };
+  }, [
+    isDesktopTarget,
+    autoClipboardSync,
+    desktopBridge,
+    client,
+    targetDeviceId,
+    clientState.sessionStatus,
+    clientState.remoteClipboard,
+  ]);
 
   // Reset stuck drag overlay if user cancels drag outside window or window loses focus
   useEffect(() => {
@@ -796,7 +967,7 @@ export function RemoteViewport({
     if (
       !isDesktopTarget ||
       !isStreamingReady ||
-      activePanel !== "none" ||
+      (activePanel !== "none" && activePanel !== "shortcuts") ||
       suppressKeyboard
     ) {
       if (isDesktopTarget && desktopPressedKeysRef.current.size > 0) {
@@ -1096,13 +1267,84 @@ export function RemoteViewport({
     };
   }
 
+  function getActiveMediaElement(): HTMLElement | null {
+    if (!isDesktopTarget) {
+      return surfaceRef.current;
+    }
+    if (
+      clientState.activeTransport === "webrtc" &&
+      clientState.mediaStream !== null &&
+      videoRef.current
+    ) {
+      return videoRef.current;
+    }
+    if (
+      clientState.activeTransport === "ws-jpeg" &&
+      hasCanvasFrameRef.current &&
+      canvasRef.current
+    ) {
+      return canvasRef.current;
+    }
+    return mediaStageRef.current ?? surfaceRef.current;
+  }
+
+  function clampDesktopPan(
+    panX: number,
+    panY: number,
+    zoom: number,
+  ): { x: number; y: number } {
+    const surface = surfaceRef.current;
+    if (!surface || zoom <= 1.001) {
+      return { x: 0, y: 0 };
+    }
+    const sRect = surface.getBoundingClientRect();
+    const content = getRenderedContentSize();
+    const baseBox = computeContentRect(
+      sRect.width,
+      sRect.height,
+      content.width,
+      content.height,
+    );
+    const maxPanX = Math.max(0, (baseBox.width * zoom - sRect.width) / 2);
+    const maxPanY = Math.max(0, (baseBox.height * zoom - sRect.height) / 2);
+    return {
+      x: Math.max(-maxPanX, Math.min(maxPanX, panX)),
+      y: Math.max(-maxPanY, Math.min(maxPanY, panY)),
+    };
+  }
+
+  function applyDesktopZoomAndPan(
+    nextZoomRaw: number,
+    nextPanX: number,
+    nextPanY: number,
+  ) {
+    const nextZoom = Math.max(
+      DESKTOP_MIN_ZOOM,
+      Math.min(DESKTOP_MAX_ZOOM, Math.round(nextZoomRaw * 100) / 100),
+    );
+    const clamped =
+      nextZoom <= 1.001
+        ? { x: 0, y: 0 }
+        : clampDesktopPan(nextPanX, nextPanY, nextZoom);
+    viewZoomRef.current = nextZoom;
+    viewPanRef.current = clamped;
+    setViewZoom(nextZoom);
+    setViewPan(clamped);
+  }
+
+  function resetDesktopZoom() {
+    applyDesktopZoomAndPan(1, 0, 0);
+  }
+
   function mapClientToNormalized(
     clientX: number,
     clientY: number,
   ): NormalizedPoint | null {
-    const surface = surfaceRef.current;
-    if (!surface) return null;
-    const rect = surface.getBoundingClientRect();
+    const targetEl = getActiveMediaElement();
+    if (!targetEl) return null;
+    // When zoomed/panned, video/canvas/mediaStage getBoundingClientRect() automatically reflects
+    // the CSS transform (translate3d + scale), mapping every tap/click to the exact desktop pixel.
+    const rect = targetEl.getBoundingClientRect();
     const content = getRenderedContentSize();
     return clientPointToNormalized(
       clientX,
@@ -1117,9 +1359,9 @@ export function RemoteViewport({
     rect: DOMRect;
     contentBox: { left: number; top: number; width: number; height: number };
   } | null {
-    const surface = surfaceRef.current;
-    if (!surface) return null;
-    const rect = surface.getBoundingClientRect();
+    const targetEl = getActiveMediaElement();
+    if (!targetEl) return null;
+    const rect = targetEl.getBoundingClientRect();
     const content = getRenderedContentSize();
     const contentBox = computeContentRect(
       rect.width,
@@ -1256,10 +1498,23 @@ export function RemoteViewport({
           targetDeviceId,
         );
       }
-      touch.mode = "two_finger_scroll";
       const pts = Array.from(touch.pointers.values());
-      touch.twoFingerMidX = (pts[0]!.lastX + pts[1]!.lastX) / 2;
-      touch.twoFingerMidY = (pts[0]!.lastY + pts[1]!.lastY) / 2;
+      const dist = Math.hypot(
+        pts[0]!.lastX - pts[1]!.lastX,
+        pts[0]!.lastY - pts[1]!.lastY,
+      );
+      const midX = (pts[0]!.lastX + pts[1]!.lastX) / 2;
+      const midY = (pts[0]!.lastY + pts[1]!.lastY) / 2;
+      touch.twoFingerStartDist = Math.max(1, dist);
+      touch.twoFingerLastDist = Math.max(1, dist);
+      touch.twoFingerStartMidX = midX;
+      touch.twoFingerStartMidY = midY;
+      touch.twoFingerMidX = midX;
+      touch.twoFingerMidY = midY;
+      // When already zoomed in, 2-finger gestures seamlessly pan & pinch-zoom;
+      // at 1x fit-to-screen, classify pinch-scale change vs parallel 2-finger scroll.
+      touch.mode =
+        viewZoomRef.current > 1.05 ? "two_finger_zoom_pan" : "two_finger_pending";
     } else {
       if (touch.longPressTimer !== null) {
         window.clearTimeout(touch.longPressTimer);
@@ -1280,10 +1535,74 @@ export function RemoteViewport({
     pointer.lastY = e.clientY;
     pointer.lastNorm = norm;
 
-    if (touch.mode === "two_finger_scroll" && touch.pointers.size >= 2) {
+    if (
+      (touch.mode === "two_finger_pending" ||
+        touch.mode === "two_finger_scroll" ||
+        touch.mode === "two_finger_zoom_pan") &&
+      touch.pointers.size >= 2
+    ) {
       const pts = Array.from(touch.pointers.values());
+      const currDist = Math.max(
+        1,
+        Math.hypot(pts[0]!.lastX - pts[1]!.lastX, pts[0]!.lastY - pts[1]!.lastY),
+      );
       const midX = (pts[0]!.lastX + pts[1]!.lastX) / 2;
       const midY = (pts[0]!.lastY + pts[1]!.lastY) / 2;
+
+      if (touch.mode === "two_finger_pending") {
+        const distDelta = Math.abs(currDist - touch.twoFingerStartDist);
+        const scaleRatio = currDist / Math.max(1, touch.twoFingerStartDist);
+        const midDelta = Math.hypot(
+          midX - touch.twoFingerStartMidX,
+          midY - touch.twoFingerStartMidY,
+        );
+        if (
+          distDelta >= DESKTOP_PINCH_DIST_THRESHOLD_PX ||
+          scaleRatio >= 1.12 ||
+          scaleRatio <= 0.89
+        ) {
+          touch.mode = "two_finger_zoom_pan";
+          touch.twoFingerLastDist = currDist;
+          touch.twoFingerMidX = midX;
+          touch.twoFingerMidY = midY;
+          return;
+        }
+        if (midDelta >= DESKTOP_SCROLL_MID_THRESHOLD_PX && distDelta < 10) {
+          touch.mode = "two_finger_scroll";
+        } else {
+          return;
+        }
+      }
+
+      if (touch.mode === "two_finger_zoom_pan") {
+        const prevZoom = viewZoomRef.current;
+        const prevPan = viewPanRef.current;
+        const scaleStep = currDist / Math.max(1, touch.twoFingerLastDist);
+        const nextZoom = Math.max(
+          DESKTOP_MIN_ZOOM,
+          Math.min(DESKTOP_MAX_ZOOM, prevZoom * scaleStep),
+        );
+        const surface = surfaceRef.current;
+        if (surface) {
+          const sRect = surface.getBoundingClientRect();
+          const cx = sRect.left + sRect.width / 2;
+          const cy = sRect.top + sRect.height / 2;
+          const prevDx = touch.twoFingerMidX - cx;
+          const prevDy = touch.twoFingerMidY - cy;
+          const currDx = midX - cx;
+          const currDy = midY - cy;
+          const zoomRatio = nextZoom / Math.max(0.01, prevZoom);
+          const nextPanX = currDx - zoomRatio * (prevDx - prevPan.x);
+          const nextPanY = currDy - zoomRatio * (prevDy - prevPan.y);
+          applyDesktopZoomAndPan(nextZoom, nextPanX, nextPanY);
+        }
+        touch.twoFingerLastDist = currDist;
+        touch.twoFingerMidX = midX;
+        touch.twoFingerMidY = midY;
+        return;
+      }
+
+      // Parallel 2-finger scroll
       const dx = midX - touch.twoFingerMidX;
       const dy = midY - touch.twoFingerMidY;
       touch.twoFingerMidX = midX;
@@ -1395,8 +1714,15 @@ export function RemoteViewport({
     const norm = mapClientToNormalized(e.clientX, e.clientY) ?? pointer.lastNorm;
     touch.pointers.delete(e.pointerId);
 
-    if (touch.mode === "two_finger_scroll") {
+    if (
+      touch.mode === "two_finger_pending" ||
+      touch.mode === "two_finger_scroll" ||
+      touch.mode === "two_finger_zoom_pan"
+    ) {
       if (touch.pointers.size === 0) {
+        if (touch.mode === "two_finger_zoom_pan" && viewZoomRef.current < 1.04) {
+          resetDesktopZoom();
+        }
         touch.mode = "idle";
       }
       return;
@@ -1903,6 +2229,67 @@ export function RemoteViewport({
     flashMouseNavHint("切换显示器");
   }
 
+  function handleToggleDesktopAudio() {
+    const nextMuted = !audioMuted;
+    setAudioMuted(nextMuted);
+    const videoEl = videoRef.current;
+    if (videoEl) {
+      videoEl.muted = nextMuted;
+      videoEl.volume = Math.max(0, Math.min(1, audioVolume));
+      if (!nextMuted) {
+        void videoEl.play().catch(() => undefined);
+      }
+    }
+    client.sendCommand({ action: "audio_toggle", enabled: !nextMuted }, targetDeviceId);
+    onShowToast?.(
+      "info",
+      nextMuted
+        ? "已关闭远端电脑声音"
+        : clientState.hasRemoteAudio
+          ? "已开启远端电脑系统声音"
+          : "已开启远端声音监听（等待远端音频流）",
+    );
+  }
+
+  function handleTogglePrivacyScreen() {
+    const nextEnabled = !device?.privacyScreenActive;
+    client.sendCommand(
+      { action: "privacy_screen", enabled: nextEnabled },
+      targetDeviceId,
+    );
+    onShowToast?.(
+      "info",
+      nextEnabled
+        ? "已请求开启远端隐私防窥黑屏（对方屏幕将显示纯黑）"
+        : "已请求解除远端隐私防窥黑屏",
+    );
+  }
+
+  function handleDesktopPowerAction(operation: DesktopPowerOperation) {
+    if (operation === "lock") {
+      setPendingPowerOp(null);
+      client.sendCommand({ action: "power", operation: "lock" }, targetDeviceId);
+      onShowToast?.("info", "已发送远程锁屏指令");
+      return;
+    }
+    setPendingPowerOp(operation);
+  }
+
+  function handleConfirmDesktopPower() {
+    if (!pendingPowerOp) return;
+    const op = pendingPowerOp;
+    setPendingPowerOp(null);
+    setActivePanel("none");
+    client.sendCommand({ action: "power", operation: op }, targetDeviceId);
+    const labelMap: Record<DesktopPowerOperation, string> = {
+      lock: "已发送锁屏指令",
+      sleep: "已发送远程睡眠指令",
+      restart: "已发送远程重启指令",
+      shutdown: "已发送远程关机指令",
+    };
+    onShowToast?.("warn", labelMap[op]);
+  }
+
   function captureCurrentFramePngDataUrl(): string | null {
     const video = videoRef.current;
     if (
@@ -2099,6 +2486,7 @@ export function RemoteViewport({
   async function handleSendLocalFile(
     file: File,
     purposeOverride?: FileTransferPurpose,
+    targetDirOverride?: string,
   ) {
     setApkFetchState((prev) => (prev.error ? { ...prev, error: null } : prev));
     const isApk = file.name.toLowerCase().endsWith(".apk");
@@ -2110,6 +2498,9 @@ export function RemoteViewport({
         fileName: file.name,
         mimeType: file.type || undefined,
         purpose,
+        ...(isDesktopTarget && targetDirOverride
+          ? { targetDir: targetDirOverride }
+          : {}),
       });
     } catch {
       // RemoteClient already records error state and surfaces toast notice
@@ -2245,8 +2636,12 @@ export function RemoteViewport({
     setIsDraggingFile(false);
     const file = e.dataTransfer.files?.[0];
     if (!file) return;
+    const dropTargetDir =
+      isDesktopTarget && activePanel === "files" && remoteBrowserDir
+        ? remoteBrowserDir
+        : undefined;
     setActivePanel("files");
-    void handleSendLocalFile(file);
+    void handleSendLocalFile(file, undefined, dropTargetDir);
   }
 
   const activeFileTransfer = clientState.fileTransfer;
@@ -2341,9 +2736,13 @@ export function RemoteViewport({
       contentW,
       contentH,
     );
+    const cx = surfaceSize.width / 2;
+    const cy = surfaceSize.height / 2;
+    const baseLeft = box.left + virtualCursor.x * box.width;
+    const baseTop = box.top + virtualCursor.y * box.height;
     return {
-      left: box.left + virtualCursor.x * box.width,
-      top: box.top + virtualCursor.y * box.height,
+      left: cx + viewPan.x + (baseLeft - cx) * viewZoom,
+      top: cy + viewPan.y + (baseTop - cy) * viewZoom,
     };
   }, [
     isDesktopTarget,
@@ -2358,7 +2757,17 @@ export function RemoteViewport({
     clientState.screenHeight,
     virtualCursor.x,
     virtualCursor.y,
+    viewZoom,
+    viewPan.x,
+    viewPan.y,
   ]);
+
+  const effectiveDesktopQuality: StreamQuality =
+    clientState.desktopQuality ??
+    DESKTOP_QUALITY_PRESETS[clientState.qualityPreset] ??
+    DESKTOP_QUALITY_PRESETS.auto;
+  const isPrivacyActive = Boolean(device?.privacyScreenActive);
+  const isAudioLive = !audioMuted && clientState.hasRemoteAudio;
 
   return (
     <div
@@ -2385,6 +2794,35 @@ export function RemoteViewport({
 
           <div className="desktop-no-drag flex shrink-0 items-center gap-1.5">
             <div className="flex items-center gap-1">
+              {isDesktopTarget && (
+                <button
+                  type="button"
+                  onClick={handleToggleDesktopAudio}
+                  title={
+                    audioMuted
+                      ? "开启远端电脑系统声音"
+                      : "静音远端电脑声音"
+                  }
+                  aria-label={
+                    audioMuted ? "开启远端电脑系统声音" : "静音远端电脑声音"
+                  }
+                  aria-pressed={!audioMuted}
+                  className={`desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border transition ${
+                    !audioMuted
+                      ? isAudioLive
+                        ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-300"
+                        : "border-[#2563EB] bg-[#2563EB] text-white"
+                      : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                  }`}
+                >
+                  {audioMuted ? (
+                    <VolumeX className="h-3.5 w-3.5" />
+                  ) : (
+                    <Volume2 className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => void onToggleAlwaysOnTop?.()}
@@ -2482,53 +2920,67 @@ export function RemoteViewport({
         onContextMenu={handleContextMenu}
         onAuxClick={handleAuxClick}
         onWheel={isDesktopTarget ? undefined : handleWheel}
-        className={`relative w-full touch-none ${
+        className={`relative w-full overflow-hidden touch-none ${
           desktopApp ? "min-h-0 flex-1" : "h-full"
         }`}
       >
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted
-          disablePictureInPicture
-          disableRemotePlayback
-          style={{ willChange: "transform" }}
-          onLoadedMetadata={(e) => {
-            const el = e.currentTarget;
-            if (el.videoWidth > 0 && el.videoHeight > 0) {
-              markVideoFrameReady();
-            }
-          }}
-          onLoadedData={(e) => {
-            const el = e.currentTarget;
-            if (el.videoWidth > 0 && el.videoHeight > 0) {
-              markVideoFrameReady();
-            }
-          }}
-          onPlaying={(e) => {
-            const el = e.currentTarget;
-            if (el.videoWidth > 0 && el.videoHeight > 0) {
-              markVideoFrameReady();
-            }
-          }}
-          onResize={(e) => {
-            const el = e.currentTarget;
-            if (el.videoWidth > 0 && el.videoHeight > 0) {
-              markVideoFrameReady();
-            }
-          }}
-          className={`pointer-events-none absolute inset-0 h-full w-full object-contain ${
-            isWebRtcVisible ? "opacity-100" : "opacity-0"
-          }`}
-        />
+        <div
+          ref={mediaStageRef}
+          style={
+            isDesktopTarget && (viewZoom > 1 || viewPan.x !== 0 || viewPan.y !== 0)
+              ? {
+                  transform: `translate3d(${viewPan.x}px, ${viewPan.y}px, 0) scale(${viewZoom})`,
+                  transformOrigin: "center center",
+                  willChange: "transform",
+                }
+              : undefined
+          }
+          className="pointer-events-none absolute inset-0 h-full w-full"
+        >
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted={!isDesktopTarget || audioMuted}
+            disablePictureInPicture
+            disableRemotePlayback
+            style={{ willChange: "transform" }}
+            onLoadedMetadata={(e) => {
+              const el = e.currentTarget;
+              if (el.videoWidth > 0 && el.videoHeight > 0) {
+                markVideoFrameReady();
+              }
+            }}
+            onLoadedData={(e) => {
+              const el = e.currentTarget;
+              if (el.videoWidth > 0 && el.videoHeight > 0) {
+                markVideoFrameReady();
+              }
+            }}
+            onPlaying={(e) => {
+              const el = e.currentTarget;
+              if (el.videoWidth > 0 && el.videoHeight > 0) {
+                markVideoFrameReady();
+              }
+            }}
+            onResize={(e) => {
+              const el = e.currentTarget;
+              if (el.videoWidth > 0 && el.videoHeight > 0) {
+                markVideoFrameReady();
+              }
+            }}
+            className={`pointer-events-none absolute inset-0 h-full w-full object-contain ${
+              isWebRtcVisible ? "opacity-100" : "opacity-0"
+            }`}
+          />
 
-        <canvas
-          ref={canvasRef}
-          className={`pointer-events-none absolute inset-0 h-full w-full object-contain ${
-            !isWebRtcVisible && hasCanvasFrame ? "opacity-100" : "opacity-0"
-          }`}
-        />
+          <canvas
+            ref={canvasRef}
+            className={`pointer-events-none absolute inset-0 h-full w-full object-contain ${
+              !isWebRtcVisible && hasCanvasFrame ? "opacity-100" : "opacity-0"
+            }`}
+          />
+        </div>
 
         {ripples.map((ripple) => (
           <span
@@ -2591,7 +3043,9 @@ export function RemoteViewport({
             <p className="mt-1.5 text-xs text-zinc-400">
               {isFileChannelReady
                 ? isDesktopTarget
-                  ? "文件将直接保存至远端电脑的下载目录，不占用云端转发带宽"
+                  ? activePanel === "files" && remoteBrowserDir
+                    ? `文件将直接保存至当前浏览目录：${remoteBrowserDir}`
+                    : "文件将直接保存至远端电脑的下载目录，不占用云端转发带宽"
                   : "普通文件将保存至手机 Download/VeloDeck/，不占用云端转发带宽"
                 : "当前 WebRTC P2P 文件通道尚未就绪，松手后将打开传输面板查看状态"}
             </p>
@@ -2599,8 +3053,95 @@ export function RemoteViewport({
         </div>
       )}
 
+      {/* Desktop Floating Zoom Control Badge (shown when zoomed > 1.05x) */}
+      {isDesktopTarget && isStreamingReady && viewZoom > 1.05 && (
+        <div
+          className="pointer-events-none fixed left-3 top-0 z-50 flex items-center gap-1.5"
+          style={{
+            paddingTop: desktopApp
+              ? "3.25rem"
+              : "max(0.75rem, env(safe-area-inset-top))",
+          }}
+        >
+          <div className="pointer-events-auto inline-flex items-center gap-1 rounded-full border border-[#2C313D] bg-[#111318] px-2 py-1 text-xs text-zinc-100 shadow-[0_8px_24px_rgba(0,0,0,0.65)]">
+            <button
+              type="button"
+              onClick={() =>
+                applyDesktopZoomAndPan(
+                  viewZoom - 0.5,
+                  viewPan.x,
+                  viewPan.y,
+                )
+              }
+              className="flex h-6 w-6 items-center justify-center rounded-full bg-white/8 text-zinc-200 hover:bg-white/15"
+              aria-label="缩小视图"
+            >
+              <ZoomOut className="h-3.5 w-3.5" />
+            </button>
+            <span className="min-w-[2.6rem] text-center font-mono text-[11px] font-semibold text-white">
+              {viewZoom.toFixed(1)}×
+            </span>
+            <button
+              type="button"
+              onClick={() =>
+                applyDesktopZoomAndPan(
+                  viewZoom + 0.5,
+                  viewPan.x,
+                  viewPan.y,
+                )
+              }
+              className="flex h-6 w-6 items-center justify-center rounded-full bg-white/8 text-zinc-200 hover:bg-white/15"
+              aria-label="放大视图"
+            >
+              <ZoomIn className="h-3.5 w-3.5" />
+            </button>
+            <span className="mx-0.5 h-3.5 w-px bg-[#2C313D]" />
+            <button
+              type="button"
+              onClick={resetDesktopZoom}
+              className="inline-flex h-6 items-center gap-1 rounded-full bg-[#2563EB] px-2 text-[11px] font-medium text-white hover:bg-[#1D4ED8]"
+            >
+              <Maximize2 className="h-3 w-3" />
+              <span>适应屏幕</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Web/Mobile Quick Audio Toggle Pill for Desktop Targets */}
+      {isDesktopTarget && isStreamingReady && !desktopApp && viewZoom <= 1.05 && (
+        <div
+          className="pointer-events-none fixed left-3 top-0 z-50"
+          style={{ paddingTop: "max(0.75rem, env(safe-area-inset-top))" }}
+        >
+          <button
+            type="button"
+            onClick={handleToggleDesktopAudio}
+            aria-label={audioMuted ? "开启远端电脑声音" : "静音远端电脑声音"}
+            aria-pressed={!audioMuted}
+            className={`pointer-events-auto inline-flex h-8 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-medium shadow-[0_8px_24px_rgba(0,0,0,0.55)] transition ${
+              !audioMuted
+                ? isAudioLive
+                  ? "border-emerald-500/50 bg-[#111318] text-emerald-300"
+                  : "border-[#2563EB] bg-[#2563EB] text-white"
+                : "border-[#2C313D] bg-[#111318] text-zinc-300 hover:border-[#3F4656]"
+            }`}
+          >
+            {audioMuted ? (
+              <VolumeX className="h-3.5 w-3.5" />
+            ) : (
+              <Volume2 className="h-3.5 w-3.5" />
+            )}
+            <span className="hidden sm:inline">
+              {audioMuted ? "静音" : isAudioLive ? "声音开启" : "监听中"}
+            </span>
+          </button>
+        </div>
+      )}
+
       {/* Compact Background Transfer Progress Pill (when transfer runs while sheet is closed) */}
-      {(isFileTransferActive || apkFetchState.active) && activePanel !== "files" && (
+      {(isFileTransferActive || clientState.fileDownload.active || apkFetchState.active) &&
+        activePanel !== "files" && (
         <div
           className="pointer-events-none fixed inset-x-0 top-0 z-50 flex justify-center px-3 sm:justify-start"
           style={{
@@ -2612,15 +3153,25 @@ export function RemoteViewport({
           <button
             type="button"
             onClick={() => setActivePanel("files")}
-            className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-blue-500/40 bg-[#111318]/95 px-3 py-1.5 text-xs font-medium text-blue-200 shadow-[0_8px_24px_rgba(0,0,0,0.6)] hover:border-blue-400"
+            className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-blue-500/40 bg-[#111318] px-3 py-1.5 text-xs font-medium text-blue-200 shadow-[0_8px_24px_rgba(0,0,0,0.6)] hover:border-blue-400"
           >
-            <Upload className="h-3.5 w-3.5 animate-pulse text-blue-400" />
+            {clientState.fileDownload.active ? (
+              <Download className="h-3.5 w-3.5 text-blue-400" />
+            ) : (
+              <Upload className="h-3.5 w-3.5 text-blue-400" />
+            )}
             <span>
-              {apkFetchState.active
-                ? "正在拉取最新 APK..."
-                : activeFileTransfer?.status === "verifying"
-                  ? "正在校验 SHA-256..."
-                  : `P2P 传输 ${fileTransferPct}%`}
+              {clientState.fileDownload.active
+                ? `正在下载 ${
+                    clientState.fileDownload.totalBytes > 0
+                      ? `${Math.min(100, Math.round((clientState.fileDownload.receivedBytes / clientState.fileDownload.totalBytes) * 100))}%`
+                      : "..."
+                  }`
+                : apkFetchState.active
+                  ? "正在拉取最新 APK..."
+                  : activeFileTransfer?.status === "verifying"
+                    ? "正在校验 SHA-256..."
+                    : `P2P 传输 ${fileTransferPct}%`}
             </span>
           </button>
         </div>
@@ -2757,30 +3308,45 @@ export function RemoteViewport({
               </div>
 
               <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={() =>
-                    setActivePanel((p) => (p === "files" ? "none" : "files"))
-                  }
-                  className={`inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-[11px] font-medium transition ${
-                    activePanel === "files"
-                      ? "border-[#2563EB] bg-[#2563EB] text-white"
-                      : isFileTransferActive || apkFetchState.active
-                        ? "border-blue-500/45 bg-blue-500/20 text-blue-200 hover:bg-blue-500/30"
-                        : isFileChannelReady
-                          ? "border-emerald-500/35 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25"
-                          : "border-[#2C313D] bg-white/10 text-zinc-200 hover:bg-white/15"
-                  }`}
-                >
-                  <Upload className="h-3 w-3" />
-                  {isFileTransferActive
-                    ? `传输 ${fileTransferPct}%`
-                    : apkFetchState.active
-                      ? "拉取 APK"
-                      : isDesktopTarget
-                        ? "文件传输"
+                {isDesktopTarget ? (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActivePanel((p) => (p === "text" ? "none" : "text"))
+                    }
+                    className={`inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-[11px] font-medium transition ${
+                      activePanel === "text"
+                        ? "border-[#2563EB] bg-[#2563EB] text-white"
+                        : "border-[#2C313D] bg-white/10 text-zinc-200 hover:bg-white/15"
+                    }`}
+                  >
+                    <Clipboard className="h-3 w-3 text-blue-400" />
+                    <span>输入/剪贴板</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setActivePanel((p) => (p === "files" ? "none" : "files"))
+                    }
+                    className={`inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-[11px] font-medium transition ${
+                      activePanel === "files"
+                        ? "border-[#2563EB] bg-[#2563EB] text-white"
+                        : isFileTransferActive || apkFetchState.active
+                          ? "border-blue-500/45 bg-blue-500/20 text-blue-200 hover:bg-blue-500/30"
+                          : isFileChannelReady
+                            ? "border-emerald-500/35 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25"
+                            : "border-[#2C313D] bg-white/10 text-zinc-200 hover:bg-white/15"
+                    }`}
+                  >
+                    <Upload className="h-3 w-3" />
+                    {isFileTransferActive
+                      ? `传输 ${fileTransferPct}%`
+                      : apkFetchState.active
+                        ? "拉取 APK"
                         : "文件/升级"}
-                </button>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={onExit}
@@ -2850,7 +3416,7 @@ export function RemoteViewport({
                         <Hand className="h-4 w-4 text-blue-400" />
                       )
                     }
-                    label={touchInputMode === "trackpad" ? "触控板" : "直点模式"}
+                    label={touchInputMode === "trackpad" ? "触控板" : "直点"}
                     active={touchInputMode === "trackpad"}
                     onClick={() => {
                       const next =
@@ -2860,51 +3426,73 @@ export function RemoteViewport({
                         "info",
                         next === "trackpad"
                           ? "已切换为触控板模式（单指拖动移动虚拟光标，轻点左键，长按右键）"
-                          : "已切换为直点模式（轻点左键，双击左键，长按右键，双指滚动）",
+                          : "已切换为直点模式（轻点左键，双击左键，长按右键，双指缩放/滚动）",
                       );
                     }}
                   />
                   <DockButton
-                    icon={<MousePointerClick className="h-4 w-4 text-sky-400" />}
-                    label="右键单击"
-                    onClick={sendDesktopRightClick}
+                    icon={<Keyboard className="h-4 w-4 text-sky-400" />}
+                    label="快捷键"
+                    active={activePanel === "shortcuts"}
+                    onClick={() =>
+                      setActivePanel((p) => (p === "shortcuts" ? "none" : "shortcuts"))
+                    }
                   />
                   <DockButton
-                    icon={<Layers className="h-4 w-4" />}
-                    label="切换应用"
-                    onClick={() => sendKey("recents")}
+                    icon={
+                      audioMuted ? (
+                        <VolumeX className="h-4 w-4 text-zinc-400" />
+                      ) : (
+                        <Volume2
+                          className={`h-4 w-4 ${
+                            isAudioLive ? "text-emerald-300" : "text-white"
+                          }`}
+                        />
+                      )
+                    }
+                    label={audioMuted ? "声音" : isAudioLive ? "声音中" : "已开声"}
+                    active={!audioMuted}
+                    onClick={handleToggleDesktopAudio}
                   />
                 </div>
 
                 <div className="mt-1.5 grid grid-cols-4 gap-1.5">
                   <DockButton
-                    icon={<Keyboard className="h-4 w-4 text-blue-400" />}
-                    label="键盘/剪贴板"
-                    active={activePanel === "text"}
-                    onClick={() =>
-                      setActivePanel((p) => (p === "text" ? "none" : "text"))
+                    icon={
+                      <EyeOff
+                        className={`h-4 w-4 ${
+                          isPrivacyActive ? "text-white" : "text-indigo-400"
+                        }`}
+                      />
                     }
+                    label={isPrivacyActive ? "防窥中" : "隐私屏"}
+                    active={isPrivacyActive}
+                    onClick={handleTogglePrivacyScreen}
                   />
                   <DockButton
-                    icon={<Upload className="h-4 w-4 text-emerald-400" />}
-                    label="文件传输"
+                    icon={<FolderOpen className="h-4 w-4 text-emerald-400" />}
+                    label="文件管理"
                     active={activePanel === "files"}
                     onClick={() =>
                       setActivePanel((p) => (p === "files" ? "none" : "files"))
                     }
                   />
                   <DockButton
-                    icon={<Lock className="h-4 w-4 text-amber-400" />}
-                    label="锁屏"
-                    onClick={() => sendKey("lock")}
+                    icon={<Gauge className="h-4 w-4 text-amber-400" />}
+                    label={`画质(${effectiveDesktopQuality.fps}Hz)`}
+                    active={activePanel === "quality"}
+                    onClick={() =>
+                      setActivePanel((p) => (p === "quality" ? "none" : "quality"))
+                    }
                   />
                   <DockButton
                     icon={<SlidersHorizontal className="h-4 w-4 text-zinc-200" />}
-                    label="画质/更多"
+                    label="更多"
                     active={activePanel === "more"}
-                    onClick={() =>
-                      setActivePanel((p) => (p === "more" ? "none" : "more"))
-                    }
+                    onClick={() => {
+                      setPendingPowerOp(null);
+                      setActivePanel((p) => (p === "more" ? "none" : "more"));
+                    }}
                   />
                 </div>
               </>
@@ -3100,6 +3688,30 @@ export function RemoteViewport({
             </div>
 
             <div className="rounded-lg border border-[#2C313D] bg-[#0A0C10] p-3">
+              {isDesktopTarget && (
+                <div className="mb-2.5 flex items-center justify-between border-b border-[#1F2430] pb-2">
+                  <span className="text-xs font-medium text-zinc-200">
+                    双向剪贴板自动同步
+                  </span>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={autoClipboardSync}
+                    onClick={() => setAutoClipboardSync((prev) => !prev)}
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+                      autoClipboardSync
+                        ? "border-[#2563EB] bg-[#2563EB]"
+                        : "border-[#3F4656] bg-[#1F2430]"
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                        autoClipboardSync ? "translate-x-4.5" : "translate-x-0.5"
+                      }`}
+                    />
+                  </button>
+                </div>
+              )}
               <div className="flex items-center justify-between">
                 <span className="text-[11px] font-medium text-zinc-400">
                   远端最新剪贴板
@@ -3134,61 +3746,178 @@ export function RemoteViewport({
         </DarkSheet>
       )}
 
-      {/* P2P File Transfer & Remote OTA APK Upgrade Sheet */}
-      {activePanel === "files" && (
+      {/* Pro Desktop Combo Shortcut Pad */}
+      {isDesktopTarget && activePanel === "shortcuts" && (
+        <DesktopShortcutBar
+          targetPlatform={device?.osPlatform}
+          onSendKeyEvent={(cmd) => client.sendCommand(cmd, targetDeviceId)}
+          onClose={() => setActivePanel("none")}
+        />
+      )}
+
+      {/* Pro Desktop Video Quality / Refresh Rate / Codec / Audio Drawer */}
+      {isDesktopTarget && activePanel === "quality" && (
         <DarkSheet
-          title={isDesktopTarget ? "P2P 文件直传" : "P2P 文件直传与远程升级"}
+          title="桌面画质、刷新率与编码器"
           onClose={() => setActivePanel("none")}
         >
-          <FileTransferSheetContent
+          <DesktopQualitySheetContent
             client={client}
-            clientState={clientState}
-            device={device}
-            isDesktopTarget={isDesktopTarget}
-            apiBase={resolvedApiBase}
-            serverInfo={serverInfo}
-            autoInstallApk={autoInstallApk}
-            onToggleAutoInstallApk={setAutoInstallApk}
-            apkFetchState={apkFetchState}
-            onPushLatestApk={() => void handlePushLatestApk()}
-            onCancelApkFetch={handleCancelApkFetch}
-            fileInputRef={fileInputRef}
-            onSelectLocalFile={(file) => void handleSendLocalFile(file)}
-            onCloseSheet={() => setActivePanel("none")}
+            qualityPreset={clientState.qualityPreset}
+            desktopQuality={effectiveDesktopQuality}
+            activeTransport={clientState.activeTransport}
+            desiredTransport={clientState.desiredTransport}
+            audioMuted={audioMuted}
+            audioVolume={audioVolume}
+            hasRemoteAudio={clientState.hasRemoteAudio}
+            onToggleAudio={handleToggleDesktopAudio}
+            onChangeVolume={setAudioVolume}
           />
+        </DarkSheet>
+      )}
+
+      {/* P2P File Transfer / Remote File Browser Sheet */}
+      {activePanel === "files" && (
+        <DarkSheet
+          title={isDesktopTarget ? "远端电脑双向文件管理" : "P2P 文件直传与远程升级"}
+          wide={isDesktopTarget}
+          onClose={() => setActivePanel("none")}
+        >
+          {isDesktopTarget ? (
+            <RemoteFileBrowser
+              client={client}
+              clientState={clientState}
+              device={device}
+              currentDir={remoteBrowserDir}
+              onCurrentDirChange={setRemoteBrowserDir}
+              onShowToast={onShowToast}
+            />
+          ) : (
+            <FileTransferSheetContent
+              client={client}
+              clientState={clientState}
+              device={device}
+              isDesktopTarget={isDesktopTarget}
+              apiBase={resolvedApiBase}
+              serverInfo={serverInfo}
+              autoInstallApk={autoInstallApk}
+              onToggleAutoInstallApk={setAutoInstallApk}
+              apkFetchState={apkFetchState}
+              onPushLatestApk={() => void handlePushLatestApk()}
+              onCancelApkFetch={handleCancelApkFetch}
+              fileInputRef={fileInputRef}
+              onSelectLocalFile={(file) => void handleSendLocalFile(file)}
+              onCloseSheet={() => setActivePanel("none")}
+            />
+          )}
         </DarkSheet>
       )}
 
       {/* Quality & Hardware Controls Sheet */}
       {activePanel === "more" && (
         <DarkSheet
-          title={isDesktopTarget ? "画质与远端电脑控制" : "画质与硬件控制"}
-          onClose={() => setActivePanel("none")}
+          title={isDesktopTarget ? "电源、显示器与桌面控制" : "画质与硬件控制"}
+          onClose={() => {
+            setPendingPowerOp(null);
+            setActivePanel("none");
+          }}
         >
           <div className="space-y-4">
-            <button
-              type="button"
-              onClick={() => setActivePanel("files")}
-              className="flex h-10 w-full items-center justify-between rounded-lg border border-[#2C313D] bg-[#191D26] px-3 text-xs font-medium text-zinc-100 transition hover:bg-[#232836]"
-            >
-              <span className="inline-flex items-center gap-2">
-                <Upload
-                  className={`h-4 w-4 ${
-                    isFileChannelReady ? "text-emerald-400" : "text-blue-400"
-                  }`}
-                />
-                {isDesktopTarget ? "P2P 文件直传" : "P2P 文件直传与远程升级"}
-              </span>
-              <span
-                className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                  isFileChannelReady
-                    ? "bg-emerald-500/20 text-emerald-300"
-                    : "bg-white/10 text-zinc-400"
-                }`}
+            {isDesktopTarget ? (
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setActivePanel("files")}
+                  className="flex h-10 items-center justify-between rounded-lg border border-[#2C313D] bg-[#191D26] px-3 text-xs font-medium text-zinc-100 transition hover:bg-[#232836]"
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <FolderOpen
+                      className={`h-4 w-4 ${
+                        isFileChannelReady ? "text-emerald-400" : "text-blue-400"
+                      }`}
+                    />
+                    文件管理
+                  </span>
+                  <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] text-zinc-300">
+                    {isFileChannelReady ? "就绪" : "查看"}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActivePanel("text")}
+                  className="flex h-10 items-center justify-between rounded-lg border border-[#2C313D] bg-[#191D26] px-3 text-xs font-medium text-zinc-100 transition hover:bg-[#232836]"
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <Clipboard className="h-4 w-4 text-blue-400" />
+                    输入/剪贴板
+                  </span>
+                  <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] text-zinc-300">
+                    {autoClipboardSync ? "自动" : "手动"}
+                  </span>
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setActivePanel("files")}
+                className="flex h-10 w-full items-center justify-between rounded-lg border border-[#2C313D] bg-[#191D26] px-3 text-xs font-medium text-zinc-100 transition hover:bg-[#232836]"
               >
-                {isFileChannelReady ? "P2P 就绪" : "查看"}
-              </span>
-            </button>
+                <span className="inline-flex items-center gap-2">
+                  <Upload
+                    className={`h-4 w-4 ${
+                      isFileChannelReady ? "text-emerald-400" : "text-blue-400"
+                    }`}
+                  />
+                  P2P 文件直传与远程升级
+                </span>
+                <span
+                  className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                    isFileChannelReady
+                      ? "bg-emerald-500/20 text-emerald-300"
+                      : "bg-white/10 text-zinc-400"
+                  }`}
+                >
+                  {isFileChannelReady ? "P2P 就绪" : "查看"}
+                </span>
+              </button>
+            )}
+
+            {/* Desktop Zoom & Mouse Quick Row */}
+            {isDesktopTarget && (
+              <div>
+                <p className="mb-2 text-xs font-medium text-zinc-400">
+                  缩放视图与辅助操作
+                </p>
+                <div className="grid grid-cols-3 gap-1.5">
+                  <DockButton
+                    icon={<Maximize2 className="h-4 w-4 text-blue-400" />}
+                    label={viewZoom > 1.05 ? "适应屏幕" : "已适应"}
+                    active={viewZoom <= 1.05}
+                    onClick={() => {
+                      resetDesktopZoom();
+                      setActivePanel("none");
+                    }}
+                  />
+                  <DockButton
+                    icon={<ZoomIn className="h-4 w-4 text-sky-400" />}
+                    label="放大 2×"
+                    active={viewZoom >= 1.95}
+                    onClick={() => {
+                      applyDesktopZoomAndPan(2, 0, 0);
+                      setActivePanel("none");
+                    }}
+                  />
+                  <DockButton
+                    icon={<MousePointerClick className="h-4 w-4 text-emerald-400" />}
+                    label="右键单击"
+                    onClick={() => {
+                      sendDesktopRightClick();
+                      setActivePanel("none");
+                    }}
+                  />
+                </div>
+              </div>
+            )}
 
             {hasMultiDisplays && (
               <div>
@@ -3228,11 +3957,13 @@ export function RemoteViewport({
               </div>
             )}
 
-            <QualityPresetSelector
-              client={client}
-              qualityPreset={clientState.qualityPreset}
-              activeTransport={clientState.activeTransport}
-            />
+            {!isDesktopTarget && (
+              <QualityPresetSelector
+                client={client}
+                qualityPreset={clientState.qualityPreset}
+                activeTransport={clientState.activeTransport}
+              />
+            )}
 
             <div>
               <p className="mb-2 text-xs font-medium text-zinc-400">传输通道</p>
@@ -3270,28 +4001,127 @@ export function RemoteViewport({
 
             <div>
               <p className="mb-2 text-xs font-medium text-zinc-400">
-                {isDesktopTarget ? "系统操作" : "硬件按键"}
+                {isDesktopTarget ? "隐私与远程电源管理" : "硬件按键"}
               </p>
               {isDesktopTarget ? (
-                <div className="grid grid-cols-3 gap-1.5">
-                  <DockButton
-                    icon={<Lock className="h-4 w-4 text-amber-400" />}
-                    label="锁屏"
-                    onClick={() => sendKey("lock")}
-                  />
-                  <DockButton
-                    icon={<RefreshCw className="h-4 w-4 text-blue-400" />}
-                    label="强制重连"
-                    onClick={() => {
-                      setActivePanel("none");
-                      client.reconnectNow();
-                    }}
-                  />
-                  <DockButton
-                    icon={<LogOut className="h-4 w-4 text-rose-400" />}
-                    label="断开退出"
-                    onClick={onExit}
-                  />
+                <div className="space-y-2.5">
+                  {/* Privacy Screen Toggle Row */}
+                  <button
+                    type="button"
+                    onClick={handleTogglePrivacyScreen}
+                    className={`flex h-10 w-full items-center justify-between rounded-lg border px-3 text-xs font-medium transition ${
+                      isPrivacyActive
+                        ? "border-[#2563EB] bg-[#2563EB] text-white"
+                        : "border-[#2C313D] bg-[#191D26] text-zinc-100 hover:bg-[#232836]"
+                    }`}
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <EyeOff className="h-4 w-4" />
+                      <span>
+                        {isPrivacyActive ? "关闭隐私防窥黑屏" : "开启隐私防窥黑屏"}
+                      </span>
+                    </span>
+                    <span
+                      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                        isPrivacyActive
+                          ? "bg-white/20 text-white"
+                          : "bg-white/10 text-zinc-400"
+                      }`}
+                    >
+                      {isPrivacyActive ? "防窥中" : "已关闭"}
+                    </span>
+                  </button>
+
+                  {/* Remote Power Grid */}
+                  <div className="grid grid-cols-4 gap-1.5">
+                    <DockButton
+                      icon={<Lock className="h-4 w-4 text-amber-400" />}
+                      label="锁屏"
+                      onClick={() => handleDesktopPowerAction("lock")}
+                    />
+                    <DockButton
+                      icon={<Moon className="h-4 w-4 text-indigo-400" />}
+                      label="睡眠"
+                      active={pendingPowerOp === "sleep"}
+                      onClick={() => handleDesktopPowerAction("sleep")}
+                    />
+                    <DockButton
+                      icon={<RotateCw className="h-4 w-4 text-amber-300" />}
+                      label="重启电脑"
+                      active={pendingPowerOp === "restart"}
+                      onClick={() => handleDesktopPowerAction("restart")}
+                    />
+                    <DockButton
+                      icon={<Power className="h-4 w-4 text-rose-400" />}
+                      label="关闭电脑"
+                      active={pendingPowerOp === "shutdown"}
+                      onClick={() => handleDesktopPowerAction("shutdown")}
+                    />
+                  </div>
+
+                  {/* Inline 2-Step Confirmation Box for Destructive Power Ops */}
+                  {pendingPowerOp && pendingPowerOp !== "lock" && (
+                    <div className="rounded-lg border border-rose-500/40 bg-rose-500/12 p-3 text-xs">
+                      <div className="flex items-start gap-2 text-rose-200">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-400" />
+                        <div className="min-w-0 flex-1 leading-relaxed">
+                          <p className="font-semibold text-white">
+                            {pendingPowerOp === "sleep"
+                              ? "确认让远端电脑进入睡眠？"
+                              : pendingPowerOp === "restart"
+                                ? "确认重启远端电脑？"
+                                : "确认关闭远端电脑？"}
+                          </p>
+                          <p className="mt-0.5 text-[11px] text-rose-200/85">
+                            {pendingPowerOp === "sleep"
+                              ? "进入睡眠后将暂停画面并可能断开当前远程连接。"
+                              : pendingPowerOp === "restart"
+                                ? "重启将关闭所有未保存的程序；若已开启开机自启，系统启动后会自动恢复在线。"
+                                : "关机后远程连接将彻底断开，无法再远程重新开机！"}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="mt-2.5 flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setPendingPowerOp(null)}
+                          className="btn-shell h-8 rounded-md px-3 text-xs font-medium"
+                        >
+                          取消
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleConfirmDesktopPower}
+                          className="inline-flex h-8 items-center gap-1 rounded-md border border-rose-500 bg-rose-600 px-3 text-xs font-semibold text-white hover:bg-rose-500"
+                        >
+                          <Power className="h-3.5 w-3.5" />
+                          {pendingPowerOp === "sleep"
+                            ? "确认睡眠"
+                            : pendingPowerOp === "restart"
+                              ? "确认重启"
+                              : "确认关机"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Session Operations */}
+                  <div className="grid grid-cols-2 gap-1.5 pt-1">
+                    <DockButton
+                      icon={<RefreshCw className="h-4 w-4 text-blue-400" />}
+                      label="强制重连"
+                      onClick={() => {
+                        setPendingPowerOp(null);
+                        setActivePanel("none");
+                        client.reconnectNow();
+                      }}
+                    />
+                    <DockButton
+                      icon={<LogOut className="h-4 w-4 text-rose-400" />}
+                      label="断开退出"
+                      onClick={onExit}
+                    />
+                  </div>
                 </div>
               ) : (
                 <div className="grid grid-cols-3 gap-1.5">
@@ -4131,10 +4961,12 @@ const FileTransferSheetContent = memo(function FileTransferSheetContent({
 
 function DarkSheet({
   title,
+  wide = false,
   onClose,
   children,
 }: {
   title: string;
+  wide?: boolean;
   onClose: () => void;
   children: React.ReactNode;
 }) {
@@ -4158,7 +4990,9 @@ function DarkSheet({
         role="dialog"
         aria-modal="true"
         aria-label={title}
-        className="animate-sheet-up safe-bottom max-h-[85dvh] w-full max-w-md overflow-y-auto rounded-t-2xl border border-[#2C313D] bg-[#111318] p-5 text-white shadow-[0_24px_48px_rgba(0,0,0,0.75)] sm:rounded-2xl"
+        className={`animate-sheet-up safe-bottom max-h-[85dvh] w-full ${
+          wide ? "max-w-2xl" : "max-w-md"
+        } overflow-y-auto rounded-t-2xl border border-[#2C313D] bg-[#111318] p-5 text-white shadow-[0_24px_48px_rgba(0,0,0,0.75)] sm:rounded-2xl`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-4 flex items-center justify-between">
@@ -4177,3 +5011,286 @@ function DarkSheet({
     </div>
   );
 }
+
+const DesktopQualitySheetContent = memo(function DesktopQualitySheetContent({
+  client,
+  qualityPreset,
+  desktopQuality,
+  activeTransport,
+  desiredTransport,
+  audioMuted,
+  audioVolume,
+  hasRemoteAudio,
+  onToggleAudio,
+  onChangeVolume,
+}: {
+  client: RemoteClient;
+  qualityPreset: QualityPreset;
+  desktopQuality: StreamQuality;
+  activeTransport: TransportMode | null;
+  desiredTransport: TransportMode;
+  audioMuted: boolean;
+  audioVolume: number;
+  hasRemoteAudio: boolean;
+  onToggleAudio: () => void;
+  onChangeVolume: (vol: number) => void;
+}) {
+  const telemetry = useSyncExternalStore(
+    client.subscribeTelemetry,
+    client.getTelemetrySnapshot,
+  );
+  const wt = telemetry.webrtcTelemetry;
+
+  const activePresetId: DesktopQualityPreset = (() => {
+    if (desktopQuality.auto) return "auto";
+    if (desktopQuality.maxWidth >= 3840) return "ultra";
+    if (desktopQuality.maxWidth >= 2560) return "hd";
+    if (desktopQuality.maxWidth >= 1920) return "balanced";
+    if (desktopQuality.maxWidth <= 1280) return "eco";
+    return qualityPreset;
+  })();
+
+  const presets: Array<{
+    id: DesktopQualityPreset;
+    title: string;
+    desc: string;
+  }> = [
+    { id: "auto", title: "智能 (Auto)", desc: "自适应网速" },
+    { id: "eco", title: "流畅", desc: "720p · 60fps" },
+    { id: "balanced", title: "高清", desc: "1080p · 60fps" },
+    { id: "hd", title: "2K 高刷", desc: "1440p · 90fps" },
+    { id: "ultra", title: "4K 极致", desc: "2160p · 120fps" },
+  ];
+
+  const fpsOptions = [30, 60, 90, 120] as const;
+  const codecOptions: Array<{ id: VideoCodecPreference; label: string }> = [
+    { id: "auto", label: "自动" },
+    { id: "h264", label: "H.264" },
+    { id: "hevc", label: "HEVC" },
+    { id: "av1", label: "AV1" },
+    { id: "vp9", label: "VP9" },
+  ];
+
+  const activeCodec: VideoCodecPreference = desktopQuality.codec ?? "auto";
+
+  function applyPreset(id: DesktopQualityPreset) {
+    const base = DESKTOP_QUALITY_PRESETS[id];
+    client.setDesktopStreamQuality(
+      {
+        ...base,
+        codec: activeCodec,
+      },
+      id,
+    );
+  }
+
+  function applyFps(fps: number) {
+    client.setDesktopStreamQuality({
+      ...desktopQuality,
+      fps,
+      auto: false,
+    });
+  }
+
+  function applyCodec(codec: VideoCodecPreference) {
+    client.setDesktopStreamQuality({
+      ...desktopQuality,
+      codec,
+    });
+  }
+
+  const resReadout =
+    wt && wt.width > 0 && wt.height > 0 ? `${wt.width}×${wt.height}` : "--×--";
+  const bitrateReadout =
+    wt && wt.bitrateKbps >= 1000
+      ? `${(wt.bitrateKbps / 1000).toFixed(1)} Mbps`
+      : wt
+        ? `${wt.bitrateKbps} kbps`
+        : "--";
+
+  return (
+    <div className="space-y-4">
+      {/* Live Bitrate / FPS / Resolution Telemetry Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#262A34] bg-[#0A0C10] px-3 py-2 font-mono text-xs">
+        <div className="flex items-center gap-2 text-zinc-200">
+          <span className="text-white font-semibold">{resReadout}</span>
+          <span className="text-zinc-600">·</span>
+          <span className="text-emerald-300">{telemetry.fps} FPS</span>
+          <span className="text-zinc-600">·</span>
+          <span className="text-blue-300">{bitrateReadout}</span>
+        </div>
+        <span className="rounded border border-[#262A34] bg-[#14171F] px-1.5 py-0.5 text-[10px] text-zinc-300">
+          {wt?.codec || activeCodec.toUpperCase()}
+        </span>
+      </div>
+
+      {/* Resolution / Quality Presets */}
+      <div>
+        <p className="mb-2 text-xs font-medium text-zinc-400">画质档位</p>
+        <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
+          {presets.map((preset) => {
+            const active = activePresetId === preset.id;
+            return (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => applyPreset(preset.id)}
+                className={`rounded-lg border px-2 py-2 text-center transition ${
+                  active
+                    ? "border-[#2563EB] bg-[#2563EB] text-white"
+                    : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+                }`}
+              >
+                <div className="text-xs font-semibold">{preset.title}</div>
+                <div
+                  className={`mt-0.5 whitespace-nowrap font-mono text-[10px] ${
+                    active ? "text-blue-100" : "text-zinc-400"
+                  }`}
+                >
+                  {preset.desc}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Independent Refresh Rate Pills */}
+      <div>
+        <div className="mb-2 flex items-center justify-between">
+          <p className="text-xs font-medium text-zinc-400">目标刷新率</p>
+          <span className="font-mono text-[11px] text-zinc-500">
+            当前目标 {desktopQuality.fps} fps
+          </span>
+        </div>
+        <div className="grid grid-cols-4 gap-1.5">
+          {fpsOptions.map((fps) => {
+            const active = desktopQuality.fps === fps;
+            return (
+              <button
+                key={fps}
+                type="button"
+                onClick={() => applyFps(fps)}
+                className={`h-9 rounded-lg border font-mono text-xs font-semibold transition ${
+                  active
+                    ? "border-[#2563EB] bg-[#2563EB] text-white"
+                    : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+                }`}
+              >
+                {fps} fps
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Independent Video Codec Pills */}
+      <div>
+        <div className="mb-2 flex items-center justify-between">
+          <p className="text-xs font-medium text-zinc-400">首选视频编码器</p>
+          <span className="text-[11px] text-zinc-500">
+            硬件编解码自动回退
+          </span>
+        </div>
+        <div className="grid grid-cols-5 gap-1.5">
+          {codecOptions.map((item) => {
+            const active = activeCodec === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => applyCodec(item.id)}
+                className={`h-9 rounded-lg border font-mono text-[11px] font-semibold transition ${
+                  active
+                    ? "border-[#2563EB] bg-[#2563EB] text-white"
+                    : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+                }`}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Desktop System Audio & Volume Slider */}
+      <div className="rounded-lg border border-[#262A34] bg-[#0A0C10] p-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onToggleAudio}
+              className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition ${
+                !audioMuted
+                  ? "border-[#2563EB] bg-[#2563EB] text-white"
+                  : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+              }`}
+            >
+              {audioMuted ? (
+                <VolumeX className="h-3.5 w-3.5" />
+              ) : (
+                <Volume2 className="h-3.5 w-3.5" />
+              )}
+              <span>{audioMuted ? "已静音" : "声音开启"}</span>
+            </button>
+            <span className="text-[11px] text-zinc-400">
+              {hasRemoteAudio ? "已收到远端音频流" : "等待远端音频"}
+            </span>
+          </div>
+          <span className="font-mono text-xs text-zinc-300">
+            {Math.round((audioMuted ? 0 : audioVolume) * 100)}%
+          </span>
+        </div>
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.05}
+          value={audioMuted ? 0 : audioVolume}
+          onChange={(e) => {
+            const val = Number(e.target.value);
+            onChangeVolume(val);
+            if (audioMuted && val > 0) {
+              onToggleAudio();
+            }
+          }}
+          aria-label="远端电脑音量"
+          className="mt-2.5 h-1.5 w-full cursor-pointer accent-[#2563EB]"
+        />
+      </div>
+
+      {/* Transport Switch + Live WebRTC Diagnostics */}
+      <div>
+        <p className="mb-2 text-xs font-medium text-zinc-400">传输通道</p>
+        <div className="grid grid-cols-2 gap-2">
+          {(
+            [
+              { id: "webrtc", label: "WebRTC（低延迟）" },
+              { id: "ws-jpeg", label: "WS 帧流（强兼容）" },
+            ] as Array<{ id: TransportMode; label: string }>
+          ).map((item) => {
+            const active = (activeTransport ?? desiredTransport) === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => client.setTransport(item.id)}
+                className={`h-9 rounded-lg border text-xs font-medium transition ${
+                  active
+                    ? "border-[#2563EB] bg-[#2563EB] text-white"
+                    : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+                }`}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {activeTransport === "webrtc" && (
+        <LiveWebRtcTelemetryStrip client={client} showHeader />
+      )}
+    </div>
+  );
+});

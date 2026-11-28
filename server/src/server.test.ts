@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { WebSocket, type RawData } from "ws";
 import {
+  DESKTOP_QUALITY_PRESETS,
   FRAME_TYPE_JPEG,
   QUALITY_PRESETS,
   decodeMediaFrame,
@@ -3898,4 +3899,472 @@ test("Desktop control commands (mouse_move, mouse_down, mouse_up, mouse_wheel, k
   // Confirm none of the malformed commands were forwarded to the desktop agent
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(agent.drainJson().length, 0);
+});
+
+test("Pro desktop host capabilities, privacyScreenActive, and audioEnabled propagate on register, telemetry, clone, and persistence", async (t) => {
+  const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "velodeck-pro-desktop-caps-test-"));
+  const { server, baseUrl, wsUrl } = await startServer({ dataDir });
+  t.after(async () => {
+    await server.close();
+    await fsp.rm(dataDir, { recursive: true, force: true });
+  });
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "pro_desk_owner", password: "pro-desk-password-123" }),
+  });
+  assert.equal(regRes.status, 201);
+  const { token } = (await regRes.json()) as { token: string };
+
+  const desktopAgent = await TestWsClient.connect(wsUrl);
+  const androidAgent = await TestWsClient.connect(wsUrl);
+  const ctrl1 = await TestWsClient.connect(wsUrl);
+  const ctrl2 = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([desktopAgent.close(), androidAgent.close(), ctrl1.close(), ctrl2.close()]);
+  });
+
+  // 1. Desktop host registers with all new capability flags + privacyScreenActive + audioEnabled
+  desktopAgent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-pro-01",
+      deviceSecret: "desk-pro-secret-01",
+      authToken: token,
+      controlPassword: "desk-pro-password-99",
+      deviceType: "desktop",
+      osPlatform: "darwin",
+      screenWidth: 3840,
+      screenHeight: 2160,
+      privacyScreenActive: true,
+      audioEnabled: true,
+      capabilities: {
+        webrtc: true,
+        wsJpeg: true,
+        wsH264: false,
+        wake: false,
+        unlock: false,
+        accessibility: true,
+        mediaProjection: true,
+        desktopAudio: true,
+        privacyScreen: true,
+        fileManager: true,
+        powerControl: true,
+        highRefresh: true,
+      },
+    }),
+  );
+  await desktopAgent.nextJson<AgentRegisteredMessage>();
+
+  // Legacy Android agent registers without any desktop flags
+  androidAgent.sendJson(
+    makeAgentRegister({
+      deviceId: "dev-android-compat",
+      deviceSecret: "android-compat-secret",
+      authToken: token,
+    }),
+  );
+  await androidAgent.nextJson<AgentRegisteredMessage>();
+
+  // 2. Controller 1 receives all desktop flags in controller.authed; Android omits them
+  ctrl1.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-pro-1",
+  });
+  const authed1 = await ctrl1.nextJson<ControllerAuthedMessage>();
+  assert.equal(authed1.devices.length, 2);
+  const desk1 = authed1.devices.find((d) => d.deviceId === "desk-pro-01");
+  const android1 = authed1.devices.find((d) => d.deviceId === "dev-android-compat");
+  assert.ok(desk1);
+  assert.equal(desk1.privacyScreenActive, true);
+  assert.equal(desk1.audioEnabled, true);
+  assert.equal(desk1.capabilities.desktopAudio, true);
+  assert.equal(desk1.capabilities.privacyScreen, true);
+  assert.equal(desk1.capabilities.fileManager, true);
+  assert.equal(desk1.capabilities.powerControl, true);
+  assert.equal(desk1.capabilities.highRefresh, true);
+
+  assert.ok(android1);
+  assert.equal(Object.hasOwn(android1, "privacyScreenActive"), false);
+  assert.equal(Object.hasOwn(android1, "audioEnabled"), false);
+  assert.equal(Object.hasOwn(android1.capabilities, "desktopAudio"), false);
+  assert.equal(Object.hasOwn(android1.capabilities, "privacyScreen"), false);
+  assert.equal(Object.hasOwn(android1.capabilities, "fileManager"), false);
+  assert.equal(Object.hasOwn(android1.capabilities, "powerControl"), false);
+  assert.equal(Object.hasOwn(android1.capabilities, "highRefresh"), false);
+
+  // 3. Partial telemetry preserves existing desktop capability flags and state fields
+  desktopAgent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "desk-pro-01",
+    battery: 99,
+    capabilities: {
+      mediaProjection: false,
+    },
+  });
+  const partialStatus = await ctrl1.nextJson<DeviceStatusMessage>();
+  assert.equal(partialStatus.device.battery, 99);
+  assert.equal(partialStatus.device.privacyScreenActive, true);
+  assert.equal(partialStatus.device.audioEnabled, true);
+  assert.equal(partialStatus.device.capabilities.mediaProjection, false);
+  assert.equal(partialStatus.device.capabilities.desktopAudio, true);
+  assert.equal(partialStatus.device.capabilities.privacyScreen, true);
+  assert.equal(partialStatus.device.capabilities.fileManager, true);
+  assert.equal(partialStatus.device.capabilities.powerControl, true);
+  assert.equal(partialStatus.device.capabilities.highRefresh, true);
+
+  // 4. Explicit telemetry updates toggle privacyScreenActive, audioEnabled, and individual capability flags
+  desktopAgent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "desk-pro-01",
+    privacyScreenActive: false,
+    audioEnabled: false,
+    capabilities: {
+      desktopAudio: false,
+      highRefresh: false,
+    },
+  });
+  const updatedStatus = await ctrl1.nextJson<DeviceStatusMessage>();
+  assert.equal(updatedStatus.device.privacyScreenActive, false);
+  assert.equal(updatedStatus.device.audioEnabled, false);
+  assert.equal(updatedStatus.device.capabilities.desktopAudio, false);
+  assert.equal(updatedStatus.device.capabilities.highRefresh, false);
+  assert.equal(updatedStatus.device.capabilities.privacyScreen, true);
+  assert.equal(updatedStatus.device.capabilities.fileManager, true);
+  assert.equal(updatedStatus.device.capabilities.powerControl, true);
+
+  // 5. Newly connecting controller & cloneDeviceSummary preserve updated flags
+  ctrl2.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-pro-2",
+  });
+  const authed2 = await ctrl2.nextJson<ControllerAuthedMessage>();
+  const desk2 = authed2.devices.find((d) => d.deviceId === "desk-pro-01");
+  assert.ok(desk2);
+  assert.equal(desk2.privacyScreenActive, false);
+  assert.equal(desk2.audioEnabled, false);
+  assert.equal(desk2.capabilities.desktopAudio, false);
+  assert.equal(desk2.capabilities.privacyScreen, true);
+  assert.equal(desk2.capabilities.fileManager, true);
+  assert.equal(desk2.capabilities.powerControl, true);
+  assert.equal(desk2.capabilities.highRefresh, false);
+
+  const cloned = cloneDeviceSummary(desk2);
+  assert.deepEqual(cloned.capabilities, desk2.capabilities);
+  assert.notEqual(cloned.capabilities, desk2.capabilities);
+  assert.equal(cloned.privacyScreenActive, false);
+  assert.equal(cloned.audioEnabled, false);
+
+  // 6. Persisted store preserves registered desktop capability flags and state on disk reload
+  await server.hub.store.flush();
+  const reloadedStore = new VeloDeckStore(dataDir);
+  const persisted = reloadedStore.getDevice("desk-pro-01");
+  assert.ok(persisted);
+  assert.equal(persisted.summary.privacyScreenActive, true);
+  assert.equal(persisted.summary.audioEnabled, true);
+  assert.equal(persisted.summary.capabilities.desktopAudio, true);
+  assert.equal(persisted.summary.capabilities.privacyScreen, true);
+  assert.equal(persisted.summary.capabilities.fileManager, true);
+  assert.equal(persisted.summary.capabilities.powerControl, true);
+  assert.equal(persisted.summary.capabilities.highRefresh, true);
+});
+
+test("Pro desktop StreamQuality (4K/120fps, codec, audioEnabled) validates and forwards cleanly while invalid codec/bounds are rejected", async (t) => {
+  const { server, wsUrl } = await startServer();
+  t.after(() => server.close());
+
+  const agent = await TestWsClient.connect(wsUrl);
+  const ctrl = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent.close(), ctrl.close()]);
+  });
+
+  agent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-4k-stream",
+      deviceSecret: "desk-4k-secret",
+      controlPassword: "desk-4k-password-123",
+      deviceType: "desktop",
+      osPlatform: "win32",
+    }),
+  );
+  const reg = await agent.nextJson<AgentRegisteredMessage>();
+  assert.ok(reg.controlCode);
+
+  ctrl.sendJson({
+    type: "controller.auth",
+    controlCode: reg.controlCode,
+    controlPassword: "desk-4k-password-123",
+    clientId: "ctrl-4k-stream",
+  });
+  await ctrl.nextJson<ControllerAuthedMessage>();
+
+  // Verify DESKTOP_QUALITY_PRESETS.ultra & QUALITY_PRESETS intact
+  assert.equal(DESKTOP_QUALITY_PRESETS.ultra.maxWidth, 3840);
+  assert.equal(DESKTOP_QUALITY_PRESETS.ultra.fps, 120);
+  assert.equal(DESKTOP_QUALITY_PRESETS.ultra.bitrateKbps, 30000);
+  assert.equal(DESKTOP_QUALITY_PRESETS.ultra.codec, "auto");
+  assert.equal(QUALITY_PRESETS.hd.maxWidth, 1080);
+
+  // 1. session.request with 4K/120fps/hevc/audioEnabled forwards all quality fields cleanly
+  const hevcUltraQuality = {
+    maxWidth: 3840,
+    fps: 120,
+    bitrateKbps: 30000,
+    jpegQuality: 74,
+    codec: "hevc" as const,
+    audioEnabled: true,
+  };
+  ctrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-4k-ultra-1",
+    deviceId: "desk-4k-stream",
+    preferredTransport: "webrtc",
+    quality: hevcUltraQuality,
+  } satisfies SessionRequestMessage);
+  const fwdReq = await agent.nextJson<SessionRequestMessage>();
+  assert.deepEqual(fwdReq.quality, hevcUltraQuality);
+
+  agent.sendJson({
+    type: "session.ready",
+    sessionId: "sess-4k-ultra-1",
+    deviceId: "desk-4k-stream",
+    transport: "webrtc",
+    screenWidth: 3840,
+    screenHeight: 2160,
+    rotation: 0,
+  } satisfies SessionReadyMessage);
+  await ctrl.nextJson<SessionReadyMessage>();
+
+  // 2. Valid in-session quality commands across codecs, audioEnabled, and upper bounds
+  const validQualities = [
+    hevcUltraQuality,
+    DESKTOP_QUALITY_PRESETS.auto,
+    DESKTOP_QUALITY_PRESETS.hd,
+    DESKTOP_QUALITY_PRESETS.ultra,
+    { maxWidth: 7680, fps: 240, bitrateKbps: 50000, jpegQuality: 100, codec: "av1" as const, audioEnabled: false },
+    { maxWidth: 2560, fps: 90, bitrateKbps: 16000, jpegQuality: 68, codec: "vp9" as const },
+    { maxWidth: 1920, fps: 60, bitrateKbps: 8000, jpegQuality: 60, codec: "h264" as const },
+  ];
+
+  let seq = 1;
+  for (const quality of validQualities) {
+    seq += 1;
+    ctrl.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-4k-ultra-1",
+      deviceId: "desk-4k-stream",
+      seq,
+      command: { action: "quality", quality },
+    } satisfies ControlCmdMessage);
+    const forwarded = await agent.nextJson<ControlCmdMessage>();
+    assert.deepEqual(forwarded.command, { action: "quality", quality });
+  }
+
+  // 3. Invalid codec ("mpeg2"), invalid audioEnabled, and out-of-range bounds are rejected
+  const invalidQualities: unknown[] = [
+    { maxWidth: 3840, fps: 120, bitrateKbps: 30000, jpegQuality: 74, codec: "mpeg2" },
+    { maxWidth: 3840, fps: 120, bitrateKbps: 30000, jpegQuality: 74, codec: "hevc", audioEnabled: "yes" },
+    { maxWidth: 7681, fps: 120, bitrateKbps: 30000, jpegQuality: 74, codec: "hevc" },
+    { maxWidth: 3840, fps: 241, bitrateKbps: 30000, jpegQuality: 74, codec: "hevc" },
+    { maxWidth: 3840, fps: 120, bitrateKbps: 50001, jpegQuality: 74, codec: "hevc" },
+    { maxWidth: 3840, fps: 120, bitrateKbps: 30000, jpegQuality: 101, codec: "hevc" },
+  ];
+
+  for (const badQuality of invalidQualities) {
+    seq += 1;
+    ctrl.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-4k-ultra-1",
+      deviceId: "desk-4k-stream",
+      seq,
+      command: { action: "quality", quality: badQuality },
+    });
+    const err = await ctrl.nextJson<ErrorMessage>();
+    assert.equal(err.type, "error");
+    assert.equal(err.code, "INVALID_MESSAGE");
+  }
+
+  // Invalid codec on session.request is also rejected
+  ctrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-4k-bad-codec",
+    deviceId: "desk-4k-stream",
+    preferredTransport: "webrtc",
+    quality: {
+      maxWidth: 3840,
+      fps: 120,
+      bitrateKbps: 30000,
+      jpegQuality: 74,
+      codec: "mpeg2",
+    },
+  });
+  const reqErr = await ctrl.nextJson<ErrorMessage>();
+  assert.equal(reqErr.type, "error");
+  assert.equal(reqErr.code, "INVALID_MESSAGE");
+
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(agent.drainJson().length, 0);
+});
+
+test("privacy_screen, audio_toggle, and power commands validate, require active sessions, forward cleanly, and emit audit logs", async (t) => {
+  const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "velodeck-pro-desk-cmd-audit-"));
+  const { server, baseUrl, wsUrl } = await startServer({ dataDir });
+  t.after(async () => {
+    await server.close();
+    await fsp.rm(dataDir, { recursive: true, force: true });
+  });
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "pro_power_user", password: "pro-power-password-123" }),
+  });
+  assert.equal(regRes.status, 201);
+  const { token } = (await regRes.json()) as { token: string };
+
+  const agent = await TestWsClient.connect(wsUrl);
+  const ctrl = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent.close(), ctrl.close()]);
+  });
+
+  agent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-power-01",
+      deviceSecret: "desk-power-secret",
+      authToken: token,
+      deviceType: "desktop",
+      osPlatform: "linux",
+    }),
+  );
+  await agent.nextJson<AgentRegisteredMessage>();
+
+  ctrl.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-power-01",
+  });
+  await ctrl.nextJson<ControllerAuthedMessage>();
+
+  // 1. Sessionless power, privacy_screen, and audio_toggle MUST be rejected with SESSION_NOT_FOUND
+  for (const sessionlessCmd of [
+    { action: "power", operation: "lock" },
+    { action: "power", operation: "shutdown" },
+    { action: "privacy_screen", enabled: true },
+    { action: "audio_toggle", enabled: true },
+  ] as const) {
+    ctrl.sendJson({
+      type: "control.cmd",
+      sessionId: "",
+      deviceId: "desk-power-01",
+      seq: 1,
+      command: sessionlessCmd,
+    } satisfies ControlCmdMessage);
+    const err = await ctrl.nextJson<ErrorMessage>();
+    assert.equal(err.type, "error");
+    assert.equal(err.code, "SESSION_NOT_FOUND");
+  }
+
+  // 2. Establish an active authenticated session
+  ctrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-power-01",
+    deviceId: "desk-power-01",
+    preferredTransport: "webrtc",
+    quality: DESKTOP_QUALITY_PRESETS.balanced,
+  } satisfies SessionRequestMessage);
+  await agent.nextJson<SessionRequestMessage>();
+
+  agent.sendJson({
+    type: "session.ready",
+    sessionId: "sess-power-01",
+    deviceId: "desk-power-01",
+    transport: "webrtc",
+    screenWidth: 1920,
+    screenHeight: 1080,
+    rotation: 0,
+  } satisfies SessionReadyMessage);
+  await ctrl.nextJson<SessionReadyMessage>();
+
+  // 3. Valid in-session privacy_screen, audio_toggle, and power operations forward cleanly
+  const validCommands: ControlCmdMessage["command"][] = [
+    { action: "privacy_screen", enabled: true },
+    { action: "privacy_screen", enabled: false },
+    { action: "audio_toggle", enabled: true },
+    { action: "audio_toggle", enabled: false },
+    { action: "power", operation: "lock" },
+    { action: "power", operation: "sleep" },
+    { action: "power", operation: "restart" },
+    { action: "power", operation: "shutdown" },
+  ];
+
+  let seq = 10;
+  for (const command of validCommands) {
+    seq += 1;
+    ctrl.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-power-01",
+      deviceId: "desk-power-01",
+      seq,
+      command,
+    } satisfies ControlCmdMessage);
+    const forwarded = await agent.nextJson<ControlCmdMessage>();
+    assert.equal(forwarded.type, "control.cmd");
+    assert.equal(forwarded.sessionId, "sess-power-01");
+    assert.equal(forwarded.deviceId, "desk-power-01");
+    assert.equal(forwarded.seq, seq);
+    assert.deepEqual(forwarded.command, command);
+  }
+
+  // 4. Invalid payloads are rejected with INVALID_MESSAGE and never forwarded
+  const invalidCommands: unknown[] = [
+    { action: "privacy_screen", enabled: "on" },
+    { action: "audio_toggle", enabled: 1 },
+    { action: "power", operation: "hibernate" },
+    { action: "power", operation: "" },
+    { action: "power" },
+  ];
+
+  for (const badCmd of invalidCommands) {
+    seq += 1;
+    ctrl.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-power-01",
+      deviceId: "desk-power-01",
+      seq,
+      command: badCmd,
+    });
+    const err = await ctrl.nextJson<ErrorMessage>();
+    assert.equal(err.type, "error");
+    assert.equal(err.code, "INVALID_MESSAGE");
+    assert.equal(err.sessionId, "sess-power-01");
+    assert.equal(err.deviceId, "desk-power-01");
+  }
+
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(agent.drainJson().length, 0);
+
+  // 5. Verify explicit audit log entries for privacy_screen (on/off) and power (lock/sleep/restart/shutdown)
+  await server.hub.audit.flush();
+  const auditEntries = (await fsp.readFile(path.join(dataDir, "audit.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { event: string; detail?: string; deviceId?: string; sessionId?: string });
+
+  const privacyAudit = auditEntries.filter((e) => e.event === "control.privacy_screen");
+  assert.deepEqual(
+    privacyAudit.map((e) => e.detail),
+    ["on", "off"],
+  );
+  assert.ok(privacyAudit.every((e) => e.deviceId === "desk-power-01" && e.sessionId === "sess-power-01"));
+
+  const powerAudit = auditEntries.filter((e) => e.event === "control.power");
+  assert.deepEqual(
+    powerAudit.map((e) => e.detail),
+    ["lock", "sleep", "restart", "shutdown"],
+  );
+  assert.ok(powerAudit.every((e) => e.deviceId === "desk-power-01" && e.sessionId === "sess-power-01"));
 });

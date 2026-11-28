@@ -1,4 +1,5 @@
 import {
+  DESKTOP_QUALITY_PRESETS,
   QUALITY_PRESETS,
   decodeMediaFrame,
   isWireMessage,
@@ -14,6 +15,7 @@ import {
   type StreamQuality,
   type TransportMode,
   type UserProfile,
+  type VideoCodecPreference,
   type WireMessage,
 } from "@velodeck/protocol";
 import {
@@ -126,6 +128,44 @@ export interface SendFileOptions {
   mimeType?: string;
   purpose?: FileTransferPurpose;
   expectedSha256?: string;
+  targetDir?: string;
+}
+
+export type DesktopQualityPreset = "auto" | "eco" | "balanced" | "hd" | "ultra";
+
+export interface RemoteFsRoot {
+  name: string;
+  path: string;
+  kind: "home" | "desktop" | "downloads" | "documents" | "drive";
+}
+
+export interface RemoteFsEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number;
+  mtimeMs: number;
+}
+
+export interface RemoteFsListResult {
+  path: string;
+  parentPath: string | null;
+  entries: RemoteFsEntry[];
+}
+
+export interface RemoteFsDownloadState {
+  active: boolean;
+  reqId: string | null;
+  fileName: string;
+  receivedBytes: number;
+  totalBytes: number;
+  error: string | null;
+}
+
+export interface RemoteFsDownloadResult {
+  blob: Blob;
+  fileName: string;
+  sha256: string;
 }
 
 export interface RemoteClientState {
@@ -151,14 +191,18 @@ export interface RemoteClientState {
   webrtcRoute: "p2p" | "turn" | null;
   webrtcTelemetry: WebRtcTelemetry | null;
   qualityPreset: QualityPreset;
+  desktopQuality: StreamQuality | null;
   dataChannelOpen: boolean;
   fileChannelOpen: boolean;
   fileTransfer: FileTransferState | null;
+  fileDownload: RemoteFsDownloadState;
   mediaStream: MediaStream | null;
+  hasRemoteAudio: boolean;
   screenWidth: number;
   screenHeight: number;
   rotation: 0 | 1 | 2 | 3;
   remoteClipboard: string;
+  lastClipboardAt: number;
   lastNotice: RemoteClientNotice | null;
 }
 
@@ -211,6 +255,40 @@ const FILE_DONE_TIMEOUT_MS = 30_000;
 const FILE_MAX_BYTES = 256 * 1024 * 1024;
 const APK_MAX_BYTES = 128 * 1024 * 1024;
 const FILE_PROGRESS_THROTTLE_MS = 120;
+const FS_RPC_TIMEOUT_MS = 10_000;
+const FS_DOWNLOAD_IDLE_TIMEOUT_MS = 30_000;
+const FS_DOWNLOAD_MAX_BYTES = 256 * 1024 * 1024;
+
+const EMPTY_FILE_DOWNLOAD_STATE: RemoteFsDownloadState = {
+  active: false,
+  reqId: null,
+  fileName: "",
+  receivedBytes: 0,
+  totalBytes: 0,
+  error: null,
+};
+
+interface PendingFsRequest {
+  expectedType: string;
+  resolve: (msg: Record<string, unknown>) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface ActiveRemoteDownload {
+  reqId: string;
+  filePath: string;
+  fileName: string;
+  mimeType: string;
+  totalBytes: number;
+  receivedBytes: number;
+  started: boolean;
+  chunks: Uint8Array[];
+  lastProgressEmitAt: number;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  resolve: (result: RemoteFsDownloadResult) => void;
+  reject: (err: Error) => void;
+}
 
 interface FileDonePayload {
   savedPath?: string;
@@ -373,7 +451,9 @@ export interface VideoCodecPreferenceLike {
  */
 export function sortPreferredVideoCodecs<T extends VideoCodecPreferenceLike>(
   codecs: readonly T[],
+  preferredCodec: VideoCodecPreference = "auto",
 ): T[] {
+  const preferredBucket: T[] = [];
   const h264ConstrainedHighPm1: T[] = [];
   const h264ConstrainedHighOther: T[] = [];
   const h264ConstrainedBaselinePm1: T[] = [];
@@ -382,9 +462,24 @@ export function sortPreferredVideoCodecs<T extends VideoCodecPreferenceLike>(
   const vp8: T[] = [];
   const rest: T[] = [];
 
+  const matchesExplicitPreferred = (mime: string): boolean => {
+    if (preferredCodec === "hevc") {
+      return mime === "video/h265" || mime === "video/hevc";
+    }
+    if (preferredCodec === "av1") {
+      return mime === "video/av1";
+    }
+    if (preferredCodec === "vp9") {
+      return mime === "video/vp9";
+    }
+    return false;
+  };
+
   for (const codec of codecs) {
     const mime = codec.mimeType.toLowerCase();
-    if (mime === "video/h264") {
+    if (matchesExplicitPreferred(mime)) {
+      preferredBucket.push(codec);
+    } else if (mime === "video/h264") {
       const fmtp = (codec.sdpFmtpLine ?? "").toLowerCase();
       if (fmtp.includes("profile-level-id=640c")) {
         if (fmtp.includes("packetization-mode=1")) {
@@ -409,6 +504,7 @@ export function sortPreferredVideoCodecs<T extends VideoCodecPreferenceLike>(
   }
 
   return [
+    ...preferredBucket,
     ...h264ConstrainedHighPm1,
     ...h264ConstrainedHighOther,
     ...h264ConstrainedBaselinePm1,
@@ -489,6 +585,11 @@ export class RemoteClient {
   private activeTouchFirstMovePending = false;
   private activeFileTransfer: ActiveFileTransfer | null = null;
   private fileTransferGeneration = 0;
+  private fsReqSeq = 0;
+  private pendingFsRequests = new Map<string, PendingFsRequest>();
+  private activeFileDownload: ActiveRemoteDownload | null = null;
+  private fileDownloadBinaryChain: Promise<void> = Promise.resolve();
+  private customDesktopQuality: StreamQuality | null = null;
   private pointerKeepaliveTimer: ReturnType<typeof setInterval> | null = null;
   private lastCommandSentAt = 0;
   private pendingRemoteIce: RTCIceCandidateInit[] = [];
@@ -571,14 +672,18 @@ export class RemoteClient {
     webrtcRoute: null,
     webrtcTelemetry: null,
     qualityPreset: "auto",
+    desktopQuality: null,
     dataChannelOpen: false,
     fileChannelOpen: false,
     fileTransfer: null,
+    fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE },
     mediaStream: null,
+    hasRemoteAudio: false,
     screenWidth: 1080,
     screenHeight: 2400,
     rotation: 0,
     remoteClipboard: "",
+    lastClipboardAt: 0,
     lastNotice: null,
   };
 
@@ -679,6 +784,7 @@ export class RemoteClient {
     this.webrtcFallbackInFlight = false;
     this.webrtcDowngradedByAgent = false;
     this.webrtcDowngradedClientSide = false;
+    this.customDesktopQuality = null;
     this.resetWsJpegAutoQuality();
 
     const desiredTransport =
@@ -714,11 +820,15 @@ export class RemoteClient {
       webrtcRoute: null,
       webrtcTelemetry: null,
       qualityPreset,
+      desktopQuality: null,
       dataChannelOpen: false,
       fileChannelOpen: false,
       fileTransfer: null,
+      fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE },
       mediaStream: null,
+      hasRemoteAudio: false,
       remoteClipboard: "",
+      lastClipboardAt: 0,
     });
 
     this.openSocket(request);
@@ -753,6 +863,7 @@ export class RemoteClient {
       dataChannelOpen: false,
       fileChannelOpen: false,
       mediaStream: null,
+      hasRemoteAudio: false,
     });
     this.openSocket(request);
   }
@@ -765,10 +876,12 @@ export class RemoteClient {
     this.clearAutoReRequestTimer();
     this.stopWsJpegFpsTimer();
     this.abortActiveFileTransferSilent();
+    this.abortAllRemoteFsSilent("连接已断开");
     this.stopSession("client_disconnect");
     this.teardownSocket();
     this.webrtcDowngradedByAgent = false;
     this.webrtcDowngradedClientSide = false;
+    this.customDesktopQuality = null;
     this.setState({
       profile: null,
       authType: null,
@@ -790,11 +903,15 @@ export class RemoteClient {
       activeTransport: null,
       webrtcRoute: null,
       webrtcTelemetry: null,
+      desktopQuality: null,
       dataChannelOpen: false,
       fileChannelOpen: false,
       fileTransfer: null,
+      fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE },
       mediaStream: null,
+      hasRemoteAudio: false,
       remoteClipboard: "",
+      lastClipboardAt: 0,
     });
   }
 
@@ -835,12 +952,25 @@ export class RemoteClient {
     this.stopWsJpegFpsTimer();
     this.resetWsJpegAutoQuality();
     this.abortActiveFileTransferSilent();
+    this.abortAllRemoteFsSilent("会话已切换");
     this.teardownPeerConnection();
     this.frameTimestamps = [];
     this.webrtcFallbackInFlight = false;
     this.webrtcDowngradedByAgent = false;
 
+    const switchingDevice = this.state.activeDeviceId !== deviceId;
     const device = this.state.devices.find((d) => d.deviceId === deviceId);
+    const isDesktop = device?.deviceType === "desktop";
+    if (switchingDevice || !isDesktop) {
+      this.customDesktopQuality = null;
+    }
+    const effectiveDesktopQuality = isDesktop
+      ? (this.customDesktopQuality
+          ? { ...this.customDesktopQuality }
+          : { ...DESKTOP_QUALITY_PRESETS[qualityPreset] })
+      : null;
+    const sessionQuality: StreamQuality = effectiveDesktopQuality ?? QUALITY_PRESETS[qualityPreset];
+
     const effectivePreferred = this.resolveInitialTransport(preferredTransport, device);
     this.webrtcDowngradedClientSide =
       preferredTransport === "webrtc" &&
@@ -857,14 +987,18 @@ export class RemoteClient {
       webrtcRoute: null,
       webrtcTelemetry: null,
       qualityPreset,
+      desktopQuality: effectiveDesktopQuality,
       fps: 0,
       mediaStream: null,
+      hasRemoteAudio: false,
       dataChannelOpen: false,
       fileChannelOpen: false,
       fileTransfer: null,
+      fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE },
       errorCode: null,
       errorMessage: null,
       remoteClipboard: "",
+      lastClipboardAt: 0,
       screenWidth: device?.screenWidth ?? this.state.screenWidth,
       screenHeight: device?.screenHeight ?? this.state.screenHeight,
       rotation: device?.rotation ?? this.state.rotation,
@@ -879,7 +1013,7 @@ export class RemoteClient {
       sessionId,
       deviceId,
       preferredTransport: effectivePreferred,
-      quality: QUALITY_PRESETS[qualityPreset],
+      quality: sessionQuality,
     });
   }
 
@@ -896,11 +1030,13 @@ export class RemoteClient {
       });
     }
     this.abortActiveFileTransferSilent();
+    this.abortAllRemoteFsSilent("会话已结束");
     this.teardownPeerConnection();
     this.frameTimestamps = [];
     this.webrtcFallbackInFlight = false;
     this.webrtcDowngradedByAgent = false;
     this.webrtcDowngradedClientSide = false;
+    this.customDesktopQuality = null;
     this.resetWsJpegAutoQuality();
     this.setState({
       activeDeviceId: null,
@@ -909,19 +1045,39 @@ export class RemoteClient {
       activeTransport: null,
       webrtcRoute: null,
       webrtcTelemetry: null,
+      desktopQuality: null,
       fps: 0,
       mediaStream: null,
+      hasRemoteAudio: false,
       dataChannelOpen: false,
       fileChannelOpen: false,
       fileTransfer: null,
+      fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE },
       remoteClipboard: "",
+      lastClipboardAt: 0,
     });
   }
 
   setQuality(preset: QualityPreset): void {
-    const quality: StreamQuality = QUALITY_PRESETS[preset];
+    const activeDevice = this.state.devices.find(
+      (d) => d.deviceId === this.state.activeDeviceId,
+    );
+    const isDesktop = activeDevice?.deviceType === "desktop";
+    const quality: StreamQuality = isDesktop
+      ? {
+          ...DESKTOP_QUALITY_PRESETS[preset],
+          ...(this.customDesktopQuality?.codec
+            ? { codec: this.customDesktopQuality.codec }
+            : {}),
+        }
+      : QUALITY_PRESETS[preset];
     this.resetWsJpegAutoQuality();
-    this.setState({ qualityPreset: preset });
+    if (isDesktop) {
+      this.customDesktopQuality = { ...quality };
+      this.setState({ qualityPreset: preset, desktopQuality: { ...quality } });
+    } else {
+      this.setState({ qualityPreset: preset });
+    }
     if (this.state.activeDeviceId && this.state.sessionId) {
       this.sendCommand({ action: "quality", quality });
       this.pushNotice(
@@ -929,6 +1085,52 @@ export class RemoteClient {
         preset === "auto"
           ? "画质已切换为 智能自适应（根据实时网速自动调节）"
           : `画质已切换为 ${preset.toUpperCase()} (${quality.maxWidth}p · ${quality.fps}fps)`,
+      );
+    }
+  }
+
+  setDesktopStreamQuality(
+    quality: StreamQuality,
+    presetHint?: DesktopQualityPreset,
+  ): void {
+    const cleanQuality: StreamQuality = { ...quality };
+    this.customDesktopQuality = cleanQuality;
+    this.resetWsJpegAutoQuality();
+
+    const nextPreset: QualityPreset =
+      presetHint === "auto" ||
+      presetHint === "eco" ||
+      presetHint === "balanced" ||
+      presetHint === "hd"
+        ? presetHint
+        : presetHint === "ultra"
+          ? "hd"
+          : this.state.qualityPreset;
+
+    this.setState({
+      qualityPreset: nextPreset,
+      desktopQuality: { ...cleanQuality },
+    });
+
+    if (this.state.activeDeviceId && this.state.sessionId) {
+      this.sendCommand({ action: "quality", quality: cleanQuality });
+      const codecNote =
+        cleanQuality.codec && cleanQuality.codec !== "auto"
+          ? ` · ${cleanQuality.codec.toUpperCase()}`
+          : "";
+      const resLabel =
+        cleanQuality.maxWidth >= 3840
+          ? "4K"
+          : cleanQuality.maxWidth >= 2560
+            ? "2K"
+            : cleanQuality.maxWidth >= 1920
+              ? "1080p"
+              : "720p";
+      this.pushNotice(
+        "info",
+        cleanQuality.auto
+          ? `桌面画质已设为智能自适应（最高 ${cleanQuality.fps}fps${codecNote}）`
+          : `桌面画质已切换为 ${resLabel} · ${cleanQuality.fps}fps${codecNote}`,
       );
     }
   }
@@ -1247,6 +1449,7 @@ export class RemoteClient {
 
     try {
       active.offerSent = true;
+      const targetDir = options.targetDir?.trim();
       fileDc.send(
         JSON.stringify({
           type: "file.offer",
@@ -1256,6 +1459,7 @@ export class RemoteClient {
           mimeType,
           sha256,
           purpose,
+          ...(targetDir ? { targetDir } : {}),
         }),
       );
     } catch {
@@ -1450,6 +1654,249 @@ export class RemoteClient {
     }
     if (this.state.fileTransfer !== null) {
       this.setState({ fileTransfer: null });
+    }
+  }
+
+  private createFsReqId(): string {
+    this.fsReqSeq += 1;
+    return `fs-${Date.now().toString(36)}-${this.fsReqSeq}`;
+  }
+
+  private sendFsRpc(
+    payload: Record<string, unknown>,
+    expectedType: string,
+    timeoutLabel: string,
+  ): Promise<Record<string, unknown>> {
+    const fileDc = this.fileDataChannel;
+    if (!fileDc || fileDc.readyState !== "open") {
+      return Promise.reject(
+        new Error("WebRTC P2P 文件通道未就绪（请确保处于 WebRTC 模式）"),
+      );
+    }
+
+    const reqId = this.createFsReqId();
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingFsRequests.delete(reqId);
+        reject(new Error(timeoutLabel));
+      }, FS_RPC_TIMEOUT_MS);
+
+      this.pendingFsRequests.set(reqId, {
+        expectedType,
+        resolve,
+        reject,
+        timer,
+      });
+
+      try {
+        fileDc.send(JSON.stringify({ ...payload, reqId }));
+      } catch {
+        clearTimeout(timer);
+        this.pendingFsRequests.delete(reqId);
+        reject(new Error("发送远端文件请求失败，连接可能已断开"));
+      }
+    });
+  }
+
+  async listRemoteFsRoots(): Promise<RemoteFsRoot[]> {
+    const res = await this.sendFsRpc(
+      { type: "fs_roots_req" },
+      "fs_roots_res",
+      "获取远端快捷目录超时",
+    );
+    if (typeof res.error === "string" && res.error.trim().length > 0) {
+      throw new Error(res.error.trim());
+    }
+    const rawRoots = Array.isArray(res.roots) ? res.roots : [];
+    const validKinds = new Set<RemoteFsRoot["kind"]>([
+      "home",
+      "desktop",
+      "downloads",
+      "documents",
+      "drive",
+    ]);
+    const roots: RemoteFsRoot[] = [];
+    for (const item of rawRoots) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.name !== "string" || typeof rec.path !== "string") continue;
+      const rawKind = typeof rec.kind === "string" ? rec.kind : "drive";
+      const kind: RemoteFsRoot["kind"] = validKinds.has(rawKind as RemoteFsRoot["kind"])
+        ? (rawKind as RemoteFsRoot["kind"])
+        : "drive";
+      roots.push({ name: rec.name, path: rec.path, kind });
+    }
+    return roots;
+  }
+
+  async listRemoteFsDir(dirPath: string): Promise<RemoteFsListResult> {
+    const res = await this.sendFsRpc(
+      { type: "fs_list_req", path: dirPath },
+      "fs_list_res",
+      "读取远端目录内容超时",
+    );
+    if (typeof res.error === "string" && res.error.trim().length > 0) {
+      throw new Error(res.error.trim());
+    }
+    const resolvedPath = typeof res.path === "string" ? res.path : dirPath;
+    const parentPath =
+      typeof res.parentPath === "string" && res.parentPath.length > 0
+        ? res.parentPath
+        : null;
+    const rawEntries = Array.isArray(res.entries) ? res.entries : [];
+    const entries: RemoteFsEntry[] = [];
+    for (const item of rawEntries) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.name !== "string" || typeof rec.path !== "string") continue;
+      entries.push({
+        name: rec.name,
+        path: rec.path,
+        isDir: Boolean(rec.isDir),
+        size:
+          typeof rec.size === "number" && Number.isFinite(rec.size)
+            ? Math.max(0, Math.floor(rec.size))
+            : 0,
+        mtimeMs:
+          typeof rec.mtimeMs === "number" && Number.isFinite(rec.mtimeMs)
+            ? Math.round(rec.mtimeMs)
+            : 0,
+      });
+    }
+    return { path: resolvedPath, parentPath, entries };
+  }
+
+  async mkdirRemoteFs(
+    parentPath: string,
+    name: string,
+  ): Promise<{ ok: boolean; createdPath?: string; error?: string }> {
+    const res = await this.sendFsRpc(
+      { type: "fs_mkdir_req", parentPath, name },
+      "fs_mkdir_res",
+      "新建远端文件夹超时",
+    );
+    return {
+      ok: Boolean(res.ok),
+      createdPath: typeof res.createdPath === "string" ? res.createdPath : undefined,
+      error: typeof res.error === "string" ? res.error : undefined,
+    };
+  }
+
+  async deleteRemoteFs(
+    targetPath: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const res = await this.sendFsRpc(
+      { type: "fs_delete_req", targetPath },
+      "fs_delete_res",
+      "删除远端文件超时",
+    );
+    return {
+      ok: Boolean(res.ok),
+      error: typeof res.error === "string" ? res.error : undefined,
+    };
+  }
+
+  downloadRemoteFile(filePath: string): Promise<RemoteFsDownloadResult> {
+    if (this.activeFileDownload) {
+      return Promise.reject(new Error("已有远端文件正在下载，请等待完成或取消后再试"));
+    }
+    const fileDc = this.fileDataChannel;
+    if (!fileDc || fileDc.readyState !== "open") {
+      return Promise.reject(
+        new Error("WebRTC P2P 文件通道未就绪（请确保处于 WebRTC 模式）"),
+      );
+    }
+
+    const reqId = this.createFsReqId();
+    const fallbackName =
+      filePath.split(/[/\\]/).filter(Boolean).pop() || "download.bin";
+
+    return new Promise<RemoteFsDownloadResult>((resolve, reject) => {
+      const download: ActiveRemoteDownload = {
+        reqId,
+        filePath,
+        fileName: fallbackName,
+        mimeType: "application/octet-stream",
+        totalBytes: 0,
+        receivedBytes: 0,
+        started: false,
+        chunks: [],
+        lastProgressEmitAt: Date.now(),
+        idleTimer: null,
+        resolve,
+        reject,
+      };
+      this.activeFileDownload = download;
+      this.fileDownloadBinaryChain = Promise.resolve();
+      this.resetRemoteDownloadIdleTimer(download);
+
+      this.setState({
+        fileDownload: {
+          active: true,
+          reqId,
+          fileName: fallbackName,
+          receivedBytes: 0,
+          totalBytes: 0,
+          error: null,
+        },
+      });
+
+      try {
+        fileDc.send(
+          JSON.stringify({
+            type: "fs_download_req",
+            reqId,
+            filePath,
+          }),
+        );
+      } catch {
+        this.failActiveRemoteDownload("发送远端文件下载请求失败");
+      }
+    });
+  }
+
+  cancelRemoteFileDownload(): void {
+    const active = this.activeFileDownload;
+    if (!active) return;
+
+    if (active.idleTimer !== null) {
+      clearTimeout(active.idleTimer);
+      active.idleTimer = null;
+    }
+    this.activeFileDownload = null;
+    active.chunks = [];
+
+    if (this.fileDataChannel?.readyState === "open") {
+      try {
+        this.fileDataChannel.send(
+          JSON.stringify({
+            type: "fs_download_cancel",
+            reqId: active.reqId,
+          }),
+        );
+      } catch {
+        // Ignore send errors while cancelling
+      }
+    }
+
+    this.setState({
+      fileDownload: {
+        active: false,
+        reqId: null,
+        fileName: active.fileName,
+        receivedBytes: active.receivedBytes,
+        totalBytes: active.totalBytes,
+        error: "已取消下载",
+      },
+    });
+    active.reject(new Error("已取消下载"));
+  }
+
+  clearRemoteFileDownload(): void {
+    if (this.activeFileDownload) return;
+    const curr = this.state.fileDownload;
+    if (curr.active || curr.fileName || curr.error || curr.receivedBytes > 0) {
+      this.setState({ fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE } });
     }
   }
 
@@ -1759,6 +2206,7 @@ export class RemoteClient {
       dataChannelOpen: false,
       fileChannelOpen: false,
       mediaStream: null,
+      hasRemoteAudio: false,
       sessionStatus: this.state.activeDeviceId ? "requesting" : "idle",
     });
 
@@ -1926,6 +2374,7 @@ export class RemoteClient {
             webrtcRoute: null,
             webrtcTelemetry: null,
             mediaStream: null,
+            hasRemoteAudio: false,
             dataChannelOpen: false,
             fileChannelOpen: false,
             fps: 0,
@@ -1956,6 +2405,7 @@ export class RemoteClient {
           webrtcRoute: null,
           webrtcTelemetry: null,
           mediaStream: null,
+          hasRemoteAudio: false,
           dataChannelOpen: false,
           fileChannelOpen: false,
           fps: 0,
@@ -2023,6 +2473,7 @@ export class RemoteClient {
               webrtcRoute: null,
               webrtcTelemetry: null,
               mediaStream: null,
+              hasRemoteAudio: false,
               dataChannelOpen: false,
               fileChannelOpen: false,
               fps: 0,
@@ -2050,6 +2501,7 @@ export class RemoteClient {
             webrtcRoute: null,
             webrtcTelemetry: null,
             mediaStream: null,
+            hasRemoteAudio: false,
             dataChannelOpen: false,
             fileChannelOpen: false,
             fps: 0,
@@ -2077,11 +2529,19 @@ export class RemoteClient {
   }
 
   private handleClipboardSync(msg: ClipboardSyncMessage): void {
-    this.setState({ remoteClipboard: msg.text });
+    this.setState({
+      remoteClipboard: msg.text,
+      lastClipboardAt: Date.now(),
+    });
     for (const listener of this.clipboardListeners) {
       listener(msg);
     }
-    this.pushNotice("info", "已同步远端剪贴板内容");
+    const target = this.state.devices.find(
+      (d) => d.deviceId === this.state.activeDeviceId,
+    );
+    if (target?.deviceType !== "desktop") {
+      this.pushNotice("info", "已同步远端剪贴板内容");
+    }
   }
 
   private handleDataChannelMessage(raw: string): void {
@@ -2144,6 +2604,7 @@ export class RemoteClient {
       webrtcTelemetry: null,
       sessionStatus: "streaming",
       mediaStream: null,
+      hasRemoteAudio: false,
       dataChannelOpen: false,
       fileChannelOpen: false,
     });
@@ -2182,7 +2643,20 @@ export class RemoteClient {
     this.activeTouchFirstMovePending = false;
     let localIceCount = 0;
 
+    const targetDevice = this.state.devices.find((d) => d.deviceId === deviceId);
+    const isDesktopTarget = targetDevice?.deviceType === "desktop";
+    const preferredCodec: VideoCodecPreference = isDesktopTarget
+      ? (this.customDesktopQuality?.codec ?? this.state.desktopQuality?.codec ?? "auto")
+      : "auto";
+
     const videoTransceiver = pc.addTransceiver("video", { direction: "recvonly" });
+    if (isDesktopTarget) {
+      try {
+        pc.addTransceiver("audio", { direction: "recvonly" });
+      } catch {
+        // Ignore if environment does not support audio recvonly transceiver
+      }
+    }
     try {
       const capabilities =
         typeof RTCRtpReceiver !== "undefined" &&
@@ -2194,9 +2668,9 @@ export class RemoteClient {
         capabilities.codecs.length > 0 &&
         typeof videoTransceiver.setCodecPreferences === "function"
       ) {
-        // Prioritize H.264 Constrained Baseline (zero B-frames, matches LowLatencyH264Encoder),
+        // Prioritize user-selected desktop codec (or H.264 Constrained High/Baseline in auto mode),
         // then remaining H.264, then VP8, then remaining codecs.
-        const ordered = sortPreferredVideoCodecs(capabilities.codecs);
+        const ordered = sortPreferredVideoCodecs(capabilities.codecs, preferredCodec);
         if (ordered.length > 0) {
           videoTransceiver.setCodecPreferences(ordered);
         }
@@ -2262,11 +2736,29 @@ export class RemoteClient {
         if (this.pc !== pc) return;
         this.setState({ fileChannelOpen: false });
         this.failActiveFileTransfer("WebRTC 连接已断开");
+        this.failAllPendingFsRequests("WebRTC 文件通道已断开");
+        this.failActiveRemoteDownload("WebRTC 文件通道已断开");
       };
       fileDc.onmessage = (event) => {
         if (this.pc !== pc) return;
-        if (typeof event.data === "string") {
-          this.handleFileChannelMessage(event.data);
+        const payload = event.data;
+        if (typeof payload === "string") {
+          this.handleFileChannelMessage(payload);
+        } else if (payload instanceof ArrayBuffer) {
+          this.handleFileChannelBinary(new Uint8Array(payload));
+        } else if (ArrayBuffer.isView(payload)) {
+          this.handleFileChannelBinary(
+            new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength),
+          );
+        } else if (typeof Blob !== "undefined" && payload instanceof Blob) {
+          this.fileDownloadBinaryChain = this.fileDownloadBinaryChain
+            .then(async () => {
+              const buf = await payload.arrayBuffer();
+              if (this.pc === pc) {
+                this.handleFileChannelBinary(new Uint8Array(buf));
+              }
+            })
+            .catch(() => undefined);
         }
       };
     } catch {
@@ -2283,11 +2775,54 @@ export class RemoteClient {
         this.activeVideoReceiver = receiver;
         this.applyReceiverPlayoutDelay(receiver, 0, true);
       }
-      const existingStream = event.streams[0];
-      const stream = existingStream ?? new MediaStream([event.track]);
+
+      const existingStream = event.streams?.[0];
+      let stream: MediaStream;
+      if (existingStream) {
+        stream = existingStream;
+        const prev = this.state.mediaStream;
+        if (
+          prev &&
+          prev !== existingStream &&
+          typeof prev.getTracks === "function" &&
+          typeof existingStream.getTracks === "function" &&
+          typeof existingStream.addTrack === "function"
+        ) {
+          const existingIds = new Set(existingStream.getTracks().map((t) => t.id));
+          for (const prevTrack of prev.getTracks()) {
+            if (!existingIds.has(prevTrack.id)) {
+              existingStream.addTrack(prevTrack);
+            }
+          }
+        }
+      } else if (
+        this.state.mediaStream &&
+        typeof this.state.mediaStream.addTrack === "function" &&
+        event.track
+      ) {
+        stream = this.state.mediaStream;
+        const existingIds =
+          typeof stream.getTracks === "function"
+            ? new Set(stream.getTracks().map((t) => t.id))
+            : new Set<string>();
+        if (!existingIds.has(event.track.id)) {
+          stream.addTrack(event.track);
+        }
+      } else {
+        stream = new MediaStream(event.track ? [event.track] : []);
+      }
+
+      const audioTracksCount =
+        typeof stream.getAudioTracks === "function"
+          ? stream.getAudioTracks().length
+          : event.track?.kind === "audio"
+            ? 1
+            : 0;
+
       // P0-2: Only attach mediaStream here; keep sessionStatus = "negotiating" until ICE connects
       this.setState({
         mediaStream: stream,
+        hasRemoteAudio: audioTracksCount > 0,
       });
     };
 
@@ -2555,6 +3090,13 @@ export class RemoteClient {
 
     const nextSessionId = createSessionId();
     this.frameTimestamps = [];
+    const fallbackDevice = this.state.devices.find((d) => d.deviceId === deviceId);
+    const fallbackQuality: StreamQuality =
+      fallbackDevice?.deviceType === "desktop"
+        ? (this.customDesktopQuality
+            ? { ...this.customDesktopQuality }
+            : { ...DESKTOP_QUALITY_PRESETS[this.state.qualityPreset] })
+        : QUALITY_PRESETS[this.state.qualityPreset];
     this.setState({
       sessionId: nextSessionId,
       sessionStatus: "fallback",
@@ -2562,6 +3104,7 @@ export class RemoteClient {
       webrtcRoute: null,
       webrtcTelemetry: null,
       mediaStream: null,
+      hasRemoteAudio: false,
       dataChannelOpen: false,
       fileChannelOpen: false,
       fps: 0,
@@ -2576,7 +3119,7 @@ export class RemoteClient {
         sessionId: nextSessionId,
         deviceId,
         preferredTransport: "ws-jpeg",
-        quality: QUALITY_PRESETS[this.state.qualityPreset],
+        quality: fallbackQuality,
       });
     }
   }
@@ -3123,6 +3666,8 @@ export class RemoteClient {
     }
 
     this.failActiveFileTransfer("WebRTC 连接已断开");
+    this.failAllPendingFsRequests("WebRTC 连接已断开");
+    this.failActiveRemoteDownload("WebRTC 连接已断开");
 
     if (this.pointerDataChannel) {
       try {
@@ -3168,8 +3713,181 @@ export class RemoteClient {
     if (this.state.fileChannelOpen) {
       teardownPatch.fileChannelOpen = false;
     }
+    if (this.state.hasRemoteAudio) {
+      teardownPatch.hasRemoteAudio = false;
+    }
     if (Object.keys(teardownPatch).length > 0) {
       this.setState(teardownPatch);
+    }
+  }
+
+  private resetRemoteDownloadIdleTimer(download: ActiveRemoteDownload): void {
+    if (download.idleTimer !== null) {
+      clearTimeout(download.idleTimer);
+    }
+    download.idleTimer = setTimeout(() => {
+      if (this.activeFileDownload === download) {
+        this.failActiveRemoteDownload("远端文件下载超时");
+      }
+    }, FS_DOWNLOAD_IDLE_TIMEOUT_MS);
+  }
+
+  private handleFileChannelBinary(chunk: Uint8Array): void {
+    const active = this.activeFileDownload;
+    if (!active) return;
+
+    if (chunk.byteLength === 0) return;
+
+    if (active.receivedBytes + chunk.byteLength > FS_DOWNLOAD_MAX_BYTES) {
+      this.failActiveRemoteDownload("下载文件超过 256 MB 大小限制");
+      return;
+    }
+
+    const copy = new Uint8Array(chunk.byteLength);
+    copy.set(chunk);
+    active.chunks.push(copy);
+    active.receivedBytes += copy.byteLength;
+    this.resetRemoteDownloadIdleTimer(active);
+
+    const now = Date.now();
+    if (
+      now - active.lastProgressEmitAt >= FILE_PROGRESS_THROTTLE_MS ||
+      (active.totalBytes > 0 && active.receivedBytes >= active.totalBytes)
+    ) {
+      active.lastProgressEmitAt = now;
+      this.setState({
+        fileDownload: {
+          active: true,
+          reqId: active.reqId,
+          fileName: active.fileName,
+          receivedBytes: active.receivedBytes,
+          totalBytes: active.totalBytes,
+          error: null,
+        },
+      });
+    }
+  }
+
+  private async finalizeRemoteDownload(
+    active: ActiveRemoteDownload,
+    expectedSha256: string,
+    expectedSize: number | null,
+  ): Promise<void> {
+    try {
+      await this.fileDownloadBinaryChain;
+    } catch {
+      // Ignore prior chain errors
+    }
+
+    const totalLen = active.receivedBytes;
+    if (expectedSize !== null && expectedSize >= 0 && totalLen !== expectedSize) {
+      const msg = `下载字节数不匹配（预期 ${expectedSize}，实际 ${totalLen}）`;
+      this.setState({
+        fileDownload: {
+          active: false,
+          reqId: null,
+          fileName: active.fileName,
+          receivedBytes: totalLen,
+          totalBytes: expectedSize,
+          error: msg,
+        },
+      });
+      active.reject(new Error(msg));
+      return;
+    }
+
+    const merged = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const part of active.chunks) {
+      merged.set(part, offset);
+      offset += part.byteLength;
+    }
+    active.chunks = [];
+
+    const actualSha = await computeSha256Hex(merged);
+    const normalizedExpected = expectedSha256.trim().toLowerCase();
+    if (
+      normalizedExpected.length === 64 &&
+      actualSha !== normalizedExpected
+    ) {
+      const msg = "远端文件下载校验失败（SHA-256 不匹配）";
+      this.setState({
+        fileDownload: {
+          active: false,
+          reqId: null,
+          fileName: active.fileName,
+          receivedBytes: totalLen,
+          totalBytes: active.totalBytes || totalLen,
+          error: msg,
+        },
+      });
+      active.reject(new Error(msg));
+      return;
+    }
+
+    const blob = new Blob([merged as BlobPart], {
+      type: active.mimeType || "application/octet-stream",
+    });
+    this.setState({
+      fileDownload: {
+        active: false,
+        reqId: null,
+        fileName: active.fileName,
+        receivedBytes: totalLen,
+        totalBytes: totalLen,
+        error: null,
+      },
+    });
+    active.resolve({
+      blob,
+      fileName: active.fileName,
+      sha256: actualSha,
+    });
+  }
+
+  private failAllPendingFsRequests(reason: string): void {
+    if (this.pendingFsRequests.size === 0) return;
+    const entries = Array.from(this.pendingFsRequests.values());
+    this.pendingFsRequests.clear();
+    for (const entry of entries) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error(reason));
+    }
+  }
+
+  private failActiveRemoteDownload(reason: string): void {
+    const active = this.activeFileDownload;
+    if (!active) return;
+    if (active.idleTimer !== null) {
+      clearTimeout(active.idleTimer);
+      active.idleTimer = null;
+    }
+    this.activeFileDownload = null;
+    active.chunks = [];
+    this.setState({
+      fileDownload: {
+        active: false,
+        reqId: null,
+        fileName: active.fileName,
+        receivedBytes: active.receivedBytes,
+        totalBytes: active.totalBytes,
+        error: reason,
+      },
+    });
+    active.reject(new Error(reason));
+  }
+
+  private abortAllRemoteFsSilent(reason: string): void {
+    this.failAllPendingFsRequests(reason);
+    const active = this.activeFileDownload;
+    if (active) {
+      if (active.idleTimer !== null) {
+        clearTimeout(active.idleTimer);
+        active.idleTimer = null;
+      }
+      this.activeFileDownload = null;
+      active.chunks = [];
+      active.reject(new Error(reason));
     }
   }
 
@@ -3183,6 +3901,98 @@ export class RemoteClient {
     if (typeof parsed !== "object" || parsed === null) return;
     const msg = parsed as Record<string, unknown>;
     const type = typeof msg.type === "string" ? msg.type : "";
+
+    // 1. Handle Remote File Manager RPC responses (fs_roots_res / fs_list_res / fs_mkdir_res / fs_delete_res / fs_error)
+    if (
+      type === "fs_roots_res" ||
+      type === "fs_list_res" ||
+      type === "fs_mkdir_res" ||
+      type === "fs_delete_res"
+    ) {
+      const reqId = typeof msg.reqId === "string" ? msg.reqId : "";
+      const pending = reqId ? this.pendingFsRequests.get(reqId) : undefined;
+      if (pending && pending.expectedType === type) {
+        clearTimeout(pending.timer);
+        this.pendingFsRequests.delete(reqId);
+        pending.resolve(msg);
+      }
+      return;
+    }
+    if (type === "fs_error") {
+      const reqId = typeof msg.reqId === "string" ? msg.reqId : "";
+      const pending = reqId ? this.pendingFsRequests.get(reqId) : undefined;
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingFsRequests.delete(reqId);
+        const errMsg =
+          typeof msg.error === "string" && msg.error.trim().length > 0
+            ? msg.error.trim()
+            : "远程文件操作失败";
+        pending.reject(new Error(errMsg));
+      }
+      return;
+    }
+
+    // 2. Handle Remote File Download control frames (fs_download_start / fs_download_end / fs_download_error)
+    if (type === "fs_download_start") {
+      const active = this.activeFileDownload;
+      const reqId = typeof msg.reqId === "string" ? msg.reqId : "";
+      if (!active || reqId !== active.reqId) return;
+      active.started = true;
+      if (typeof msg.fileName === "string" && msg.fileName.trim()) {
+        active.fileName = msg.fileName.trim();
+      }
+      if (typeof msg.size === "number" && Number.isFinite(msg.size) && msg.size >= 0) {
+        active.totalBytes = Math.floor(msg.size);
+      }
+      if (typeof msg.mimeType === "string" && msg.mimeType.trim()) {
+        active.mimeType = msg.mimeType.trim();
+      }
+      this.resetRemoteDownloadIdleTimer(active);
+      this.setState({
+        fileDownload: {
+          active: true,
+          reqId: active.reqId,
+          fileName: active.fileName,
+          receivedBytes: active.receivedBytes,
+          totalBytes: active.totalBytes,
+          error: null,
+        },
+      });
+      return;
+    }
+
+    if (type === "fs_download_end") {
+      const active = this.activeFileDownload;
+      const reqId = typeof msg.reqId === "string" ? msg.reqId : "";
+      if (!active || reqId !== active.reqId) return;
+      if (active.idleTimer !== null) {
+        clearTimeout(active.idleTimer);
+        active.idleTimer = null;
+      }
+      this.activeFileDownload = null;
+      const expectedSha = typeof msg.sha256 === "string" ? msg.sha256 : "";
+      const expectedSize =
+        typeof msg.size === "number" && Number.isFinite(msg.size)
+          ? Math.floor(msg.size)
+          : null;
+      void this.finalizeRemoteDownload(active, expectedSha, expectedSize);
+      return;
+    }
+
+    if (type === "fs_download_error") {
+      const active = this.activeFileDownload;
+      const reqId = typeof msg.reqId === "string" ? msg.reqId : "";
+      if (!active || (reqId && reqId !== active.reqId)) return;
+      const errText =
+        typeof msg.error === "string" && msg.error.trim().length > 0
+          ? msg.error.trim()
+          : "远端文件下载失败";
+      this.failActiveRemoteDownload(errText);
+      return;
+    }
+
+    // 3. Handle P2P upload control frames (file.accept / file.progress / file.done / file.error)
     const active = this.activeFileTransfer;
     if (!active) return;
 

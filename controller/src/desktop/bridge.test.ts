@@ -295,6 +295,11 @@ describe("desktop bridge detection", () => {
       permissions: basePermissions,
       lastError: null,
       lastReceivedFile: null,
+      autoLaunch: false,
+      preventSleep: true,
+      audioCaptureEnabled: true,
+      clipboardAutoSync: true,
+      privacyScreenActive: false,
     };
 
     const unsubSpy = vi.fn();
@@ -339,6 +344,12 @@ describe("desktop bridge detection", () => {
       })),
       refreshHostPermissions: vi.fn(async () => basePermissions),
       openPermissionSettings: vi.fn(async () => undefined),
+      setHostPrivacyScreen: vi.fn(async (enabled: boolean) => ({
+        ...baseHostState,
+        privacyScreenActive: enabled,
+      })),
+      writeClipboardText: vi.fn(async (_text: string) => true),
+      readClipboardText: vi.fn(async () => "copied from host"),
     } as unknown as VeloDeckDesktopBridge;
 
     (globalThis as { window?: unknown }).window = {
@@ -367,8 +378,21 @@ describe("desktop bridge detection", () => {
     const updated = await bridge.updateHostConfig?.({
       deviceName: "Work Mac",
       controlPassword: "new-password-999",
+      autoLaunch: true,
+      preventSleep: true,
+      audioCaptureEnabled: false,
+      clipboardAutoSync: true,
     });
     expect(updated?.deviceName).toBe("Work Mac");
+    expect(updated?.autoLaunch).toBe(true);
+    expect(updated?.preventSleep).toBe(true);
+    expect(updated?.audioCaptureEnabled).toBe(false);
+    expect(updated?.clipboardAutoSync).toBe(true);
+
+    const privacyOn = await bridge.setHostPrivacyScreen?.(true);
+    expect(privacyOn?.privacyScreenActive).toBe(true);
+    expect(await bridge.writeClipboardText?.("hello")).toBe(true);
+    expect(await bridge.readClipboardText?.()).toBe("copied from host");
 
     const regen = await bridge.regenerateHostPassword?.();
     expect(regen?.controlPassword).toBe("new-password-123");

@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { FRAME_TYPE_JPEG, QUALITY_PRESETS, encodeMediaFrame } from "@velodeck/protocol";
+import {
+  DESKTOP_QUALITY_PRESETS,
+  FRAME_TYPE_JPEG,
+  QUALITY_PRESETS,
+  encodeMediaFrame,
+} from "@velodeck/protocol";
+import { computeSha256Hex } from "../utils/sha256";
 import {
   RemoteClient,
   isAllowedDataChannelMessage,
@@ -106,6 +112,10 @@ class FakeDataChannel {
   emitMessage(payload: unknown): void {
     this.onmessage?.({ data: JSON.stringify(payload) });
   }
+
+  emitBinary(data: ArrayBuffer | Uint8Array): void {
+    this.onmessage?.({ data });
+  }
 }
 
 class FakeRTCPeerConnection {
@@ -119,6 +129,7 @@ class FakeRTCPeerConnection {
   pointerDc: FakeDataChannel | null = null;
   fileDc: FakeDataChannel | null = null;
   channels = new Map<string, FakeDataChannel>();
+  transceiverCalls: Array<{ kind: string; init?: RTCRtpTransceiverInit }> = [];
   offerCalls: Array<RTCOfferOptions | undefined> = [];
   addedIceCandidates: RTCIceCandidateInit[] = [];
   statsEntries: Array<Record<string, unknown>> = [];
@@ -133,7 +144,11 @@ class FakeRTCPeerConnection {
     FakeRTCPeerConnection.instances.push(this);
   }
 
-  addTransceiver(): { setCodecPreferences: ReturnType<typeof vi.fn> } {
+  addTransceiver(
+    kind = "video",
+    init?: RTCRtpTransceiverInit,
+  ): { setCodecPreferences: ReturnType<typeof vi.fn> } {
+    this.transceiverCalls.push({ kind, init });
     return { setCodecPreferences: vi.fn() };
   }
 
@@ -2265,6 +2280,370 @@ describe("RemoteClient smart auto quality preset and ws-jpeg fallback step-down"
     ws.emitJson({ type: "pong", ts: Date.now() - 400 });
     ws.emitJson({ type: "pong", ts: Date.now() - 400 });
     expect(qualityCmds()).toHaveLength(countAfterManual);
+
+    client.disconnect();
+  });
+});
+
+describe("RemoteClient Pro Desktop features (FS RPC, chunked download, targetDir upload, audio transceiver, desktop quality)", () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const originalRTC = globalThis.RTCPeerConnection;
+
+  afterEach(() => {
+    vi.useRealTimers();
+    FakeWebSocket.instances = [];
+    FakeRTCPeerConnection.instances = [];
+    globalThis.WebSocket = originalWebSocket;
+    globalThis.RTCPeerConnection = originalRTC;
+  });
+
+  function makeDesktopDevice(deviceId = "pc-1") {
+    return {
+      ...makeDeviceSummary({ deviceId, mediaProjection: true, webrtc: true }),
+      name: "Mac Studio",
+      model: "Apple Silicon Mac",
+      androidVersion: "macOS 15",
+      screenWidth: 2560,
+      screenHeight: 1440,
+      deviceType: "desktop" as const,
+      osPlatform: "darwin" as const,
+      capabilities: {
+        webrtc: true,
+        wsJpeg: true,
+        wsH264: false,
+        wake: true,
+        unlock: false,
+        accessibility: true,
+        mediaProjection: true,
+        p2pFileTransfer: true,
+        desktopAudio: true,
+        privacyScreen: true,
+        fileManager: true,
+        powerControl: true,
+        highRefresh: true,
+      },
+    };
+  }
+
+  async function setupDesktopSession() {
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+    globalThis.RTCPeerConnection =
+      FakeRTCPeerConnection as unknown as typeof RTCPeerConnection;
+
+    const client = new RemoteClient("ctrl-desktop-pro");
+    client.connectWithAccount({
+      wsUrl: "wss://velodeck.example.com/ws",
+      authToken: "jwt-valid",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      preferredTransport: "webrtc",
+    });
+
+    const ws = FakeWebSocket.instances[0]!;
+    ws.emitOpen();
+    ws.emitJson({
+      type: "controller.authed",
+      clientId: "ctrl-desktop-pro",
+      serverTime: Date.now(),
+      mode: "relay",
+      authType: "account",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      devices: [makeDesktopDevice("pc-1"), makeDeviceSummary({ deviceId: "phone-1" })],
+      iceServers: [],
+    });
+
+    client.startSession("pc-1", { preferredTransport: "webrtc" });
+    const sessId = client.getState().sessionId!;
+    ws.emitJson({
+      type: "session.ready",
+      sessionId: sessId,
+      deviceId: "pc-1",
+      transport: "webrtc",
+      screenWidth: 2560,
+      screenHeight: 1440,
+      rotation: 0,
+    });
+    await Promise.resolve();
+
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    const fileDc = pc.fileDc!;
+    fileDc.onopen?.();
+    return { client, ws, pc, fileDc };
+  }
+
+  it("adds audio recvonly transceiver for desktop targets (not Android) and tracks hasRemoteAudio on ontrack", async () => {
+    const { client, ws, pc } = await setupDesktopSession();
+
+    // Desktop session adds BOTH video and audio recvonly transceivers, and requests DESKTOP_QUALITY_PRESETS.auto
+    expect(pc.transceiverCalls).toEqual([
+      { kind: "video", init: { direction: "recvonly" } },
+      { kind: "audio", init: { direction: "recvonly" } },
+    ]);
+    const desktopReq = parseSentMessages(ws).find((m) => m.type === "session.request");
+    expect(desktopReq?.quality).toEqual(DESKTOP_QUALITY_PRESETS.auto);
+    expect(client.getState().hasRemoteAudio).toBe(false);
+
+    // Incoming stream with audio track sets hasRemoteAudio=true
+    const streamWithAudio = {
+      getAudioTracks: () => [{ id: "aud-1", kind: "audio" }],
+      getTracks: () => [
+        { id: "vid-1", kind: "video" },
+        { id: "aud-1", kind: "audio" },
+      ],
+    } as unknown as MediaStream;
+    pc.ontrack?.({
+      streams: [streamWithAudio],
+      track: { id: "aud-1", kind: "audio" } as MediaStreamTrack,
+    });
+    expect(client.getState().hasRemoteAudio).toBe(true);
+
+    // Custom desktop quality preset sends exact quality command
+    client.setDesktopStreamQuality(
+      { ...DESKTOP_QUALITY_PRESETS.ultra, codec: "hevc" },
+      "ultra",
+    );
+    const lastCmd = JSON.parse(pc.dc!.sent[pc.dc!.sent.length - 1]!) as {
+      type: string;
+      command: { action: string; quality: Record<string, unknown> };
+    };
+    expect(lastCmd.command).toEqual({
+      action: "quality",
+      quality: { ...DESKTOP_QUALITY_PRESETS.ultra, codec: "hevc" },
+    });
+
+    // Switching to Android target adds ONLY video transceiver (no audio transceiver)
+    client.startSession("phone-1", { preferredTransport: "webrtc" });
+    const phoneSessId = client.getState().sessionId!;
+    ws.emitJson({
+      type: "session.ready",
+      sessionId: phoneSessId,
+      deviceId: "phone-1",
+      transport: "webrtc",
+      screenWidth: 1080,
+      screenHeight: 2400,
+      rotation: 0,
+    });
+    await Promise.resolve();
+    const phonePc = FakeRTCPeerConnection.instances[1]!;
+    expect(phonePc.transceiverCalls).toEqual([
+      { kind: "video", init: { direction: "recvonly" } },
+    ]);
+    expect(client.getState().hasRemoteAudio).toBe(false);
+
+    client.disconnect();
+  });
+
+  it("handles fs_roots_req/res, fs_list_req/res, fs_mkdir_req/res, fs_delete_req/res over file DataChannel", async () => {
+    const { client, fileDc } = await setupDesktopSession();
+
+    // 1. fs_roots_req / fs_roots_res
+    const rootsPromise = client.listRemoteFsRoots();
+    expect(fileDc.sent).toHaveLength(1);
+    const rootsReq = JSON.parse(fileDc.sent[0]!) as { type: string; reqId: string };
+    expect(rootsReq.type).toBe("fs_roots_req");
+    expect(typeof rootsReq.reqId).toBe("string");
+
+    fileDc.emitMessage({
+      type: "fs_roots_res",
+      reqId: rootsReq.reqId,
+      roots: [
+        { name: "桌面", path: "/Users/alice/Desktop", kind: "desktop" },
+        { name: "下载", path: "/Users/alice/Downloads", kind: "downloads" },
+      ],
+    });
+    const roots = await rootsPromise;
+    expect(roots).toEqual([
+      { name: "桌面", path: "/Users/alice/Desktop", kind: "desktop" },
+      { name: "下载", path: "/Users/alice/Downloads", kind: "downloads" },
+    ]);
+
+    // 2. fs_list_req / fs_list_res
+    const listPromise = client.listRemoteFsDir("/Users/alice/Desktop");
+    const listReq = JSON.parse(fileDc.sent[1]!) as {
+      type: string;
+      reqId: string;
+      path: string;
+    };
+    expect(listReq.type).toBe("fs_list_req");
+    expect(listReq.path).toBe("/Users/alice/Desktop");
+
+    fileDc.emitMessage({
+      type: "fs_list_res",
+      reqId: listReq.reqId,
+      path: "/Users/alice/Desktop",
+      parentPath: "/Users/alice",
+      entries: [
+        {
+          name: "notes.txt",
+          path: "/Users/alice/Desktop/notes.txt",
+          isDir: false,
+          size: 42,
+          mtimeMs: 1700000000000,
+        },
+      ],
+    });
+    const listing = await listPromise;
+    expect(listing.path).toBe("/Users/alice/Desktop");
+    expect(listing.parentPath).toBe("/Users/alice");
+    expect(listing.entries).toHaveLength(1);
+    expect(listing.entries[0]?.name).toBe("notes.txt");
+
+    // 3. fs_mkdir_req / fs_mkdir_res
+    const mkdirPromise = client.mkdirRemoteFs("/Users/alice/Desktop", "Demo");
+    const mkdirReq = JSON.parse(fileDc.sent[2]!) as {
+      type: string;
+      reqId: string;
+      parentPath: string;
+      name: string;
+    };
+    expect(mkdirReq.type).toBe("fs_mkdir_req");
+    expect(mkdirReq.parentPath).toBe("/Users/alice/Desktop");
+    expect(mkdirReq.name).toBe("Demo");
+
+    fileDc.emitMessage({
+      type: "fs_mkdir_res",
+      reqId: mkdirReq.reqId,
+      ok: true,
+      createdPath: "/Users/alice/Desktop/Demo",
+    });
+    expect(await mkdirPromise).toEqual({
+      ok: true,
+      createdPath: "/Users/alice/Desktop/Demo",
+      error: undefined,
+    });
+
+    // 4. fs_delete_req / fs_delete_res
+    const delPromise = client.deleteRemoteFs("/Users/alice/Desktop/notes.txt");
+    const delReq = JSON.parse(fileDc.sent[3]!) as {
+      type: string;
+      reqId: string;
+      targetPath: string;
+    };
+    expect(delReq.type).toBe("fs_delete_req");
+    expect(delReq.targetPath).toBe("/Users/alice/Desktop/notes.txt");
+
+    fileDc.emitMessage({
+      type: "fs_delete_res",
+      reqId: delReq.reqId,
+      ok: true,
+    });
+    expect(await delPromise).toEqual({ ok: true, error: undefined });
+
+    client.disconnect();
+  });
+
+  it("downloads remote file via chunked binary frames, verifies SHA-256, rejects corrupted digest, and supports cancel", async () => {
+    const { client, fileDc } = await setupDesktopSession();
+
+    const chunk1 = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const chunk2 = new Uint8Array([9, 10, 11, 12, 13, 14]);
+    const full = new Uint8Array(chunk1.byteLength + chunk2.byteLength);
+    full.set(chunk1, 0);
+    full.set(chunk2, chunk1.byteLength);
+    const expectedSha = await computeSha256Hex(full);
+
+    const dlPromise = client.downloadRemoteFile("/Users/alice/Desktop/report.bin");
+    const dlReq = JSON.parse(fileDc.sent[0]!) as {
+      type: string;
+      reqId: string;
+      filePath: string;
+    };
+    expect(dlReq.type).toBe("fs_download_req");
+    expect(dlReq.filePath).toBe("/Users/alice/Desktop/report.bin");
+    expect(client.getState().fileDownload.active).toBe(true);
+
+    fileDc.emitMessage({
+      type: "fs_download_start",
+      reqId: dlReq.reqId,
+      fileName: "report.bin",
+      size: full.byteLength,
+      mimeType: "application/octet-stream",
+    });
+    fileDc.emitBinary(chunk1.buffer);
+    fileDc.emitBinary(chunk2);
+    fileDc.emitMessage({
+      type: "fs_download_end",
+      reqId: dlReq.reqId,
+      sha256: expectedSha,
+      size: full.byteLength,
+    });
+
+    const result = await dlPromise;
+    expect(result.fileName).toBe("report.bin");
+    expect(result.sha256).toBe(expectedSha);
+    expect(new Uint8Array(await result.blob.arrayBuffer())).toEqual(full);
+    expect(client.getState().fileDownload.active).toBe(false);
+    expect(client.getState().fileDownload.error).toBeNull();
+
+    // Corrupted SHA-256 must reject cleanly
+    const badPromise = client.downloadRemoteFile("/Users/alice/Desktop/corrupt.bin");
+    const badReq = JSON.parse(fileDc.sent[1]!) as { reqId: string };
+    fileDc.emitMessage({
+      type: "fs_download_start",
+      reqId: badReq.reqId,
+      fileName: "corrupt.bin",
+      size: chunk1.byteLength,
+      mimeType: "application/octet-stream",
+    });
+    fileDc.emitBinary(chunk1.buffer);
+    fileDc.emitMessage({
+      type: "fs_download_end",
+      reqId: badReq.reqId,
+      sha256: "f".repeat(64),
+      size: chunk1.byteLength,
+    });
+    await expect(badPromise).rejects.toThrow("SHA-256");
+
+    // Cancel sends fs_download_cancel and rejects cleanly
+    const cancelPromise = client.downloadRemoteFile("/Users/alice/Desktop/huge.zip");
+    const cancelReq = JSON.parse(fileDc.sent[2]!) as { reqId: string };
+    client.cancelRemoteFileDownload();
+    await expect(cancelPromise).rejects.toThrow("已取消下载");
+    const cancelMsg = JSON.parse(fileDc.sent[3]!) as {
+      type: string;
+      reqId: string;
+    };
+    expect(cancelMsg).toEqual({
+      type: "fs_download_cancel",
+      reqId: cancelReq.reqId,
+    });
+
+    client.disconnect();
+  });
+
+  it("includes targetDir in file.offer when uploading into a RemoteFileBrowser folder", async () => {
+    const { client, fileDc } = await setupDesktopSession();
+
+    const payload = new Uint8Array([10, 20, 30, 40]);
+    const uploadPromise = client.sendFileOverWebRtc(payload, {
+      fileName: "hello.txt",
+      mimeType: "text/plain",
+      purpose: "file",
+      targetDir: "/Users/alice/Desktop/Work",
+    });
+
+    await vi.waitFor(() => {
+      expect(fileDc.sent).toHaveLength(1);
+    });
+
+    const offer = JSON.parse(fileDc.sent[0]!) as Record<string, unknown>;
+    expect(offer.type).toBe("file.offer");
+    expect(offer.fileName).toBe("hello.txt");
+    expect(offer.targetDir).toBe("/Users/alice/Desktop/Work");
+
+    const transferId = offer.transferId as string;
+    fileDc.emitMessage({ type: "file.accept", transferId });
+    await vi.waitFor(() => {
+      expect(fileDc.sent).toHaveLength(2);
+    });
+    fileDc.emitMessage({
+      type: "file.done",
+      transferId,
+      savedPath: "/Users/alice/Desktop/Work/hello.txt",
+    });
+
+    const done = await uploadPromise;
+    expect(done.status).toBe("done");
+    expect(done.savedPath).toBe("/Users/alice/Desktop/Work/hello.txt");
 
     client.disconnect();
   });

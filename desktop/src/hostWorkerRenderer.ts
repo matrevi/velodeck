@@ -1,14 +1,16 @@
 /**
  * VeloDeck Desktop Host Hidden Worker (runs inside sandboxed BrowserWindow at app://velodeck-host/hostWorker.html).
- * Handles:
- * - Relay WebSocket connection, agent.register, heartbeat & exponential reconnect
- * - Desktop screen capture via Electron getUserMedia (chromeMediaSource: "desktop")
- * - WebRTC low-latency streaming (H.264 preferred, 1s Adaptive QoS for TURN/P2P, hot display track swap)
- * - WebRTC DataChannels ("control", "pointer", "file") + WS-JPEG 20-byte VeloDeck binary frame fallback
+ * Flagship Pro Remote Desktop Engine:
+ * - High-refresh 30/60/90/120fps & up to 4K (3840x2160) capture
+ * - Multi-codec selection (auto | h264 | hevc | av1 | vp9) with RTX preservation
+ * - Real-time loopback system audio (Electron 35 display-media loopback + graceful video-only fallback + live audio_toggle)
+ * - Adaptive QoS: up to 30 Mbps on Direct LAN/P2P while keeping 2.4 Mbps TURN anti-bufferbloat cap tight
+ * - Privacy curtain, remote power management, two-way clipboard sync, and two-way remote file manager over "file" DataChannel
  */
 
 type HostPlatform = "darwin" | "win32" | "linux";
 type TransportMode = "webrtc" | "ws-jpeg";
+type VideoCodecPreference = "auto" | "h264" | "hevc" | "av1" | "vp9";
 
 interface HostDisplayInfo {
   id: string;
@@ -16,6 +18,7 @@ interface HostDisplayInfo {
   width: number;
   height: number;
   primary: boolean;
+  scaleFactor?: number;
 }
 
 interface HostPermissions {
@@ -38,6 +41,8 @@ interface HostWorkerConfig {
   displays: HostDisplayInfo[];
   activeDisplayId: string;
   permissions: HostPermissions;
+  audioCaptureEnabled: boolean;
+  privacyScreenActive: boolean;
 }
 
 type HostWorkerCommand =
@@ -48,6 +53,8 @@ type HostWorkerCommand =
       reconnect: boolean;
       switchDisplayId?: string;
     }
+  | { type: "clipboard-push"; text: string }
+  | { type: "privacy-state-changed"; active: boolean }
   | { type: "disconnect-session"; reason?: string }
   | { type: "stop" };
 
@@ -59,6 +66,8 @@ interface HostWorkerStateReport {
   activeTransport?: TransportMode | null;
   activeDisplayId?: string;
   lastError?: string | null;
+  privacyScreenActive?: boolean;
+  audioEnabled?: boolean;
 }
 
 interface HostCaptureSourceResult {
@@ -69,12 +78,31 @@ interface HostCaptureSourceResult {
   error?: string;
 }
 
+interface HostFsDownloadOpenResult {
+  ok: boolean;
+  fileName?: string;
+  size?: number;
+  mimeType?: string;
+  error?: string;
+}
+
+interface HostFsDownloadChunkResult {
+  ok: boolean;
+  chunk?: Uint8Array;
+  done?: boolean;
+  sha256?: string;
+  size?: number;
+  error?: string;
+}
+
 interface StreamQuality {
   maxWidth: number;
   fps: number;
   bitrateKbps: number;
   jpegQuality: number;
   auto?: boolean;
+  codec?: VideoCodecPreference;
+  audioEnabled?: boolean;
 }
 
 interface IceServerConfig {
@@ -87,15 +115,34 @@ interface HostWorkerBridge {
   ready(): void;
   onCommand(cb: (command: HostWorkerCommand) => void): () => void;
   reportState(report: HostWorkerStateReport): void;
-  requestCaptureSource(displayId?: string): Promise<HostCaptureSourceResult>;
+  requestCaptureSource(
+    displayId?: string,
+    wantAudio?: boolean,
+  ): Promise<HostCaptureSourceResult>;
   dispatchControl(
     cmd: Record<string, unknown>,
     displayId?: string,
   ): Promise<{ ok: boolean; message?: string }>;
   setClipboard(text: string): Promise<boolean>;
+  setPrivacyScreen(
+    enabled: boolean,
+  ): Promise<{ ok: boolean; active: boolean; message?: string }>;
+  executePower(
+    operation: string,
+  ): Promise<{ ok: boolean; message?: string }>;
   fileTransferText(sessionId: string, text: string): Promise<string | null>;
   fileTransferBinary(sessionId: string, chunk: Uint8Array): Promise<string | null>;
   fileTransferAbort(sessionId: string): void;
+  fsRequest(
+    request: Record<string, unknown>,
+  ): Promise<Record<string, unknown>>;
+  fsDownloadOpen(
+    sessionId: string,
+    reqId: string,
+    filePath: string,
+  ): Promise<HostFsDownloadOpenResult>;
+  fsDownloadReadChunk(reqId: string): Promise<HostFsDownloadChunkResult>;
+  fsDownloadCancel(reqId: string): void;
 }
 
 declare global {
@@ -113,18 +160,42 @@ const RECONNECT_BACKOFF_MS = [1000, 2000, 5000, 10000, 15000];
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_WATCHDOG_MS = 40_000;
 const WS_JPEG_MAX_BUFFERED_BYTES = 128 * 1024;
+const FILE_DC_HIGH_WATERMARK = 512 * 1024;
+const FILE_DC_LOW_THRESHOLD = 256 * 1024;
+const MAX_LAN_BITRATE_KBPS = 30_000;
+const TURN_AUTO_CEILING_KBPS = 2400;
+const TURN_MANUAL_CEILING_KBPS = 2600;
+const MAX_CAPTURE_WIDTH = 3840;
+const MAX_CAPTURE_FPS = 120;
+const OPUS_AUDIO_MAX_BITRATE_BPS = 128_000;
+
 const DEFAULT_QUALITY: StreamQuality = {
-  maxWidth: 900,
+  maxWidth: 1920,
   fps: 60,
-  bitrateKbps: 4500,
-  jpegQuality: 54,
+  bitrateKbps: 6000,
+  jpegQuality: 58,
   auto: true,
+  codec: "auto",
+  audioEnabled: true,
 };
 
 const textEncoder = new TextEncoder();
 
 function getBridge(): HostWorkerBridge | null {
   return window.velodeckHostWorker ?? null;
+}
+
+function normalizeCodecPreference(raw: unknown): VideoCodecPreference {
+  if (
+    raw === "auto" ||
+    raw === "h264" ||
+    raw === "hevc" ||
+    raw === "av1" ||
+    raw === "vp9"
+  ) {
+    return raw;
+  }
+  return "auto";
 }
 
 function encodeJpegMediaFrame(
@@ -135,7 +206,8 @@ function encodeJpegMediaFrame(
   payload: Uint8Array,
 ): Uint8Array {
   const sessionBytes = sessionId ? textEncoder.encode(sessionId) : new Uint8Array(0);
-  const totalLen = FRAME_HEADER_FIXED_SIZE + sessionBytes.byteLength + payload.byteLength;
+  const totalLen =
+    FRAME_HEADER_FIXED_SIZE + sessionBytes.byteLength + payload.byteLength;
   const out = new Uint8Array(totalLen);
   const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
 
@@ -160,64 +232,136 @@ function encodeJpegMediaFrame(
   return out;
 }
 
-function sortPreferredVideoCodecs(
-  codecs: readonly RTCRtpCodec[],
-): RTCRtpCodec[] {
-  const h264HighPm1: RTCRtpCodec[] = [];
-  const h264HighOther: RTCRtpCodec[] = [];
-  const h264BasePm1: RTCRtpCodec[] = [];
-  const h264BaseOther: RTCRtpCodec[] = [];
-  const h264Other: RTCRtpCodec[] = [];
-  const vp8: RTCRtpCodec[] = [];
-  const rest: RTCRtpCodec[] = [];
+function sortH264Bucket(h264Codecs: RTCRtpCodec[]): RTCRtpCodec[] {
+  const highPm1: RTCRtpCodec[] = [];
+  const highOther: RTCRtpCodec[] = [];
+  const basePm1: RTCRtpCodec[] = [];
+  const baseOther: RTCRtpCodec[] = [];
+  const other: RTCRtpCodec[] = [];
 
-  for (const codec of codecs) {
-    const mime = codec.mimeType.toLowerCase();
-    if (mime === "video/h264") {
-      const fmtp = (codec.sdpFmtpLine ?? "").toLowerCase();
-      if (fmtp.includes("profile-level-id=640c")) {
-        if (fmtp.includes("packetization-mode=1")) h264HighPm1.push(codec);
-        else h264HighOther.push(codec);
-      } else if (fmtp.includes("profile-level-id=42e0")) {
-        if (fmtp.includes("packetization-mode=1")) h264BasePm1.push(codec);
-        else h264BaseOther.push(codec);
-      } else {
-        h264Other.push(codec);
-      }
-    } else if (mime === "video/vp8") {
-      vp8.push(codec);
+  for (const codec of h264Codecs) {
+    const fmtp = (codec.sdpFmtpLine ?? "").toLowerCase();
+    if (fmtp.includes("profile-level-id=640c")) {
+      if (fmtp.includes("packetization-mode=1")) highPm1.push(codec);
+      else highOther.push(codec);
+    } else if (fmtp.includes("profile-level-id=42e0")) {
+      if (fmtp.includes("packetization-mode=1")) basePm1.push(codec);
+      else baseOther.push(codec);
     } else {
-      rest.push(codec);
+      other.push(codec);
     }
   }
 
-  return [
-    ...h264HighPm1,
-    ...h264HighOther,
-    ...h264BasePm1,
-    ...h264BaseOther,
-    ...h264Other,
-    ...vp8,
-    ...rest,
-  ];
+  return [...highPm1, ...highOther, ...basePm1, ...baseOther, ...other];
+}
+
+function sortPreferredVideoCodecs(
+  codecs: readonly RTCRtpCodec[],
+  preferred: VideoCodecPreference = "auto",
+): RTCRtpCodec[] {
+  const h264Raw: RTCRtpCodec[] = [];
+  const hevc: RTCRtpCodec[] = [];
+  const vp9: RTCRtpCodec[] = [];
+  const av1: RTCRtpCodec[] = [];
+  const vp8: RTCRtpCodec[] = [];
+  const otherVideo: RTCRtpCodec[] = [];
+  const auxiliary: RTCRtpCodec[] = []; // RTX, RED, ULPFEC, FlexFEC
+
+  for (const codec of codecs) {
+    const mime = codec.mimeType.toLowerCase();
+    if (
+      mime === "video/rtx" ||
+      mime === "video/red" ||
+      mime === "video/ulpfec" ||
+      mime.startsWith("video/flexfec")
+    ) {
+      auxiliary.push(codec);
+    } else if (mime === "video/h264") {
+      h264Raw.push(codec);
+    } else if (mime === "video/h265" || mime === "video/hevc") {
+      hevc.push(codec);
+    } else if (mime === "video/vp9") {
+      vp9.push(codec);
+    } else if (mime === "video/av1") {
+      av1.push(codec);
+    } else if (mime === "video/vp8") {
+      vp8.push(codec);
+    } else {
+      otherVideo.push(codec);
+    }
+  }
+
+  const h264 = sortH264Bucket(h264Raw);
+
+  let orderedPrimary: RTCRtpCodec[];
+  switch (preferred) {
+    case "hevc":
+      orderedPrimary = [...hevc, ...h264, ...vp9, ...av1, ...vp8, ...otherVideo];
+      break;
+    case "av1":
+      orderedPrimary = [...av1, ...hevc, ...vp9, ...h264, ...vp8, ...otherVideo];
+      break;
+    case "vp9":
+      orderedPrimary = [...vp9, ...hevc, ...h264, ...av1, ...vp8, ...otherVideo];
+      break;
+    case "h264":
+    case "auto":
+    default:
+      orderedPrimary = [...h264, ...hevc, ...vp9, ...av1, ...vp8, ...otherVideo];
+      break;
+  }
+
+  // Preserve RTX & FEC auxiliary entries so WebRTC NACK retransmission stays enabled
+  return [...orderedPrimary, ...auxiliary];
 }
 
 function computeDesktopCaptureBounds(
   display: HostDisplayInfo,
   quality: StreamQuality,
 ): { width: number; height: number; fps: number } {
-  const srcW = Math.max(320, Math.round(display.width || 1920));
-  const srcH = Math.max(240, Math.round(display.height || 1080));
-  const targetFps = Math.max(10, Math.min(60, Math.round(quality.fps || 60)));
+  const scaleFactor =
+    typeof display.scaleFactor === "number" &&
+    Number.isFinite(display.scaleFactor) &&
+    display.scaleFactor >= 1
+      ? Math.min(3, display.scaleFactor)
+      : 1;
+  const logicalW = Math.max(320, Math.round(display.width || 1920));
+  const logicalH = Math.max(240, Math.round(display.height || 1080));
+  const physW = Math.round(logicalW * scaleFactor);
+  const physH = Math.round(logicalH * scaleFactor);
 
-  // Desktop screens are typically wide (16:9 / 16:10); scale preset long edge cleanly for crisp text
-  const maxLongEdge =
-    quality.maxWidth >= 1080 ? 1920 : quality.maxWidth >= 800 ? 1600 : 1280;
+  const targetFps = Math.max(
+    10,
+    Math.min(MAX_CAPTURE_FPS, Math.round(quality.fps || 60)),
+  );
+
+  // Respect explicit 2K (2560) / 4K (3840) widths while keeping legacy presets crisp
+  let maxLongEdge: number;
+  if (quality.maxWidth >= 2560) {
+    maxLongEdge = Math.min(MAX_CAPTURE_WIDTH, Math.round(quality.maxWidth));
+  } else if (quality.maxWidth >= 1920) {
+    maxLongEdge = Math.round(quality.maxWidth);
+  } else if (quality.maxWidth >= 1080) {
+    maxLongEdge = 1920;
+  } else if (quality.maxWidth >= 800) {
+    maxLongEdge = 1600;
+  } else {
+    maxLongEdge = 1280;
+  }
+
+  const srcW = maxLongEdge > logicalW ? physW : logicalW;
+  const srcH = maxLongEdge > logicalW ? physH : logicalH;
   const longEdge = Math.max(srcW, srcH);
   const scale = longEdge > maxLongEdge ? maxLongEdge / longEdge : 1;
 
-  const w = Math.max(320, Math.round((srcW * scale) / 2) * 2);
-  const h = Math.max(240, Math.round((srcH * scale) / 2) * 2);
+  const w = Math.min(
+    MAX_CAPTURE_WIDTH,
+    Math.max(320, Math.round((srcW * scale) / 2) * 2),
+  );
+  const h = Math.min(
+    2160,
+    Math.max(240, Math.round((srcH * scale) / 2) * 2),
+  );
   return { width: w, height: h, fps: targetFps };
 }
 
@@ -229,7 +373,13 @@ function computeWsJpegDimensions(
   const safeW = Math.max(320, srcW || 1280);
   const safeH = Math.max(240, srcH || 720);
   const maxLongEdge =
-    quality.maxWidth >= 1080 ? 1440 : quality.maxWidth >= 800 ? 1200 : 960;
+    quality.maxWidth >= 2560
+      ? 1920
+      : quality.maxWidth >= 1080
+        ? 1440
+        : quality.maxWidth >= 800
+          ? 1200
+          : 960;
   const longEdge = Math.max(safeW, safeH);
   const scale = longEdge > maxLongEdge ? maxLongEdge / longEdge : 1;
   return {
@@ -255,22 +405,30 @@ class DesktopHostWorkerEngine {
   private sessionGeneration = 0;
   private activeTransport: TransportMode | null = null;
   private activeQuality: StreamQuality = { ...DEFAULT_QUALITY };
+  private activeCaptureBounds: { width: number; height: number; fps: number } | null = null;
   private activeDisplay: HostDisplayInfo | null = null;
   private mediaStream: MediaStream | null = null;
   private pc: RTCPeerConnection | null = null;
   private videoSender: RTCRtpSender | null = null;
+  private audioSender: RTCRtpSender | null = null;
   private controlDc: RTCDataChannel | null = null;
   private pointerDc: RTCDataChannel | null = null;
   private fileDc: RTCDataChannel | null = null;
   private remoteDescriptionReady = false;
   private pendingRemoteIce: RTCIceCandidateInit[] = [];
   private fileMsgChain: Promise<void> = Promise.resolve();
+  private downloadChain: Promise<void> = Promise.resolve();
+  private cancelledDownloads = new Set<string>();
+
+  // Pro runtime state
+  private audioEnabled = true;
+  private privacyScreenActive = false;
 
   // Adaptive QoS state
   private qosTimer: ReturnType<typeof setInterval> | null = null;
   private qosRouteTurn = false;
   private qosBaselineRttMs: number | null = null;
-  private qosBitrateKbps = 4500;
+  private qosBitrateKbps = 6000;
   private qosFps = 60;
   private qosScaleDown = 1.0;
   private qosHealthyStreak = 0;
@@ -284,6 +442,8 @@ class DesktopHostWorkerEngine {
 
   public start(config: HostWorkerConfig): void {
     this.config = config;
+    this.privacyScreenActive = Boolean(config.privacyScreenActive);
+    this.audioEnabled = Boolean(config.audioCaptureEnabled);
     this.running = true;
     this.reconnectAttempt = 0;
     this.clearReconnectTimer();
@@ -297,11 +457,13 @@ class DesktopHostWorkerEngine {
     this.clearReconnectTimer();
     this.teardownSession(true, "host_stopped");
     this.closeSocket();
+    this.privacyScreenActive = false;
     this.report({
       status: "stopped",
       activeSessionId: null,
       activeTransport: null,
       lastError: null,
+      privacyScreenActive: false,
     });
   }
 
@@ -310,7 +472,10 @@ class DesktopHostWorkerEngine {
     reconnect: boolean,
     switchDisplayId?: string,
   ): void {
+    const prevAudioCapture = this.config?.audioCaptureEnabled;
     this.config = config;
+    this.privacyScreenActive = Boolean(config.privacyScreenActive);
+
     if (!this.running) {
       return;
     }
@@ -324,11 +489,47 @@ class DesktopHostWorkerEngine {
       return;
     }
 
+    if (prevAudioCapture !== config.audioCaptureEnabled) {
+      if (!config.audioCaptureEnabled) {
+        this.audioEnabled = false;
+        this.syncAudioTrackMuteState();
+      } else {
+        this.audioEnabled = this.activeQuality.audioEnabled !== false;
+        this.syncAudioTrackMuteState();
+      }
+    }
+
     if (switchDisplayId && this.sessionId) {
       void this.hotSwapDisplay(switchDisplayId);
     } else {
       this.sendTelemetry();
     }
+  }
+
+  public onPrivacyStateChanged(active: boolean): void {
+    this.privacyScreenActive = Boolean(active);
+    this.sendTelemetry();
+  }
+
+  public pushLocalClipboard(text: string): void {
+    if (!this.sessionId || !this.config || !text) {
+      return;
+    }
+    const payload: Record<string, unknown> = {
+      type: "clipboard.sync",
+      sessionId: this.sessionId,
+      deviceId: this.config.deviceId,
+      text,
+    };
+    if (this.controlDc && this.controlDc.readyState === "open") {
+      try {
+        this.controlDc.send(JSON.stringify(payload));
+        return;
+      } catch {
+        // Fall through to Relay WS
+      }
+    }
+    this.sendJson(payload);
   }
 
   public disconnectSession(reason = "host_disconnected"): void {
@@ -349,6 +550,44 @@ class DesktopHostWorkerEngine {
     getBridge()?.reportState(patch);
   }
 
+  private isAudioEffectivelyEnabled(): boolean {
+    if (!this.config?.audioCaptureEnabled || !this.audioEnabled) {
+      return false;
+    }
+    if (!this.mediaStream) {
+      return true;
+    }
+    const audioTracks = this.mediaStream.getAudioTracks();
+    return audioTracks.length > 0 && audioTracks.some((t) => t.enabled && t.readyState === "live");
+  }
+
+  private syncAudioTrackMuteState(): void {
+    if (!this.mediaStream) return;
+    const allow = Boolean(this.config?.audioCaptureEnabled && this.audioEnabled);
+    for (const track of this.mediaStream.getAudioTracks()) {
+      track.enabled = allow;
+    }
+  }
+
+  private buildCapabilities(): Record<string, boolean> {
+    const cfg = this.config;
+    return {
+      webrtc: typeof RTCPeerConnection !== "undefined",
+      wsJpeg: true,
+      wsH264: false,
+      wake: true,
+      unlock: false,
+      accessibility: Boolean(cfg?.permissions.accessibility),
+      mediaProjection: Boolean(cfg?.permissions.screenCapture),
+      p2pFileTransfer: true,
+      desktopAudio: Boolean(cfg?.audioCaptureEnabled),
+      privacyScreen: true,
+      fileManager: true,
+      powerControl: true,
+      highRefresh: true,
+    };
+  }
+
   private getActiveDisplayFromConfig(): HostDisplayInfo {
     const cfg = this.config;
     if (cfg && cfg.displays.length > 0) {
@@ -364,6 +603,7 @@ class DesktopHostWorkerEngine {
       width: 1920,
       height: 1080,
       primary: true,
+      scaleFactor: 1,
     };
   }
 
@@ -491,18 +731,11 @@ class DesktopHostWorkerEngine {
         charging: true,
         locked: false,
         screenOn: true,
+        privacyScreenActive: this.privacyScreenActive,
+        audioEnabled: this.isAudioEffectivelyEnabled(),
         displays: this.config.displays,
         activeDisplayId: activeDisp.id,
-        capabilities: {
-          webrtc: typeof RTCPeerConnection !== "undefined",
-          wsJpeg: true,
-          wsH264: false,
-          wake: true,
-          unlock: false,
-          accessibility: this.config.permissions.accessibility,
-          mediaProjection: this.config.permissions.screenCapture,
-          p2pFileTransfer: true,
-        },
+        capabilities: this.buildCapabilities(),
       };
 
       if (this.config.unbindOwner) {
@@ -594,18 +827,11 @@ class DesktopHostWorkerEngine {
       screenWidth: disp.width,
       screenHeight: disp.height,
       rotation: 0,
+      privacyScreenActive: this.privacyScreenActive,
+      audioEnabled: this.isAudioEffectivelyEnabled(),
       displays: this.config.displays,
       activeDisplayId: disp.id,
-      capabilities: {
-        webrtc: typeof RTCPeerConnection !== "undefined",
-        wsJpeg: true,
-        wsH264: false,
-        wake: true,
-        unlock: false,
-        accessibility: this.config.permissions.accessibility,
-        mediaProjection: this.config.permissions.screenCapture,
-        p2pFileTransfer: true,
-      },
+      capabilities: this.buildCapabilities(),
     });
   }
 
@@ -726,12 +952,18 @@ class DesktopHostWorkerEngine {
   private async acquireDesktopStream(
     displayId: string | undefined,
     quality: StreamQuality,
-  ): Promise<{ stream: MediaStream; display: HostDisplayInfo }> {
+  ): Promise<{
+    stream: MediaStream;
+    display: HostDisplayInfo;
+    bounds: { width: number; height: number; fps: number };
+  }> {
     const bridge = getBridge();
     if (!bridge) {
       throw new Error("Host worker bridge unavailable");
     }
-    const sourceRes = await bridge.requestCaptureSource(displayId);
+
+    const wantAudio = Boolean(this.config?.audioCaptureEnabled);
+    const sourceRes = await bridge.requestCaptureSource(displayId, wantAudio);
     if (!sourceRes.ok || !sourceRes.sourceId || !sourceRes.display) {
       throw new Error(
         sourceRes.error ||
@@ -739,7 +971,11 @@ class DesktopHostWorkerEngine {
       );
     }
 
-    if (this.config && Array.isArray(sourceRes.displays) && sourceRes.displays.length > 0) {
+    if (
+      this.config &&
+      Array.isArray(sourceRes.displays) &&
+      sourceRes.displays.length > 0
+    ) {
       this.config = {
         ...this.config,
         displays: sourceRes.displays,
@@ -748,33 +984,70 @@ class DesktopHostWorkerEngine {
     }
 
     const bounds = computeDesktopCaptureBounds(sourceRes.display, quality);
-    const constraints = {
-      audio: false,
-      video: {
-        mandatory: {
-          chromeMediaSource: "desktop",
-          chromeMediaSourceId: sourceRes.sourceId,
-          minWidth: 320,
-          maxWidth: bounds.width,
-          minHeight: 240,
-          maxHeight: bounds.height,
-          maxFrameRate: bounds.fps,
-        },
-      },
-    } as unknown as MediaStreamConstraints;
+    let stream: MediaStream | null = null;
 
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    const track = stream.getVideoTracks()[0];
-    if (!track) {
+    // 1) Primary path: Electron 35 getDisplayMedia backed by setDisplayMediaRequestHandler with native loopback audio
+    if (
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getDisplayMedia === "function"
+    ) {
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: {
+            frameRate: { ideal: bounds.fps, max: bounds.fps },
+            width: { max: bounds.width },
+            height: { max: bounds.height },
+          },
+          audio: wantAudio,
+        });
+      } catch (err) {
+        console.warn(
+          "[hostWorker] getDisplayMedia with loopback audio failed, falling back to video-only:",
+          err,
+        );
+        stream = null;
+      }
+    }
+
+    // 2) Graceful fallback: Electron desktop getUserMedia (video-only)
+    if (!stream) {
+      const legacyConstraints = {
+        audio: false,
+        video: {
+          mandatory: {
+            chromeMediaSource: "desktop",
+            chromeMediaSourceId: sourceRes.sourceId,
+            minWidth: 320,
+            maxWidth: bounds.width,
+            minHeight: 240,
+            maxHeight: bounds.height,
+            maxFrameRate: bounds.fps,
+          },
+        },
+      } as unknown as MediaStreamConstraints;
+      stream = await navigator.mediaDevices.getUserMedia(legacyConstraints);
+    }
+
+    const videoTrack = stream.getVideoTracks()[0];
+    if (!videoTrack) {
       stream.getTracks().forEach((t) => t.stop());
       throw new Error("未获取到桌面视频轨道");
     }
+
     try {
-      track.contentHint = "detail";
+      videoTrack.contentHint = bounds.fps >= 90 ? "motion" : "detail";
     } catch {
       // Optional browser hint
     }
-    return { stream, display: sourceRes.display };
+
+    const allowAudioNow = Boolean(
+      this.config?.audioCaptureEnabled && this.audioEnabled,
+    );
+    for (const audioTrack of stream.getAudioTracks()) {
+      audioTrack.enabled = allowAudioNow;
+    }
+
+    return { stream, display: sourceRes.display, bounds };
   }
 
   private async handleSessionRequest(msg: Record<string, unknown>): Promise<void> {
@@ -795,21 +1068,26 @@ class DesktopHostWorkerEngine {
     const quality: StreamQuality = {
       maxWidth:
         typeof rawQuality.maxWidth === "number" && rawQuality.maxWidth > 0
-          ? rawQuality.maxWidth
+          ? Math.min(MAX_CAPTURE_WIDTH, rawQuality.maxWidth)
           : DEFAULT_QUALITY.maxWidth,
       fps:
         typeof rawQuality.fps === "number" && rawQuality.fps > 0
-          ? rawQuality.fps
+          ? Math.min(MAX_CAPTURE_FPS, rawQuality.fps)
           : DEFAULT_QUALITY.fps,
       bitrateKbps:
         typeof rawQuality.bitrateKbps === "number" && rawQuality.bitrateKbps > 0
-          ? rawQuality.bitrateKbps
+          ? Math.min(MAX_LAN_BITRATE_KBPS, rawQuality.bitrateKbps)
           : DEFAULT_QUALITY.bitrateKbps,
       jpegQuality:
         typeof rawQuality.jpegQuality === "number" && rawQuality.jpegQuality > 0
           ? rawQuality.jpegQuality
           : DEFAULT_QUALITY.jpegQuality,
       auto: typeof rawQuality.auto === "boolean" ? rawQuality.auto : true,
+      codec: normalizeCodecPreference(rawQuality.codec),
+      audioEnabled:
+        typeof rawQuality.audioEnabled === "boolean"
+          ? rawQuality.audioEnabled
+          : true,
     };
 
     const sessionIceServers: IceServerConfig[] =
@@ -827,8 +1105,15 @@ class DesktopHostWorkerEngine {
     const gen = ++this.sessionGeneration;
     this.sessionId = sid;
     this.activeQuality = quality;
+    this.audioEnabled = Boolean(
+      this.config.audioCaptureEnabled && quality.audioEnabled !== false,
+    );
 
-    let captured: { stream: MediaStream; display: HostDisplayInfo };
+    let captured: {
+      stream: MediaStream;
+      display: HostDisplayInfo;
+      bounds: { width: number; height: number; fps: number };
+    };
     try {
       captured = await this.acquireDesktopStream(this.config.activeDisplayId, quality);
     } catch (err) {
@@ -854,13 +1139,18 @@ class DesktopHostWorkerEngine {
       return;
     }
 
-    if (this.sessionGeneration !== gen || !this.running || this.ws?.readyState !== WebSocket.OPEN) {
+    if (
+      this.sessionGeneration !== gen ||
+      !this.running ||
+      this.ws?.readyState !== WebSocket.OPEN
+    ) {
       captured.stream.getTracks().forEach((t) => t.stop());
       return;
     }
 
     this.mediaStream = captured.stream;
     this.activeDisplay = captured.display;
+    this.activeCaptureBounds = captured.bounds;
 
     const useWebRtc =
       preferred === "webrtc" && typeof RTCPeerConnection !== "undefined";
@@ -893,8 +1183,11 @@ class DesktopHostWorkerEngine {
       activeSessionId: sid,
       activeTransport: this.activeTransport,
       activeDisplayId: captured.display.id,
+      audioEnabled: this.isAudioEffectivelyEnabled(),
       lastError: null,
     });
+
+    this.sendTelemetry();
 
     if (this.activeTransport === "ws-jpeg") {
       this.startWsJpegLoop(sid, gen, captured.stream);
@@ -925,10 +1218,20 @@ class DesktopHostWorkerEngine {
 
     const sender = pc.addTrack(videoTrack, stream);
     this.videoSender = sender;
-    this.preferH264Codec(pc, sender);
+    this.applyPreferredVideoCodec(pc, sender, this.activeQuality.codec ?? "auto");
+
+    const audioTrack = stream.getAudioTracks()[0];
+    if (audioTrack) {
+      this.audioSender = pc.addTrack(audioTrack, stream);
+    }
 
     pc.onicecandidate = (event) => {
-      if (this.sessionGeneration !== gen || this.pc !== pc || !event.candidate || !this.config) {
+      if (
+        this.sessionGeneration !== gen ||
+        this.pc !== pc ||
+        !event.candidate ||
+        !this.config
+      ) {
         return;
       }
       this.sendJson({
@@ -958,6 +1261,7 @@ class DesktopHostWorkerEngine {
     const handleConnected = () => {
       if (this.sessionGeneration !== gen || this.pc !== pc) return;
       void this.applyVideoSenderParameters();
+      void this.applyAudioSenderParameters();
       this.startAdaptiveQosLoop(sid, gen, pc);
     };
 
@@ -998,7 +1302,11 @@ class DesktopHostWorkerEngine {
     };
   }
 
-  private preferH264Codec(pc: RTCPeerConnection, sender: RTCRtpSender): void {
+  private applyPreferredVideoCodec(
+    pc: RTCPeerConnection,
+    sender: RTCRtpSender,
+    preferred: VideoCodecPreference,
+  ): void {
     try {
       const capabilities =
         typeof RTCRtpSender !== "undefined" &&
@@ -1008,7 +1316,7 @@ class DesktopHostWorkerEngine {
       if (!capabilities || capabilities.codecs.length === 0) {
         return;
       }
-      const ordered = sortPreferredVideoCodecs(capabilities.codecs);
+      const ordered = sortPreferredVideoCodecs(capabilities.codecs, preferred);
       if (ordered.length === 0) {
         return;
       }
@@ -1020,6 +1328,23 @@ class DesktopHostWorkerEngine {
       }
     } catch {
       // Fall back to default browser codec negotiation
+    }
+  }
+
+  private async applyAudioSenderParameters(): Promise<void> {
+    const sender = this.audioSender;
+    if (!sender) return;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}];
+      }
+      for (const enc of params.encodings) {
+        enc.maxBitrate = OPUS_AUDIO_MAX_BITRATE_BPS;
+      }
+      await sender.setParameters(params);
+    } catch {
+      // Ignore if audio sender isn't negotiated in remote SDP
     }
   }
 
@@ -1055,10 +1380,23 @@ class DesktopHostWorkerEngine {
 
     if (label === "file") {
       dc.binaryType = "arraybuffer";
+      try {
+        dc.bufferedAmountLowThreshold = FILE_DC_LOW_THRESHOLD;
+      } catch {
+        // Optional threshold
+      }
       this.fileDc = dc;
       dc.onmessage = (event) => {
         if (this.sessionGeneration !== gen) return;
         const payload = event.data;
+
+        if (typeof payload === "string") {
+          const fsHandled = this.tryDispatchRemoteFsMessage(sid, gen, dc, payload);
+          if (fsHandled) {
+            return;
+          }
+        }
+
         this.fileMsgChain = this.fileMsgChain
           .then(async () => {
             if (this.sessionGeneration !== gen || this.fileDc !== dc) return;
@@ -1086,9 +1424,266 @@ class DesktopHostWorkerEngine {
       dc.onclose = () => {
         if (this.fileDc === dc) {
           this.fileDc = null;
+          this.cancelledDownloads.clear();
           getBridge()?.fileTransferAbort(sid);
         }
       };
+    }
+  }
+
+  private tryDispatchRemoteFsMessage(
+    sid: string,
+    gen: number,
+    dc: RTCDataChannel,
+    rawText: string,
+  ): boolean {
+    let parsed: Record<string, unknown>;
+    try {
+      const obj: unknown = JSON.parse(rawText);
+      if (!obj || typeof obj !== "object") return false;
+      parsed = obj as Record<string, unknown>;
+    } catch {
+      return false;
+    }
+
+    const type = typeof parsed.type === "string" ? parsed.type : "";
+    if (!type.startsWith("fs_")) {
+      return false;
+    }
+
+    const reqId = typeof parsed.reqId === "string" ? parsed.reqId : "";
+    const bridge = getBridge();
+    if (!bridge) {
+      return true;
+    }
+
+    if (type === "fs_download_cancel") {
+      if (reqId) {
+        this.cancelledDownloads.add(reqId);
+        bridge.fsDownloadCancel(reqId);
+      }
+      return true;
+    }
+
+    if (type === "fs_download_req") {
+      const filePath = typeof parsed.filePath === "string" ? parsed.filePath : "";
+      this.cancelledDownloads.delete(reqId);
+      this.downloadChain = this.downloadChain
+        .then(async () => {
+          if (
+            this.sessionGeneration !== gen ||
+            this.fileDc !== dc ||
+            dc.readyState !== "open"
+          ) {
+            return;
+          }
+          await this.streamFileDownloadToChannel(sid, gen, dc, reqId, filePath);
+        })
+        .catch(() => undefined);
+      return true;
+    }
+
+    if (
+      type === "fs_roots_req" ||
+      type === "fs_list_req" ||
+      type === "fs_mkdir_req" ||
+      type === "fs_delete_req"
+    ) {
+      void bridge
+        .fsRequest(parsed)
+        .then((response) => {
+          if (
+            this.sessionGeneration === gen &&
+            this.fileDc === dc &&
+            dc.readyState === "open"
+          ) {
+            try {
+              dc.send(JSON.stringify(response));
+            } catch {
+              // Ignore closed channel
+            }
+          }
+        })
+        .catch((error) => {
+          if (
+            this.sessionGeneration === gen &&
+            this.fileDc === dc &&
+            dc.readyState === "open"
+          ) {
+            try {
+              dc.send(
+                JSON.stringify({
+                  type: "fs_error",
+                  reqId,
+                  error:
+                    error instanceof Error ? error.message : "远程文件操作失败",
+                }),
+              );
+            } catch {
+              // Ignore
+            }
+          }
+        });
+      return true;
+    }
+
+    return false;
+  }
+
+  private waitForFileChannelDrain(
+    dc: RTCDataChannel,
+    gen: number,
+    reqId: string,
+  ): Promise<void> {
+    if (
+      dc.readyState !== "open" ||
+      dc.bufferedAmount <= FILE_DC_HIGH_WATERMARK ||
+      this.sessionGeneration !== gen ||
+      this.cancelledDownloads.has(reqId)
+    ) {
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        dc.removeEventListener("bufferedamountlow", onLow);
+        dc.removeEventListener("close", onLow);
+        resolve();
+      };
+      const onLow = () => done();
+      const timer = setTimeout(done, 50);
+      dc.addEventListener("bufferedamountlow", onLow, { once: true });
+      dc.addEventListener("close", onLow, { once: true });
+    });
+  }
+
+  private async streamFileDownloadToChannel(
+    sid: string,
+    gen: number,
+    dc: RTCDataChannel,
+    reqId: string,
+    filePath: string,
+  ): Promise<void> {
+    const bridge = getBridge();
+    if (!bridge) return;
+
+    const sendJsonSafe = (obj: Record<string, unknown>): boolean => {
+      if (
+        this.sessionGeneration !== gen ||
+        this.fileDc !== dc ||
+        dc.readyState !== "open"
+      ) {
+        return false;
+      }
+      try {
+        dc.send(JSON.stringify(obj));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const openRes = await bridge.fsDownloadOpen(sid, reqId, filePath);
+    if (!openRes.ok) {
+      sendJsonSafe({
+        type: "fs_download_error",
+        reqId,
+        error: openRes.error || "无法打开目标文件",
+      });
+      return;
+    }
+
+    if (
+      this.cancelledDownloads.has(reqId) ||
+      this.sessionGeneration !== gen ||
+      this.fileDc !== dc ||
+      dc.readyState !== "open"
+    ) {
+      bridge.fsDownloadCancel(reqId);
+      this.cancelledDownloads.delete(reqId);
+      return;
+    }
+
+    if (
+      !sendJsonSafe({
+        type: "fs_download_start",
+        reqId,
+        fileName: openRes.fileName ?? "download",
+        size: openRes.size ?? 0,
+        mimeType: openRes.mimeType ?? "application/octet-stream",
+      })
+    ) {
+      bridge.fsDownloadCancel(reqId);
+      return;
+    }
+
+    while (true) {
+      if (
+        this.cancelledDownloads.has(reqId) ||
+        this.sessionGeneration !== gen ||
+        this.fileDc !== dc ||
+        dc.readyState !== "open"
+      ) {
+        bridge.fsDownloadCancel(reqId);
+        this.cancelledDownloads.delete(reqId);
+        return;
+      }
+
+      while (
+        dc.readyState === "open" &&
+        dc.bufferedAmount > FILE_DC_HIGH_WATERMARK &&
+        this.sessionGeneration === gen &&
+        !this.cancelledDownloads.has(reqId)
+      ) {
+        await this.waitForFileChannelDrain(dc, gen, reqId);
+      }
+
+      if (
+        this.cancelledDownloads.has(reqId) ||
+        this.sessionGeneration !== gen ||
+        this.fileDc !== dc ||
+        dc.readyState !== "open"
+      ) {
+        bridge.fsDownloadCancel(reqId);
+        this.cancelledDownloads.delete(reqId);
+        return;
+      }
+
+      const chunkRes = await bridge.fsDownloadReadChunk(reqId);
+      if (!chunkRes.ok) {
+        sendJsonSafe({
+          type: "fs_download_error",
+          reqId,
+          error: chunkRes.error || "读取文件失败",
+        });
+        return;
+      }
+
+      if (chunkRes.done) {
+        sendJsonSafe({
+          type: "fs_download_end",
+          reqId,
+          sha256: chunkRes.sha256 ?? "",
+          size: chunkRes.size ?? 0,
+        });
+        this.cancelledDownloads.delete(reqId);
+        return;
+      }
+
+      if (chunkRes.chunk && chunkRes.chunk.byteLength > 0) {
+        const copy = new Uint8Array(chunkRes.chunk.byteLength);
+        copy.set(chunkRes.chunk);
+        try {
+          dc.send(copy.buffer);
+        } catch {
+          bridge.fsDownloadCancel(reqId);
+          return;
+        }
+      }
     }
   }
 
@@ -1115,6 +1710,11 @@ class DesktopHostWorkerEngine {
         return;
       }
       void this.handleControlCmd(obj, true);
+    } else if (obj.type === "clipboard.sync") {
+      const text = typeof obj.text === "string" ? obj.text : "";
+      if (text) {
+        void getBridge()?.setClipboard(text);
+      }
     }
   }
 
@@ -1138,7 +1738,11 @@ class DesktopHostWorkerEngine {
       if (this.sessionGeneration !== gen || this.pc !== pc) return;
 
       if (this.videoSender) {
-        this.preferH264Codec(pc, this.videoSender);
+        this.applyPreferredVideoCodec(
+          pc,
+          this.videoSender,
+          this.activeQuality.codec ?? "auto",
+        );
       }
 
       const answer = await pc.createAnswer();
@@ -1156,6 +1760,7 @@ class DesktopHostWorkerEngine {
       this.remoteDescriptionReady = true;
       await this.flushPendingIce(pc, gen);
       await this.applyVideoSenderParameters();
+      await this.applyAudioSenderParameters();
     } catch (err) {
       console.warn("[hostWorker] handleRemoteOffer failed:", err);
     }
@@ -1173,6 +1778,7 @@ class DesktopHostWorkerEngine {
       this.remoteDescriptionReady = true;
       await this.flushPendingIce(pc, gen);
       await this.applyVideoSenderParameters();
+      await this.applyAudioSenderParameters();
     } catch (err) {
       console.warn("[hostWorker] handleRemoteAnswer failed:", err);
     }
@@ -1214,12 +1820,35 @@ class DesktopHostWorkerEngine {
     this.qosHealthyStreak = 0;
     this.qosPrevRetx = -1;
     this.qosScaleDown = 1.0;
+
+    const requestedKbps = Math.max(
+      400,
+      Math.min(MAX_LAN_BITRATE_KBPS, this.activeQuality.bitrateKbps || 6000),
+    );
+    const requestedFps = Math.max(
+      15,
+      Math.min(MAX_CAPTURE_FPS, this.activeQuality.fps || 60),
+    );
+
     if (this.activeQuality.auto) {
-      this.qosBitrateKbps = this.qosRouteTurn ? 1800 : 4500;
-      this.qosFps = this.qosRouteTurn ? 30 : 60;
+      if (this.qosRouteTurn) {
+        this.qosBitrateKbps = 1800;
+        this.qosFps = Math.min(30, requestedFps);
+      } else {
+        const lanCeiling = Math.min(
+          MAX_LAN_BITRATE_KBPS,
+          Math.max(8000, requestedKbps),
+        );
+        this.qosBitrateKbps = Math.min(lanCeiling, Math.max(6000, requestedKbps));
+        this.qosFps = requestedFps;
+      }
     } else {
-      this.qosBitrateKbps = Math.max(400, this.activeQuality.bitrateKbps || 4500);
-      this.qosFps = Math.max(15, Math.min(60, this.activeQuality.fps || 60));
+      this.qosBitrateKbps = this.qosRouteTurn
+        ? Math.min(requestedKbps, TURN_MANUAL_CEILING_KBPS)
+        : requestedKbps;
+      this.qosFps = this.qosRouteTurn
+        ? Math.min(requestedFps, 60)
+        : requestedFps;
     }
   }
 
@@ -1237,13 +1866,19 @@ class DesktopHostWorkerEngine {
       }
       const targetKbps = Math.max(
         400,
-        Math.round(bitrateKbpsOverride ?? this.qosBitrateKbps),
+        Math.min(
+          MAX_LAN_BITRATE_KBPS,
+          Math.round(bitrateKbpsOverride ?? this.qosBitrateKbps),
+        ),
       );
       const targetFps = Math.max(
         15,
-        Math.min(60, Math.round(fpsOverride ?? this.qosFps)),
+        Math.min(MAX_CAPTURE_FPS, Math.round(fpsOverride ?? this.qosFps)),
       );
-      const targetScale = Math.max(1.0, Math.min(2.0, scaleDownOverride ?? this.qosScaleDown));
+      const targetScale = Math.max(
+        1.0,
+        Math.min(2.0, scaleDownOverride ?? this.qosScaleDown),
+      );
       for (const enc of params.encodings) {
         enc.maxBitrate = targetKbps * 1000;
         enc.maxFramerate = targetFps;
@@ -1315,7 +1950,10 @@ class DesktopHostWorkerEngine {
     let activePair = selectedPairId ? candidatePairs.get(selectedPairId) : undefined;
     if (!activePair) {
       for (const pair of candidatePairs.values()) {
-        if ((pair.nominated === true || pair.selected === true) && pair.state === "succeeded") {
+        if (
+          (pair.nominated === true || pair.selected === true) &&
+          pair.state === "succeeded"
+        ) {
           activePair = pair;
           break;
         }
@@ -1354,51 +1992,76 @@ class DesktopHostWorkerEngine {
         : 0;
     this.qosPrevRetx = retxTotal;
 
+    const requestedKbps = Math.max(
+      500,
+      Math.min(MAX_LAN_BITRATE_KBPS, this.activeQuality.bitrateKbps || 6000),
+    );
+    const requestedFps = Math.max(
+      15,
+      Math.min(MAX_CAPTURE_FPS, this.activeQuality.fps || 60),
+    );
+
     if (!this.activeQuality.auto) {
       if (routeChanged) {
         const manualKbps = isTurn
-          ? Math.min(this.activeQuality.bitrateKbps, 2600)
-          : this.activeQuality.bitrateKbps;
+          ? Math.min(requestedKbps, TURN_MANUAL_CEILING_KBPS)
+          : requestedKbps;
         this.qosBitrateKbps = Math.max(500, manualKbps);
-        this.qosFps = Math.max(15, Math.min(60, this.activeQuality.fps));
+        this.qosFps = isTurn ? Math.min(requestedFps, 60) : requestedFps;
         this.qosScaleDown = 1.0;
         void this.applyVideoSenderParameters();
       }
       return;
     }
 
-    const ceilingKbps = isTurn ? 2400 : 6000;
+    // TURN stays tightly capped at 2.4 Mbps anti-bufferbloat; Direct LAN/P2P scales up to 30 Mbps @ 90/120fps
+    const ceilingKbps = isTurn
+      ? TURN_AUTO_CEILING_KBPS
+      : Math.min(MAX_LAN_BITRATE_KBPS, Math.max(12_000, requestedKbps));
     const floorKbps = 500;
-    const maxFps = isTurn ? 45 : 60;
+    const maxFps = isTurn ? Math.min(45, requestedFps) : requestedFps;
 
-    let nextKbps = routeChanged ? (isTurn ? 1800 : 4500) : this.qosBitrateKbps;
-    let nextFps = routeChanged ? (isTurn ? 30 : 60) : this.qosFps;
+    let nextKbps = routeChanged
+      ? isTurn
+        ? 1800
+        : Math.min(ceilingKbps, Math.max(6000, requestedKbps))
+      : this.qosBitrateKbps;
+    let nextFps = routeChanged
+      ? isTurn
+        ? Math.min(30, requestedFps)
+        : requestedFps
+      : this.qosFps;
     let nextScale = routeChanged ? 1.0 : this.qosScaleDown;
 
     const baseline = this.qosBaselineRttMs ?? 40;
     const severeSpike =
-      (rttMs !== null && (rttMs > baseline + 130 || rttMs > 260)) || retxDelta > 40;
+      (rttMs !== null && (rttMs > baseline + 130 || rttMs > 260)) ||
+      retxDelta > 40;
     const mildSpike =
-      (rttMs !== null && (rttMs > baseline + 70 || rttMs > 160)) || retxDelta > 15;
+      (rttMs !== null && (rttMs > baseline + 70 || rttMs > 160)) ||
+      retxDelta > 15;
 
     if (severeSpike) {
       this.qosHealthyStreak = 0;
-      nextKbps = Math.max(floorKbps, Math.round(nextKbps * 0.72));
-      nextFps = Math.max(20, nextFps > 30 ? 30 : 20);
+      nextKbps = Math.max(floorKbps, Math.round(nextKbps * 0.7));
+      nextFps = Math.max(20, nextFps > 60 ? 60 : nextFps > 30 ? 30 : 20);
       nextScale = nextKbps <= 900 ? 1.5 : 1.25;
     } else if (mildSpike) {
       this.qosHealthyStreak = 0;
       nextKbps = Math.max(floorKbps, Math.round(nextKbps * 0.85));
-      nextFps = Math.max(24, Math.min(nextFps, 30));
+      nextFps = Math.max(24, nextFps > 60 ? 60 : Math.min(nextFps, 30));
     } else {
       this.qosHealthyStreak += 1;
       if (this.qosHealthyStreak >= 3) {
-        nextKbps = Math.min(ceilingKbps, Math.round(nextKbps * 1.15) + 100);
+        const stepUp = isTurn
+          ? Math.round(nextKbps * 1.15) + 100
+          : Math.round(nextKbps * 1.22) + 400;
+        nextKbps = Math.min(ceilingKbps, stepUp);
         if (nextScale > 1.0 && nextKbps >= 1400) {
           nextScale = nextScale > 1.25 ? 1.25 : 1.0;
         }
-        if (nextFps < maxFps && nextKbps >= (isTurn ? 1600 : 2800)) {
-          nextFps = Math.min(maxFps, nextFps + 15);
+        if (nextFps < maxFps && nextKbps >= (isTurn ? 1600 : 3500)) {
+          nextFps = Math.min(maxFps, nextFps + (maxFps > 60 ? 30 : 15));
         }
         this.qosHealthyStreak = 0;
       }
@@ -1479,7 +2142,10 @@ class DesktopHostWorkerEngine {
 
     ctx.drawImage(video, 0, 0, dims.width, dims.height);
     this.jpegEncoding = true;
-    const jpegQ = Math.max(0.25, Math.min(0.92, (this.activeQuality.jpegQuality || 55) / 100));
+    const jpegQ = Math.max(
+      0.25,
+      Math.min(0.92, (this.activeQuality.jpegQuality || 55) / 100),
+    );
 
     canvas.toBlob(
       (blob) => {
@@ -1541,7 +2207,11 @@ class DesktopHostWorkerEngine {
     const sid = this.sessionId;
     const gen = this.sessionGeneration;
 
-    let captured: { stream: MediaStream; display: HostDisplayInfo };
+    let captured: {
+      stream: MediaStream;
+      display: HostDisplayInfo;
+      bounds: { width: number; height: number; fps: number };
+    };
     try {
       captured = await this.acquireDesktopStream(displayId, this.activeQuality);
     } catch (err) {
@@ -1555,19 +2225,28 @@ class DesktopHostWorkerEngine {
     }
 
     const oldStream = this.mediaStream;
-    const newTrack = captured.stream.getVideoTracks()[0];
-    if (!newTrack) {
+    const newVideoTrack = captured.stream.getVideoTracks()[0];
+    if (!newVideoTrack) {
       captured.stream.getTracks().forEach((t) => t.stop());
       return false;
     }
 
+    const newAudioTrack = captured.stream.getAudioTracks()[0] ?? null;
+
     if (this.activeTransport === "webrtc" && this.videoSender) {
       try {
-        await this.videoSender.replaceTrack(newTrack);
+        await this.videoSender.replaceTrack(newVideoTrack);
       } catch (err) {
         console.warn("[hostWorker] replaceTrack failed:", err);
         captured.stream.getTracks().forEach((t) => t.stop());
         return false;
+      }
+      if (this.audioSender && newAudioTrack) {
+        try {
+          await this.audioSender.replaceTrack(newAudioTrack);
+        } catch {
+          // Keep video swap even if audio track swap fails
+        }
       }
     } else if (this.activeTransport === "ws-jpeg" && this.jpegVideo) {
       this.jpegVideo.srcObject = captured.stream;
@@ -1576,11 +2255,57 @@ class DesktopHostWorkerEngine {
 
     this.mediaStream = captured.stream;
     this.activeDisplay = captured.display;
+    this.activeCaptureBounds = captured.bounds;
     oldStream?.getTracks().forEach((t) => t.stop());
 
     this.report({ activeDisplayId: captured.display.id });
     this.sendTelemetry();
     return true;
+  }
+
+  private async applyLiveQualityChange(): Promise<void> {
+    if (!this.sessionId) return;
+
+    if (this.activeTransport === "webrtc") {
+      if (this.pc && this.videoSender) {
+        this.applyPreferredVideoCodec(
+          this.pc,
+          this.videoSender,
+          this.activeQuality.codec ?? "auto",
+        );
+      }
+
+      // Check if requested resolution or refresh rate exceeds current capture track bounds
+      const disp = this.activeDisplay ?? this.getActiveDisplayFromConfig();
+      const desired = computeDesktopCaptureBounds(disp, this.activeQuality);
+      const prev = this.activeCaptureBounds;
+      const needsCaptureUpgrade =
+        !prev ||
+        desired.width > prev.width ||
+        desired.height > prev.height ||
+        desired.fps > prev.fps;
+
+      const videoTrack = this.mediaStream?.getVideoTracks()[0];
+      if (needsCaptureUpgrade && videoTrack) {
+        try {
+          await videoTrack.applyConstraints({
+            width: { max: desired.width },
+            height: { max: desired.height },
+            frameRate: { ideal: desired.fps, max: desired.fps },
+          });
+          videoTrack.contentHint = desired.fps >= 90 ? "motion" : "detail";
+          this.activeCaptureBounds = desired;
+        } catch {
+          // Re-acquire desktop track cleanly if live applyConstraints isn't supported
+          await this.hotSwapDisplay(disp.id);
+        }
+      }
+
+      this.resetAdaptiveQosState();
+      await this.applyVideoSenderParameters();
+    } else if (this.activeTransport === "ws-jpeg" && this.mediaStream) {
+      this.startWsJpegLoop(this.sessionId, this.sessionGeneration, this.mediaStream);
+    }
   }
 
   private async handleControlCmd(
@@ -1594,7 +2319,8 @@ class DesktopHostWorkerEngine {
     if (!cmd) return;
 
     const action = typeof cmd.action === "string" ? cmd.action : "";
-    const sid = typeof msg.sessionId === "string" ? msg.sessionId : this.sessionId ?? "";
+    const sid =
+      typeof msg.sessionId === "string" ? msg.sessionId : this.sessionId ?? "";
     const seq = typeof msg.seq === "number" ? msg.seq : undefined;
 
     let ok = true;
@@ -1605,31 +2331,45 @@ class DesktopHostWorkerEngine {
         const q = cmd.quality as Partial<StreamQuality> | undefined;
         if (q && typeof q === "object") {
           this.activeQuality = {
-            maxWidth: typeof q.maxWidth === "number" && q.maxWidth > 0 ? q.maxWidth : this.activeQuality.maxWidth,
-            fps: typeof q.fps === "number" && q.fps > 0 ? q.fps : this.activeQuality.fps,
+            maxWidth:
+              typeof q.maxWidth === "number" && q.maxWidth > 0
+                ? Math.min(MAX_CAPTURE_WIDTH, q.maxWidth)
+                : this.activeQuality.maxWidth,
+            fps:
+              typeof q.fps === "number" && q.fps > 0
+                ? Math.min(MAX_CAPTURE_FPS, q.fps)
+                : this.activeQuality.fps,
             bitrateKbps:
               typeof q.bitrateKbps === "number" && q.bitrateKbps > 0
-                ? q.bitrateKbps
+                ? Math.min(MAX_LAN_BITRATE_KBPS, q.bitrateKbps)
                 : this.activeQuality.bitrateKbps,
             jpegQuality:
               typeof q.jpegQuality === "number" && q.jpegQuality > 0
                 ? q.jpegQuality
                 : this.activeQuality.jpegQuality,
             auto: typeof q.auto === "boolean" ? q.auto : false,
+            codec:
+              q.codec !== undefined
+                ? normalizeCodecPreference(q.codec)
+                : this.activeQuality.codec,
+            audioEnabled:
+              typeof q.audioEnabled === "boolean"
+                ? q.audioEnabled
+                : this.activeQuality.audioEnabled,
           };
-          if (this.activeTransport === "webrtc") {
-            this.resetAdaptiveQosState();
-            await this.applyVideoSenderParameters();
-          } else if (this.activeTransport === "ws-jpeg" && this.mediaStream && this.sessionId) {
-            this.startWsJpegLoop(this.sessionId, this.sessionGeneration, this.mediaStream);
+          if (typeof q.audioEnabled === "boolean") {
+            this.audioEnabled = Boolean(
+              this.config?.audioCaptureEnabled && q.audioEnabled,
+            );
+            this.syncAudioTrackMuteState();
           }
+          await this.applyLiveQualityChange();
         }
         break;
       }
 
       case "request_keyframe": {
         if (this.activeTransport === "webrtc") {
-          // Nudge sender bitrate slightly to encourage an immediate IDR keyframe refresh
           const currentKbps = this.qosBitrateKbps;
           await this.applyVideoSenderParameters(Math.max(400, currentKbps - 50));
           await this.applyVideoSenderParameters(currentKbps);
@@ -1654,6 +2394,49 @@ class DesktopHostWorkerEngine {
       case "clipboard_set": {
         const text = typeof cmd.text === "string" ? cmd.text : "";
         ok = (await getBridge()?.setClipboard(text)) ?? false;
+        break;
+      }
+
+      case "audio_toggle": {
+        const enabled = Boolean(cmd.enabled);
+        if (enabled && !this.config?.audioCaptureEnabled) {
+          ok = false;
+          detail = "被控电脑已关闭系统音频采集";
+        } else {
+          this.audioEnabled = enabled;
+          this.syncAudioTrackMuteState();
+          const hasTrack = (this.mediaStream?.getAudioTracks().length ?? 0) > 0;
+          if (enabled && !hasTrack) {
+            ok = false;
+            detail = "当前系统未能采集到桌面音频轨道";
+          } else {
+            this.report({ audioEnabled: this.isAudioEffectivelyEnabled() });
+            this.sendTelemetry();
+          }
+        }
+        break;
+      }
+
+      case "privacy_screen": {
+        const enabled = Boolean(cmd.enabled);
+        const res = await getBridge()?.setPrivacyScreen(enabled);
+        ok = res?.ok ?? false;
+        detail = res?.message;
+        this.privacyScreenActive = res?.active ?? false;
+        this.sendTelemetry();
+        break;
+      }
+
+      case "power": {
+        const operation =
+          typeof cmd.operation === "string"
+            ? cmd.operation
+            : typeof cmd.op === "string"
+              ? cmd.op
+              : "";
+        const res = await getBridge()?.executePower(operation);
+        ok = res?.ok ?? false;
+        detail = res?.message;
         break;
       }
 
@@ -1707,6 +2490,8 @@ class DesktopHostWorkerEngine {
     this.remoteDescriptionReady = false;
     this.pendingRemoteIce = [];
     this.videoSender = null;
+    this.audioSender = null;
+    this.cancelledDownloads.clear();
 
     for (const dc of [this.controlDc, this.pointerDc, this.fileDc]) {
       if (dc) {
@@ -1744,6 +2529,7 @@ class DesktopHostWorkerEngine {
     this.sessionGeneration += 1;
     this.sessionId = null;
     this.activeTransport = null;
+    this.activeCaptureBounds = null;
     this.stopWsJpegLoop();
     this.closePeerConnection();
 
@@ -1787,6 +2573,12 @@ if (bridge) {
           command.reconnect,
           command.switchDisplayId,
         );
+        break;
+      case "clipboard-push":
+        engine.pushLocalClipboard(command.text);
+        break;
+      case "privacy-state-changed":
+        engine.onPrivacyStateChanged(command.active);
         break;
       case "disconnect-session":
         engine.disconnectSession(command.reason);

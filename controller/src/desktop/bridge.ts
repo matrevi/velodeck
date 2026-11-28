@@ -50,12 +50,21 @@ export interface DesktopHostState {
   permissions: DesktopHostPermissions;
   lastError: string | null;
   lastReceivedFile: { fileName: string; savedPath: string; at: number } | null;
+  autoLaunch?: boolean;
+  preventSleep?: boolean;
+  audioCaptureEnabled?: boolean;
+  clipboardAutoSync?: boolean;
+  privacyScreenActive?: boolean;
 }
 
 export interface DesktopHostConfigPatch {
   deviceName?: string;
   controlPassword?: string;
   activeDisplayId?: string;
+  autoLaunch?: boolean;
+  preventSleep?: boolean;
+  audioCaptureEnabled?: boolean;
+  clipboardAutoSync?: boolean;
 }
 
 export interface VeloDeckDesktopBridge {
@@ -93,6 +102,9 @@ export interface VeloDeckDesktopBridge {
   disconnectHostSession?(): Promise<DesktopHostState>;
   refreshHostPermissions?(): Promise<DesktopHostPermissions>;
   openPermissionSettings?(kind: "accessibility" | "screen"): Promise<void>;
+  setHostPrivacyScreen?(enabled: boolean): Promise<DesktopHostState>;
+  writeClipboardText?(text: string): Promise<boolean>;
+  readClipboardText?(): Promise<string>;
 }
 
 declare global {

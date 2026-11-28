@@ -7,9 +7,11 @@ import {
   clipboard,
   desktopCapturer,
   ipcMain,
+  powerSaveBlocker,
   screen,
   shell,
   systemPreferences,
+  type DesktopCapturerSource,
   type Display,
   type IpcMainEvent,
   type IpcMainInvokeEvent,
@@ -19,6 +21,20 @@ import {
   type DisplayBounds,
   type InputPlatform,
 } from "./inputInjector";
+import {
+  executePowerAction,
+  isPowerOperation,
+  PrivacyCurtainManager,
+} from "./powerAndPrivacy";
+import {
+  createDirectory,
+  getDefaultRoots,
+  listDirectory,
+  openDownloadStream,
+  resolveValidUploadTargetDir,
+  trashPath,
+  type RemoteDownloadStream,
+} from "./remoteFileManager";
 import {
   ensureHostSettings,
   generateHostControlPassword,
@@ -31,6 +47,8 @@ import {
 } from "./settings";
 import type {
   HostCaptureSourceResult,
+  HostFsDownloadChunkResult,
+  HostFsDownloadOpenResult,
   HostWorkerCommand,
   HostWorkerConfig,
   HostWorkerStateReport,
@@ -48,6 +66,7 @@ export interface DesktopDisplayInfo {
   width: number;
   height: number;
   primary: boolean;
+  scaleFactor?: number;
 }
 
 export interface DesktopHostPermissions {
@@ -71,12 +90,21 @@ export interface DesktopHostState {
   permissions: DesktopHostPermissions;
   lastError: string | null;
   lastReceivedFile: { fileName: string; savedPath: string; at: number } | null;
+  autoLaunch: boolean;
+  preventSleep: boolean;
+  audioCaptureEnabled: boolean;
+  clipboardAutoSync: boolean;
+  privacyScreenActive: boolean;
 }
 
 export interface DesktopHostConfigPatch {
   deviceName?: string;
   controlPassword?: string;
   activeDisplayId?: string;
+  autoLaunch?: boolean;
+  preventSleep?: boolean;
+  audioCaptureEnabled?: boolean;
+  clipboardAutoSync?: boolean;
 }
 
 export interface HostManagerDeps {
@@ -91,6 +119,7 @@ interface ActiveIncomingFile {
   sessionId: string;
   transferId: string;
   sanitizedName: string;
+  targetDir: string;
   expectedSize: number;
   expectedSha256: string | null;
   tempPath: string;
@@ -101,10 +130,24 @@ interface ActiveIncomingFile {
   lastProgressAt: number;
 }
 
+interface PendingDisplayMediaCapture {
+  source: DesktopCapturerSource;
+  wantAudio: boolean;
+  expiresAt: number;
+}
+
+interface ActiveRemoteDownload {
+  sessionId: string;
+  stream: RemoteDownloadStream;
+}
+
 const MAX_INCOMING_FILE_BYTES = 256 * 1024 * 1024;
 const PROGRESS_INTERVAL_BYTES = 262_144;
 const PROGRESS_INTERVAL_MS = 250;
 const MAX_FILE_NAME_LENGTH = 120;
+const CLIPBOARD_POLL_INTERVAL_MS = 600;
+const CLIPBOARD_MAX_CHARS = 64 * 1024;
+const CLIPBOARD_ECHO_GUARD_MS = 4000;
 
 export function formatHostControlCode(raw: string): string {
   const digits = raw.replace(/[\s-]+/g, "").trim();
@@ -234,6 +277,7 @@ export class HostManager {
   private readonly deps: HostManagerDeps;
   private readonly platform: DesktopPlatform;
   private readonly injector: NativeInputInjector;
+  private readonly privacyCurtain: PrivacyCurtainManager;
 
   private workerWindow: BrowserWindow | null = null;
   private workerReady = false;
@@ -241,8 +285,18 @@ export class HostManager {
   private disposed = false;
   private pendingUnbindOwner = false;
   private ipcRegistered = false;
+  private displayMediaHandlerRegistered = false;
   private screenListenersAttached = false;
   private activeFileTransfer: ActiveIncomingFile | null = null;
+  private activeDownloads = new Map<string, ActiveRemoteDownload>();
+  private pendingDisplayMediaCapture: PendingDisplayMediaCapture | null = null;
+
+  // Power save blocker & two-way clipboard sync state
+  private powerBlockerId: number | null = null;
+  private clipboardTimer: NodeJS.Timeout | null = null;
+  private lastObservedClipboardText = "";
+  private lastInjectedClipboardText: string | null = null;
+  private lastInjectedClipboardAt = 0;
 
   private state: DesktopHostState;
 
@@ -264,6 +318,19 @@ export class HostManager {
           : undefined,
     });
 
+    this.privacyCurtain = new PrivacyCurtainManager({
+      platform: this.platform,
+      onVisibilityChanged: (active) => {
+        if (this.disposed) return;
+        if (this.state.privacyScreenActive !== active) {
+          this.patchState({ privacyScreenActive: active });
+        }
+        if (this.workerWindow && !this.workerWindow.isDestroyed() && this.workerReady) {
+          this.sendWorkerCommand({ type: "privacy-state-changed", active });
+        }
+      },
+    });
+
     const ensured = ensureHostSettings(deps.getSettings());
     if (ensured.changed) {
       deps.updateSettings((draft) => {
@@ -271,6 +338,10 @@ export class HostManager {
         draft.hostDeviceSecret = ensured.settings.hostDeviceSecret;
         draft.hostDeviceName = ensured.settings.hostDeviceName;
         draft.hostControlPassword = ensured.settings.hostControlPassword;
+        draft.hostAutoLaunch = ensured.settings.hostAutoLaunch;
+        draft.hostPreventSleep = ensured.settings.hostPreventSleep;
+        draft.hostAudioEnabled = ensured.settings.hostAudioEnabled;
+        draft.hostClipboardAutoSync = ensured.settings.hostClipboardAutoSync;
       });
     }
     const currentSettings = deps.getSettings();
@@ -299,12 +370,21 @@ export class HostManager {
       },
       lastError: null,
       lastReceivedFile: null,
+      autoLaunch: Boolean(currentSettings.hostAutoLaunch ?? false),
+      preventSleep: currentSettings.hostPreventSleep !== false,
+      audioCaptureEnabled: currentSettings.hostAudioEnabled !== false,
+      clipboardAutoSync: currentSettings.hostClipboardAutoSync !== false,
+      privacyScreenActive: false,
     };
   }
 
   public init(): void {
     this.registerWorkerIpcHandlers();
     this.attachScreenListeners();
+    if (this.state.autoLaunch) {
+      this.applyAutoLaunchSetting(true);
+    }
+    this.syncPowerSaveBlocker();
     void this.refreshHostPermissions().then(() => {
       if (!this.disposed && this.deps.getSettings().hostEnabled) {
         void this.startHost();
@@ -316,6 +396,14 @@ export class HostManager {
     return Boolean(win && this.workerWindow && win === this.workerWindow);
   }
 
+  public isPrivacyCurtainWindow(win: BrowserWindow | null | undefined): boolean {
+    return this.privacyCurtain.isCurtainWindow(win);
+  }
+
+  public isInternalWindow(win: BrowserWindow | null | undefined): boolean {
+    return this.isWorkerWindow(win) || this.isPrivacyCurtainWindow(win);
+  }
+
   public getHostState(): DesktopHostState {
     return {
       ...this.state,
@@ -325,6 +413,18 @@ export class HostManager {
         ? { ...this.state.lastReceivedFile }
         : null,
     };
+  }
+
+  public async setHostPrivacyScreen(enabled: boolean): Promise<DesktopHostState> {
+    if (this.disposed) {
+      return this.getHostState();
+    }
+    if (enabled) {
+      this.privacyCurtain.show();
+    } else {
+      this.privacyCurtain.hide();
+    }
+    return this.getHostState();
   }
 
   public async startHost(authToken?: string | null): Promise<DesktopHostState> {
@@ -341,6 +441,10 @@ export class HostManager {
       draft.hostDeviceSecret = ensured.settings.hostDeviceSecret;
       draft.hostDeviceName = ensured.settings.hostDeviceName;
       draft.hostControlPassword = ensured.settings.hostControlPassword;
+      draft.hostAutoLaunch = ensured.settings.hostAutoLaunch;
+      draft.hostPreventSleep = ensured.settings.hostPreventSleep;
+      draft.hostAudioEnabled = ensured.settings.hostAudioEnabled;
+      draft.hostClipboardAutoSync = ensured.settings.hostClipboardAutoSync;
       if (cleanToken) {
         draft.hostAuthToken = cleanToken;
       }
@@ -363,6 +467,7 @@ export class HostManager {
         controlPassword: cfg.controlPassword,
         lastError: "请先配置 VeloDeck 服务器地址后再开启本机被控",
       });
+      this.syncPowerSaveBlocker();
       return this.getHostState();
     }
 
@@ -374,6 +479,7 @@ export class HostManager {
       controlPassword: cfg.controlPassword,
       lastError: null,
     });
+    this.syncPowerSaveBlocker();
 
     await this.ensureWorkerReady();
     this.sendWorkerCommand({ type: "start", config: cfg });
@@ -384,7 +490,10 @@ export class HostManager {
     this.deps.updateSettings((draft) => {
       draft.hostEnabled = false;
     });
+    this.privacyCurtain.hide();
+    this.stopClipboardWatcher();
     this.cleanupActiveFileTransfer();
+    this.cleanupAllDownloads();
     this.injector.releaseAll();
     if (this.workerWindow && !this.workerWindow.isDestroyed() && this.workerReady) {
       this.sendWorkerCommand({ type: "stop" });
@@ -395,7 +504,9 @@ export class HostManager {
       activeSessionId: null,
       activeTransport: null,
       lastError: null,
+      privacyScreenActive: false,
     });
+    this.syncPowerSaveBlocker();
     return this.getHostState();
   }
 
@@ -404,11 +515,16 @@ export class HostManager {
   ): Promise<DesktopHostState> {
     let needsReconnect = false;
     let switchDisplayId: string | undefined;
+    let shouldNotifyWorker = false;
 
     const current = this.deps.getSettings();
     let nextName = current.hostDeviceName;
     let nextPassword = current.hostControlPassword;
     let nextDisplayId = this.state.activeDisplayId;
+    let nextAutoLaunch = this.state.autoLaunch;
+    let nextPreventSleep = this.state.preventSleep;
+    let nextAudioEnabled = this.state.audioCaptureEnabled;
+    let nextClipboardAutoSync = this.state.clipboardAutoSync;
 
     if (patch.deviceName !== undefined) {
       const sanitized = sanitizeHostDeviceName(patch.deviceName);
@@ -439,25 +555,57 @@ export class HostManager {
         if (sanitized !== this.state.activeDisplayId) {
           nextDisplayId = sanitized;
           switchDisplayId = sanitized;
+          shouldNotifyWorker = true;
         }
       } else {
         throw new Error("指定的显示器不存在或已断开");
       }
     }
 
+    if (typeof patch.autoLaunch === "boolean") {
+      nextAutoLaunch = patch.autoLaunch;
+      this.applyAutoLaunchSetting(nextAutoLaunch);
+    }
+
+    if (typeof patch.preventSleep === "boolean") {
+      nextPreventSleep = patch.preventSleep;
+    }
+
+    if (typeof patch.audioCaptureEnabled === "boolean") {
+      if (patch.audioCaptureEnabled !== nextAudioEnabled) {
+        shouldNotifyWorker = true;
+      }
+      nextAudioEnabled = patch.audioCaptureEnabled;
+    }
+
+    if (typeof patch.clipboardAutoSync === "boolean") {
+      nextClipboardAutoSync = patch.clipboardAutoSync;
+    }
+
     this.deps.updateSettings((draft) => {
       if (nextName) draft.hostDeviceName = nextName;
       if (nextPassword) draft.hostControlPassword = nextPassword;
       if (nextDisplayId) draft.hostDisplayId = nextDisplayId;
+      draft.hostAutoLaunch = nextAutoLaunch;
+      draft.hostPreventSleep = nextPreventSleep;
+      draft.hostAudioEnabled = nextAudioEnabled;
+      draft.hostClipboardAutoSync = nextClipboardAutoSync;
     });
 
     this.patchState({
       deviceName: nextName ?? this.state.deviceName,
       controlPassword: nextPassword ?? this.state.controlPassword,
       activeDisplayId: nextDisplayId,
+      autoLaunch: nextAutoLaunch,
+      preventSleep: nextPreventSleep,
+      audioCaptureEnabled: nextAudioEnabled,
+      clipboardAutoSync: nextClipboardAutoSync,
     });
 
-    if (this.state.enabled) {
+    this.syncPowerSaveBlocker();
+    this.syncClipboardWatcher();
+
+    if (this.state.enabled && (needsReconnect || shouldNotifyWorker)) {
       await this.pushConfigToWorker(needsReconnect, switchDisplayId);
     }
 
@@ -510,7 +658,10 @@ export class HostManager {
   }
 
   public async disconnectHostSession(): Promise<DesktopHostState> {
+    this.privacyCurtain.hide();
+    this.stopClipboardWatcher();
     this.cleanupActiveFileTransfer();
+    this.cleanupAllDownloads();
     this.injector.releaseAll();
     if (this.workerWindow && !this.workerWindow.isDestroyed() && this.workerReady) {
       this.sendWorkerCommand({
@@ -522,6 +673,7 @@ export class HostManager {
       status: this.state.enabled ? "online" : "stopped",
       activeSessionId: null,
       activeTransport: null,
+      privacyScreenActive: false,
     });
     return this.getHostState();
   }
@@ -559,6 +711,8 @@ export class HostManager {
     }
     const cfg = this.buildWorkerConfig();
     if (!cfg.wsUrl) {
+      this.privacyCurtain.hide();
+      this.stopClipboardWatcher();
       if (this.workerWindow && !this.workerWindow.isDestroyed() && this.workerReady) {
         this.sendWorkerCommand({ type: "stop" });
       }
@@ -566,6 +720,7 @@ export class HostManager {
         status: "error",
         activeSessionId: null,
         activeTransport: null,
+        privacyScreenActive: false,
         lastError: "未配置有效的 VeloDeck 服务器地址",
       });
       return;
@@ -576,7 +731,11 @@ export class HostManager {
 
   public dispose(): void {
     this.disposed = true;
+    this.privacyCurtain.dispose();
+    this.stopClipboardWatcher();
+    this.stopPowerSaveBlocker();
     this.cleanupActiveFileTransfer();
+    this.cleanupAllDownloads();
     this.detachScreenListeners();
     this.injector.dispose();
     if (this.workerWindow && !this.workerWindow.isDestroyed()) {
@@ -588,6 +747,120 @@ export class HostManager {
     }
     this.workerWindow = null;
     this.workerReady = false;
+  }
+
+  private applyAutoLaunchSetting(enabled: boolean): void {
+    if (!app.isPackaged) {
+      return;
+    }
+    if (this.platform !== "darwin" && this.platform !== "win32") {
+      return;
+    }
+    try {
+      app.setLoginItemSettings({
+        openAtLogin: enabled,
+        openAsHidden: true,
+      });
+    } catch (error) {
+      console.warn("[velodeck-host] Failed to update login item settings:", error);
+    }
+  }
+
+  private syncPowerSaveBlocker(): void {
+    const shouldBlock =
+      !this.disposed && this.state.enabled && this.state.preventSleep;
+    if (shouldBlock) {
+      if (
+        this.powerBlockerId === null ||
+        !powerSaveBlocker.isStarted(this.powerBlockerId)
+      ) {
+        try {
+          this.powerBlockerId = powerSaveBlocker.start("prevent-display-sleep");
+        } catch (error) {
+          console.warn("[velodeck-host] Failed to start powerSaveBlocker:", error);
+        }
+      }
+    } else {
+      this.stopPowerSaveBlocker();
+    }
+  }
+
+  private stopPowerSaveBlocker(): void {
+    if (this.powerBlockerId !== null) {
+      try {
+        if (powerSaveBlocker.isStarted(this.powerBlockerId)) {
+          powerSaveBlocker.stop(this.powerBlockerId);
+        }
+      } catch {
+        // Ignore
+      }
+      this.powerBlockerId = null;
+    }
+  }
+
+  private syncClipboardWatcher(): void {
+    const shouldWatch =
+      !this.disposed &&
+      Boolean(this.state.activeSessionId) &&
+      this.state.clipboardAutoSync;
+    if (shouldWatch) {
+      if (this.clipboardTimer === null) {
+        try {
+          this.lastObservedClipboardText = clipboard
+            .readText()
+            .slice(0, CLIPBOARD_MAX_CHARS);
+        } catch {
+          this.lastObservedClipboardText = "";
+        }
+        this.clipboardTimer = setInterval(() => {
+          this.pollHostClipboard();
+        }, CLIPBOARD_POLL_INTERVAL_MS);
+        this.clipboardTimer.unref?.();
+      }
+    } else {
+      this.stopClipboardWatcher();
+    }
+  }
+
+  private stopClipboardWatcher(): void {
+    if (this.clipboardTimer !== null) {
+      clearInterval(this.clipboardTimer);
+      this.clipboardTimer = null;
+    }
+  }
+
+  private pollHostClipboard(): void {
+    if (
+      this.disposed ||
+      !this.state.activeSessionId ||
+      !this.state.clipboardAutoSync
+    ) {
+      this.stopClipboardWatcher();
+      return;
+    }
+    let current = "";
+    try {
+      current = clipboard.readText().slice(0, CLIPBOARD_MAX_CHARS);
+    } catch {
+      return;
+    }
+    if (!current || current === this.lastObservedClipboardText) {
+      return;
+    }
+    this.lastObservedClipboardText = current;
+
+    // Loop-prevention guard: never echo text that was just written by the remote controller
+    if (
+      this.lastInjectedClipboardText !== null &&
+      current === this.lastInjectedClipboardText &&
+      Date.now() - this.lastInjectedClipboardAt < CLIPBOARD_ECHO_GUARD_MS
+    ) {
+      return;
+    }
+
+    if (this.workerWindow && !this.workerWindow.isDestroyed() && this.workerReady) {
+      this.sendWorkerCommand({ type: "clipboard-push", text: current });
+    }
   }
 
   private async refreshHostPermissionsInternal(
@@ -651,12 +924,17 @@ export class HostManager {
             : isPrimary
               ? "主显示器"
               : `显示器 ${idx + 1}`;
+        const scaleFactor =
+          typeof d.scaleFactor === "number" && Number.isFinite(d.scaleFactor) && d.scaleFactor > 0
+            ? d.scaleFactor
+            : 1;
         return {
           id: String(d.id),
           name: label,
           width: Math.max(1, Math.round(d.bounds.width)),
           height: Math.max(1, Math.round(d.bounds.height)),
           primary: isPrimary,
+          scaleFactor,
         };
       });
     } catch {
@@ -667,6 +945,7 @@ export class HostManager {
           width: 1920,
           height: 1080,
           primary: true,
+          scaleFactor: 1,
         },
       ];
     }
@@ -735,7 +1014,8 @@ export class HostManager {
   private buildWorkerConfig(): HostWorkerConfig {
     const s = this.deps.getSettings();
     const wsUrl = deriveRelayWsUrl(this.deps.getEffectiveServerUrl());
-    const displays = this.state.displays.length > 0 ? this.state.displays : this.collectDisplays();
+    const displays =
+      this.state.displays.length > 0 ? this.state.displays : this.collectDisplays();
     const activeDisplayId = this.resolveActiveDisplayId(
       s.hostDisplayId ?? this.state.activeDisplayId,
       displays,
@@ -755,6 +1035,8 @@ export class HostManager {
       displays,
       activeDisplayId,
       permissions: { ...this.state.permissions },
+      audioCaptureEnabled: this.state.audioCaptureEnabled,
+      privacyScreenActive: this.state.privacyScreenActive,
     };
   }
 
@@ -773,6 +1055,73 @@ export class HostManager {
       reconnect,
       switchDisplayId,
     });
+  }
+
+  private registerDisplayMediaHandler(win: BrowserWindow): void {
+    if (this.displayMediaHandlerRegistered) return;
+    this.displayMediaHandlerRegistered = true;
+
+    win.webContents.session.setDisplayMediaRequestHandler(
+      async (request, callback) => {
+        const frameUrl = request.frame?.url ?? request.securityOrigin ?? "";
+        if (!frameUrl.startsWith(`${HOST_WORKER_ORIGIN}/`)) {
+          callback({});
+          return;
+        }
+
+        const pending = this.pendingDisplayMediaCapture;
+        const now = Date.now();
+        let source: DesktopCapturerSource | undefined;
+        let wantAudio = Boolean(
+          request.audioRequested && this.state.audioCaptureEnabled,
+        );
+
+        if (pending && pending.expiresAt >= now) {
+          source = pending.source;
+          wantAudio = Boolean(
+            request.audioRequested &&
+              pending.wantAudio &&
+              this.state.audioCaptureEnabled,
+          );
+          this.pendingDisplayMediaCapture = null;
+        } else {
+          try {
+            const sources = await desktopCapturer.getSources({
+              types: ["screen"],
+              thumbnailSize: { width: 0, height: 0 },
+            });
+            source =
+              sources.find((s) => s.display_id === this.state.activeDisplayId) ??
+              sources.find(
+                (s) => s.display_id === String(screen.getPrimaryDisplay().id),
+              ) ??
+              sources[0];
+          } catch {
+            source = undefined;
+          }
+        }
+
+        if (!source) {
+          callback({});
+          return;
+        }
+
+        try {
+          if (wantAudio) {
+            callback({ video: source, audio: "loopback" });
+          } else {
+            callback({ video: source });
+          }
+        } catch {
+          // Fallback to video-only if loopback audio is unsupported on this OS build
+          try {
+            callback({ video: source });
+          } catch {
+            callback({});
+          }
+        }
+      },
+    );
   }
 
   private async ensureWorkerReady(): Promise<void> {
@@ -802,6 +1151,7 @@ export class HostManager {
         },
       });
       this.workerWindow = win;
+      this.registerDisplayMediaHandler(win);
 
       win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
       win.webContents.on("will-navigate", (event, targetUrl) => {
@@ -878,6 +1228,9 @@ export class HostManager {
         if (!rawReport || typeof rawReport !== "object") return;
 
         const patch: Partial<DesktopHostState> = {};
+        let sessionEnded = false;
+        let sessionChanged = false;
+
         if (rawReport.status) patch.status = rawReport.status;
         if (typeof rawReport.controlCode === "string") {
           patch.controlCode = rawReport.controlCode;
@@ -889,9 +1242,14 @@ export class HostManager {
           }
         }
         if (rawReport.activeSessionId !== undefined) {
+          if (this.state.activeSessionId !== rawReport.activeSessionId) {
+            sessionChanged = true;
+          }
           if (this.state.activeSessionId && !rawReport.activeSessionId) {
+            sessionEnded = true;
             this.injector.releaseAll();
             this.cleanupActiveFileTransfer();
+            this.cleanupAllDownloads();
           }
           patch.activeSessionId = rawReport.activeSessionId;
         }
@@ -907,22 +1265,46 @@ export class HostManager {
         if (rawReport.lastError !== undefined) {
           patch.lastError = rawReport.lastError;
         }
+        if (typeof rawReport.privacyScreenActive === "boolean") {
+          patch.privacyScreenActive = rawReport.privacyScreenActive;
+        }
+
+        if (sessionEnded && this.privacyCurtain.isActive()) {
+          this.privacyCurtain.hide();
+          patch.privacyScreenActive = false;
+        }
 
         this.patchState(patch);
+
+        if (sessionChanged) {
+          this.syncClipboardWatcher();
+        }
       },
     );
 
     ipcMain.handle(
       "velodeck-host:get-capture-source",
-      async (event, requestedDisplayId: unknown): Promise<HostCaptureSourceResult> => {
+      async (event, rawArg: unknown): Promise<HostCaptureSourceResult> => {
         if (!this.isTrustedWorkerEvent(event)) {
           return { ok: false, error: "Untrusted worker IPC sender" };
         }
+        let requestedDisplayId = "";
+        let wantAudio = this.state.audioCaptureEnabled;
+        if (typeof rawArg === "string") {
+          requestedDisplayId = rawArg;
+        } else if (rawArg && typeof rawArg === "object") {
+          const obj = rawArg as { displayId?: unknown; wantAudio?: unknown };
+          if (typeof obj.displayId === "string") {
+            requestedDisplayId = obj.displayId;
+          }
+          if (typeof obj.wantAudio === "boolean") {
+            wantAudio = obj.wantAudio && this.state.audioCaptureEnabled;
+          }
+        }
+
         const displays = this.collectDisplays();
         const targetId = this.resolveActiveDisplayId(
-          typeof requestedDisplayId === "string" && requestedDisplayId
-            ? requestedDisplayId
-            : this.state.activeDisplayId,
+          requestedDisplayId || this.state.activeDisplayId,
           displays,
         );
         const targetDisplay =
@@ -944,6 +1326,12 @@ export class HostManager {
             sources.find((s) => s.display_id && s.display_id === targetDisplay.id) ??
             sources.find((s) => s.display_id === String(screen.getPrimaryDisplay().id)) ??
             sources[0]!;
+
+          this.pendingDisplayMediaCapture = {
+            source: matched,
+            wantAudio,
+            expiresAt: Date.now() + 15_000,
+          };
 
           if (targetDisplay.id !== this.state.activeDisplayId) {
             this.deps.updateSettings((draft) => {
@@ -993,7 +1381,6 @@ export class HostManager {
           return { ok: false, message: "Missing command object" };
         }
         if (this.platform === "darwin" && !this.state.permissions.accessibility) {
-          // Re-check synchronously once in case user just toggled Accessibility on
           try {
             if (systemPreferences.isTrustedAccessibilityClient(false)) {
               this.patchState({
@@ -1031,8 +1418,49 @@ export class HostManager {
         if (typeof text !== "string") {
           return false;
         }
-        clipboard.writeText(text.slice(0, 64 * 1024));
+        const clean = text.slice(0, CLIPBOARD_MAX_CHARS);
+        this.lastInjectedClipboardText = clean;
+        this.lastInjectedClipboardAt = Date.now();
+        this.lastObservedClipboardText = clean;
+        clipboard.writeText(clean);
         return true;
+      },
+    );
+
+    ipcMain.handle(
+      "velodeck-host:privacy-screen",
+      (
+        event,
+        enabled: unknown,
+      ): { ok: boolean; active: boolean; message?: string } => {
+        if (!this.isTrustedWorkerEvent(event)) {
+          return { ok: false, active: false, message: "Untrusted worker IPC sender" };
+        }
+        const target = Boolean(enabled);
+        if (target) {
+          const shown = this.privacyCurtain.show();
+          return { ok: shown, active: this.privacyCurtain.isActive() };
+        }
+        this.privacyCurtain.hide();
+        return { ok: true, active: this.privacyCurtain.isActive() };
+      },
+    );
+
+    ipcMain.handle(
+      "velodeck-host:power",
+      async (
+        event,
+        operation: unknown,
+      ): Promise<{ ok: boolean; message?: string }> => {
+        if (!this.isTrustedWorkerEvent(event)) {
+          return { ok: false, message: "Untrusted worker IPC sender" };
+        }
+        if (!isPowerOperation(operation)) {
+          return { ok: false, message: "不支持的电源操作指令" };
+        }
+        return executePowerAction(operation, this.platform, () =>
+          this.injector.sendPayload({ action: "lock" }),
+        );
       },
     );
 
@@ -1074,13 +1502,225 @@ export class HostManager {
 
     ipcMain.on("velodeck-host:file-abort", (event, sessionId: unknown) => {
       if (!this.isTrustedWorkerEvent(event)) return;
-      if (
-        typeof sessionId === "string" &&
-        this.activeFileTransfer?.sessionId === sessionId
-      ) {
-        this.cleanupActiveFileTransfer();
+      if (typeof sessionId === "string") {
+        if (this.activeFileTransfer?.sessionId === sessionId) {
+          this.cleanupActiveFileTransfer();
+        }
+        this.cleanupSessionDownloads(sessionId);
       }
     });
+
+    ipcMain.handle(
+      "velodeck-host:fs-request",
+      async (
+        event,
+        rawRequest: unknown,
+      ): Promise<Record<string, unknown>> => {
+        if (!this.isTrustedWorkerEvent(event)) {
+          return { type: "fs_error", reqId: "", error: "Untrusted worker IPC sender" };
+        }
+        if (!rawRequest || typeof rawRequest !== "object") {
+          return { type: "fs_error", reqId: "", error: "无效的文件管理请求" };
+        }
+        return this.handleRemoteFsRequest(rawRequest as Record<string, unknown>);
+      },
+    );
+
+    ipcMain.handle(
+      "velodeck-host:fs-download-open",
+      (event, rawPayload: unknown): HostFsDownloadOpenResult => {
+        if (!this.isTrustedWorkerEvent(event)) {
+          return { ok: false, error: "Untrusted worker IPC sender" };
+        }
+        if (!rawPayload || typeof rawPayload !== "object") {
+          return { ok: false, error: "无效的下载请求参数" };
+        }
+        const { sessionId, reqId, filePath } = rawPayload as {
+          sessionId?: unknown;
+          reqId?: unknown;
+          filePath?: unknown;
+        };
+        if (
+          typeof sessionId !== "string" ||
+          typeof reqId !== "string" ||
+          !reqId ||
+          typeof filePath !== "string"
+        ) {
+          return { ok: false, error: "缺少下载请求 ID 或文件路径" };
+        }
+
+        this.closeDownload(reqId);
+        try {
+          const stream = openDownloadStream(filePath);
+          this.activeDownloads.set(reqId, { sessionId, stream });
+          return {
+            ok: true,
+            fileName: stream.meta.fileName,
+            size: stream.meta.size,
+            mimeType: stream.meta.mimeType,
+          };
+        } catch (error) {
+          return {
+            ok: false,
+            error: error instanceof Error ? error.message : "打开下载文件失败",
+          };
+        }
+      },
+    );
+
+    ipcMain.handle(
+      "velodeck-host:fs-download-read",
+      (event, reqId: unknown): HostFsDownloadChunkResult => {
+        if (!this.isTrustedWorkerEvent(event)) {
+          return { ok: false, error: "Untrusted worker IPC sender" };
+        }
+        if (typeof reqId !== "string" || !reqId) {
+          return { ok: false, error: "缺少下载请求 ID" };
+        }
+        const active = this.activeDownloads.get(reqId);
+        if (!active) {
+          return { ok: false, error: "下载任务已取消或不存在" };
+        }
+        try {
+          const res = active.stream.readNextChunk();
+          if (res.done) {
+            this.activeDownloads.delete(reqId);
+            return {
+              ok: true,
+              done: true,
+              sha256: res.sha256 ?? "",
+              size: res.size ?? active.stream.totalBytesRead,
+            };
+          }
+          return {
+            ok: true,
+            done: false,
+            chunk: res.chunk,
+          };
+        } catch (error) {
+          this.closeDownload(reqId);
+          return {
+            ok: false,
+            error: error instanceof Error ? error.message : "读取文件块失败",
+          };
+        }
+      },
+    );
+
+    ipcMain.on("velodeck-host:fs-download-cancel", (event, reqId: unknown) => {
+      if (!this.isTrustedWorkerEvent(event)) return;
+      if (typeof reqId === "string" && reqId) {
+        this.closeDownload(reqId);
+      }
+    });
+  }
+
+  private async handleRemoteFsRequest(
+    req: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const type = typeof req.type === "string" ? req.type : "";
+    const reqId = typeof req.reqId === "string" ? req.reqId : "";
+
+    switch (type) {
+      case "fs_roots_req": {
+        try {
+          const roots = getDefaultRoots(this.platform);
+          return { type: "fs_roots_res", reqId, roots };
+        } catch (error) {
+          return {
+            type: "fs_error",
+            reqId,
+            error: error instanceof Error ? error.message : "获取磁盘目录失败",
+          };
+        }
+      }
+
+      case "fs_list_req": {
+        const targetPath = typeof req.path === "string" ? req.path : "";
+        try {
+          const result = listDirectory(targetPath);
+          return {
+            type: "fs_list_res",
+            reqId,
+            path: result.path,
+            parentPath: result.parentPath,
+            entries: result.entries,
+          };
+        } catch (error) {
+          return {
+            type: "fs_error",
+            reqId,
+            error: error instanceof Error ? error.message : "读取目录失败",
+          };
+        }
+      }
+
+      case "fs_mkdir_req": {
+        const parentPath = typeof req.parentPath === "string" ? req.parentPath : "";
+        const name = typeof req.name === "string" ? req.name : "";
+        const res = createDirectory(parentPath, name);
+        return {
+          type: "fs_mkdir_res",
+          reqId,
+          ok: res.ok,
+          ...(res.createdPath ? { createdPath: res.createdPath } : {}),
+          ...(res.error ? { error: res.error } : {}),
+        };
+      }
+
+      case "fs_delete_req": {
+        const targetPath = typeof req.targetPath === "string" ? req.targetPath : "";
+        const res = await trashPath(targetPath, (p) => shell.trashItem(p));
+        return {
+          type: "fs_delete_res",
+          reqId,
+          ok: res.ok,
+          ...(res.error ? { error: res.error } : {}),
+        };
+      }
+
+      default:
+        return {
+          type: "fs_error",
+          reqId,
+          error: `不支持的文件管理请求类型: ${type}`,
+        };
+    }
+  }
+
+  private closeDownload(reqId: string): void {
+    const active = this.activeDownloads.get(reqId);
+    if (!active) return;
+    this.activeDownloads.delete(reqId);
+    try {
+      active.stream.close();
+    } catch {
+      // Ignore
+    }
+  }
+
+  private cleanupSessionDownloads(sessionId: string): void {
+    for (const [reqId, item] of this.activeDownloads.entries()) {
+      if (item.sessionId === sessionId) {
+        this.activeDownloads.delete(reqId);
+        try {
+          item.stream.close();
+        } catch {
+          // Ignore
+        }
+      }
+    }
+  }
+
+  private cleanupAllDownloads(): void {
+    for (const item of this.activeDownloads.values()) {
+      try {
+        item.stream.close();
+      } catch {
+        // Ignore
+      }
+    }
+    this.activeDownloads.clear();
   }
 
   private handleFileTransferText(sessionId: string, rawText: string): string | null {
@@ -1106,10 +1746,13 @@ export class HostManager {
     const type = typeof parsed.type === "string" ? parsed.type : "";
     switch (type) {
       case "file.offer":
+      case "file_offer":
         return this.handleFileOffer(sessionId, parsed);
       case "file.complete":
+      case "file_complete":
         return this.handleFileComplete(sessionId, parsed);
-      case "file.cancel": {
+      case "file.cancel":
+      case "file_cancel": {
         const tid = typeof parsed.transferId === "string" ? parsed.transferId.trim() : "";
         if (
           this.activeFileTransfer &&
@@ -1173,12 +1816,15 @@ export class HostManager {
     }
 
     const sanitizedName = sanitizeIncomingFileName(rawFileName);
-    const downloadsDir = path.join(app.getPath("downloads"), "VeloDeck");
-    const safeId = transferId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48) || "transfer";
-    const tempPath = path.join(downloadsDir, `.velodeck-incoming-${safeId}.tmp`);
+    const customTargetDir = resolveValidUploadTargetDir(msg.targetDir);
+    const targetDir =
+      customTargetDir ?? path.join(app.getPath("downloads"), "VeloDeck");
+    const safeId =
+      transferId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 48) || "transfer";
+    const tempPath = path.join(targetDir, `.velodeck-incoming-${safeId}.tmp`);
 
     try {
-      fs.mkdirSync(downloadsDir, { recursive: true });
+      fs.mkdirSync(targetDir, { recursive: true });
       if (fs.existsSync(tempPath)) {
         fs.unlinkSync(tempPath);
       }
@@ -1187,6 +1833,7 @@ export class HostManager {
         sessionId,
         transferId,
         sanitizedName,
+        targetDir,
         expectedSize: size,
         expectedSha256,
         tempPath,
@@ -1321,7 +1968,11 @@ export class HostManager {
       }
     }
 
-    if (transfer.expectedSha256 && completeSha && transfer.expectedSha256 !== completeSha) {
+    if (
+      transfer.expectedSha256 &&
+      completeSha &&
+      transfer.expectedSha256 !== completeSha
+    ) {
       removeTemp();
       return JSON.stringify({
         type: "file.error",
@@ -1342,9 +1993,9 @@ export class HostManager {
     }
 
     try {
-      const downloadsDir = path.join(app.getPath("downloads"), "VeloDeck");
-      fs.mkdirSync(downloadsDir, { recursive: true });
-      const finalPath = resolveUniqueFilePath(downloadsDir, transfer.sanitizedName);
+      const saveDir = transfer.targetDir;
+      fs.mkdirSync(saveDir, { recursive: true });
+      const finalPath = resolveUniqueFilePath(saveDir, transfer.sanitizedName);
       fs.renameSync(transfer.tempPath, finalPath);
       const finalName = path.basename(finalPath);
 

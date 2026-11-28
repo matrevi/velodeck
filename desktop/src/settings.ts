@@ -32,6 +32,10 @@ export interface DesktopSettings {
   hostControlPassword?: string;
   hostDisplayId?: string;
   hostAuthToken?: string;
+  hostAutoLaunch?: boolean;
+  hostPreventSleep?: boolean;
+  hostAudioEnabled?: boolean;
+  hostClipboardAutoSync?: boolean;
 }
 
 export const PRESET_SIZES: Readonly<
@@ -231,6 +235,22 @@ export function ensureHostSettings(
   }
   if (!sanitizeHostControlPassword(next.hostControlPassword)) {
     next.hostControlPassword = generateHostControlPassword(8);
+    changed = true;
+  }
+  if (typeof next.hostAutoLaunch !== "boolean") {
+    next.hostAutoLaunch = false;
+    changed = true;
+  }
+  if (typeof next.hostPreventSleep !== "boolean") {
+    next.hostPreventSleep = true;
+    changed = true;
+  }
+  if (typeof next.hostAudioEnabled !== "boolean") {
+    next.hostAudioEnabled = true;
+    changed = true;
+  }
+  if (typeof next.hostClipboardAutoSync !== "boolean") {
+    next.hostClipboardAutoSync = true;
     changed = true;
   }
 
@@ -671,6 +691,18 @@ function sanitizeSettings(raw: unknown): DesktopSettings {
   const hostAuthToken = sanitizeHostAuthToken(obj.hostAuthToken);
   if (hostAuthToken) {
     sanitized.hostAuthToken = hostAuthToken;
+  }
+  if (typeof obj.hostAutoLaunch === "boolean") {
+    sanitized.hostAutoLaunch = obj.hostAutoLaunch;
+  }
+  if (typeof obj.hostPreventSleep === "boolean") {
+    sanitized.hostPreventSleep = obj.hostPreventSleep;
+  }
+  if (typeof obj.hostAudioEnabled === "boolean") {
+    sanitized.hostAudioEnabled = obj.hostAudioEnabled;
+  }
+  if (typeof obj.hostClipboardAutoSync === "boolean") {
+    sanitized.hostClipboardAutoSync = obj.hostClipboardAutoSync;
   }
   return sanitized;
 }

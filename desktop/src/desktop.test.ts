@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,12 +10,28 @@ import {
   type DisplayBounds,
 } from "./inputInjector.ts";
 import {
+  executePowerAction,
+  isPowerOperation,
+  resolvePowerCommand,
+} from "./powerAndPrivacy.ts";
+import {
   APP_ORIGIN,
   getMimeType,
   isAllowedRendererUrl,
   isSafeExternalUrl,
   resolveStaticAssetPath,
 } from "./protocol.ts";
+import {
+  createDirectory,
+  getDefaultRoots,
+  isProtectedDeletePath,
+  listDirectory,
+  openDownloadStream,
+  REMOTE_DOWNLOAD_CHUNK_SIZE,
+  resolveValidUploadTargetDir,
+  sanitizeEntryName,
+  trashPath,
+} from "./remoteFileManager.ts";
 import {
   clampWindowBounds,
   computePresetBounds,
@@ -636,5 +653,339 @@ describe("desktop host input mapping & command translation", () => {
       ),
       [{ action: "text", text: "你好 VeloDeck 🚀", submit: true }],
     );
+
+    // Pro host commands: power / privacy_screen / audio_toggle / extended desktop keys
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "power", operation: "lock" },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "lock" }],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "power", operation: "sleep" },
+        primaryDisplay,
+        "darwin",
+      ),
+      [],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "power", operation: "restart" },
+        primaryDisplay,
+        "win32",
+      ),
+      [],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "power", operation: "shutdown" },
+        primaryDisplay,
+        "win32",
+      ),
+      [],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "privacy_screen", enabled: true },
+        primaryDisplay,
+        "darwin",
+      ),
+      [],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "audio_toggle", enabled: false },
+        primaryDisplay,
+        "darwin",
+      ),
+      [],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "key", key: "volume_mute" },
+        primaryDisplay,
+        "darwin",
+      ),
+      [
+        {
+          action: "key_event",
+          phase: "press",
+          code: "AudioVolumeMute",
+          key: "AudioVolumeMute",
+          modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+        },
+      ],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        {
+          action: "key_event",
+          phase: "press",
+          code: "F13",
+          key: "F13",
+          modifiers: { ctrl: true, alt: true, shift: false, meta: false },
+        },
+        primaryDisplay,
+        "win32",
+      ),
+      [
+        {
+          action: "key_event",
+          phase: "press",
+          code: "F13",
+          key: "F13",
+          modifiers: { ctrl: true, alt: true, shift: false, meta: false },
+        },
+      ],
+    );
+  });
+});
+
+describe("pro host settings defaults & persistence", () => {
+  it("applies default pro host flags and round-trips custom overrides atomically", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "velodeck-pro-settings-"));
+    const settingsPath = path.join(tmpDir, "desktop-settings.json");
+
+    try {
+      const base = loadSettings(settingsPath);
+      const ensured = ensureHostSettings(base, "Pro-Studio-Mac");
+      assert.equal(ensured.changed, true);
+      assert.equal(ensured.settings.hostAutoLaunch, false);
+      assert.equal(ensured.settings.hostPreventSleep, true);
+      assert.equal(ensured.settings.hostAudioEnabled, true);
+      assert.equal(ensured.settings.hostClipboardAutoSync, true);
+
+      const customized: DesktopSettings = {
+        ...ensured.settings,
+        hostEnabled: true,
+        hostAutoLaunch: true,
+        hostPreventSleep: false,
+        hostAudioEnabled: false,
+        hostClipboardAutoSync: false,
+      };
+      saveSettingsAtomic(settingsPath, customized);
+
+      const loaded = loadSettings(settingsPath);
+      assert.equal(loaded.hostAutoLaunch, true);
+      assert.equal(loaded.hostPreventSleep, false);
+      assert.equal(loaded.hostAudioEnabled, false);
+      assert.equal(loaded.hostClipboardAutoSync, false);
+      assert.deepEqual(loaded, customized);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("remote power action validation & resolution", () => {
+  it("allowlists only lock/sleep/restart/shutdown and builds safe execFile specs", async () => {
+    assert.equal(isPowerOperation("lock"), true);
+    assert.equal(isPowerOperation("sleep"), true);
+    assert.equal(isPowerOperation("restart"), true);
+    assert.equal(isPowerOperation("shutdown"), true);
+    assert.equal(isPowerOperation("reboot; rm -rf /"), false);
+    assert.equal(isPowerOperation(""), false);
+
+    assert.deepEqual(resolvePowerCommand("sleep", "darwin"), {
+      file: "pmset",
+      args: ["sleepnow"],
+    });
+    assert.deepEqual(resolvePowerCommand("sleep", "win32"), {
+      file: "rundll32.exe",
+      args: ["powrprof.dll,SetSuspendState", "0,1,0"],
+    });
+    assert.deepEqual(resolvePowerCommand("restart", "win32"), {
+      file: "shutdown",
+      args: ["/r", "/t", "5"],
+    });
+    assert.deepEqual(resolvePowerCommand("shutdown", "darwin"), {
+      file: "osascript",
+      args: ["-e", 'tell application "System Events" to shut down'],
+    });
+
+    // Lock prefers native lockFallbackFn first
+    let execCalled = false;
+    const lockOk = await executePowerAction(
+      "lock",
+      "darwin",
+      () => true,
+      async () => {
+        execCalled = true;
+        return { ok: true };
+      },
+    );
+    assert.equal(lockOk.ok, true);
+    assert.equal(execCalled, false);
+
+    // Falls back to OS CLI if lockFallbackFn returns false
+    let capturedFile = "";
+    const lockFallback = await executePowerAction(
+      "lock",
+      "darwin",
+      () => false,
+      async (spec) => {
+        capturedFile = spec.file;
+        return { ok: true };
+      },
+    );
+    assert.equal(lockFallback.ok, true);
+    assert.equal(capturedFile, "pmset");
+  });
+});
+
+describe("remote file manager", () => {
+  it("sanitizes entry names strictly and blocks traversal, separators, NUL, and long names", () => {
+    assert.equal(sanitizeEntryName("Projects 2026"), "Projects 2026");
+    assert.equal(sanitizeEntryName("测试目录_01"), "测试目录_01");
+    assert.equal(sanitizeEntryName("  spaced  "), "spaced");
+
+    assert.equal(sanitizeEntryName(""), null);
+    assert.equal(sanitizeEntryName("   "), null);
+    assert.equal(sanitizeEntryName("."), null);
+    assert.equal(sanitizeEntryName(".."), null);
+    assert.equal(sanitizeEntryName("foo/bar"), null);
+    assert.equal(sanitizeEntryName("foo\\bar"), null);
+    assert.equal(sanitizeEntryName("bad\0name"), null);
+    assert.equal(sanitizeEntryName("bad\nname"), null);
+    assert.equal(sanitizeEntryName("a".repeat(121)), null);
+    assert.equal(sanitizeEntryName("a".repeat(120)), "a".repeat(120));
+  });
+
+  it("enumerates roots, lists sorted directories, creates folders, and validates upload targetDir", () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "velodeck-rfm-home-"));
+    try {
+      fs.mkdirSync(path.join(tmpHome, "Desktop"));
+      fs.mkdirSync(path.join(tmpHome, "Downloads"));
+
+      const roots = getDefaultRoots("linux", tmpHome);
+      assert.ok(roots.some((r) => r.kind === "home" && r.path === tmpHome));
+      assert.ok(roots.some((r) => r.kind === "desktop"));
+      assert.ok(roots.some((r) => r.kind === "downloads"));
+      assert.equal(roots.some((r) => r.kind === "documents"), false);
+
+      // Create mixed files & folders and verify dirs-first alphabetical sort
+      fs.writeFileSync(path.join(tmpHome, "b.txt"), "hello");
+      fs.writeFileSync(path.join(tmpHome, "a.txt"), "world!");
+      fs.mkdirSync(path.join(tmpHome, "ZetaDir"));
+      fs.mkdirSync(path.join(tmpHome, "AlphaDir"));
+
+      const listed = listDirectory(tmpHome);
+      assert.equal(listed.path, tmpHome);
+      assert.equal(listed.parentPath, path.dirname(tmpHome));
+      assert.deepEqual(
+        listed.entries.map((e) => `${e.isDir ? "D" : "F"}:${e.name}`),
+        ["D:AlphaDir", "D:Desktop", "D:Downloads", "D:ZetaDir", "F:a.txt", "F:b.txt"],
+      );
+      const aEntry = listed.entries.find((e) => e.name === "a.txt");
+      assert.equal(aEntry?.size, 6);
+
+      // Safe mkdir
+      const created = createDirectory(tmpHome, "New Folder");
+      assert.equal(created.ok, true);
+      assert.equal(created.createdPath, path.join(tmpHome, "New Folder"));
+      assert.equal(fs.statSync(created.createdPath!).isDirectory(), true);
+
+      // Reject duplicate & traversal names
+      assert.equal(createDirectory(tmpHome, "New Folder").ok, false);
+      assert.equal(createDirectory(tmpHome, "../escape").ok, false);
+
+      // Upload targetDir validation
+      assert.equal(resolveValidUploadTargetDir(tmpHome), tmpHome);
+      assert.equal(resolveValidUploadTargetDir(path.join(tmpHome, "a.txt")), null);
+      assert.equal(resolveValidUploadTargetDir(path.join(tmpHome, "does-not-exist")), null);
+      assert.equal(resolveValidUploadTargetDir(`${tmpHome}\0evil`), null);
+    } finally {
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
+
+  it("protects filesystem roots and homeDir from deletion and safely trashes regular items", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "velodeck-rfm-del-"));
+    const fakeHome = path.join(tmpRoot, "home-user");
+    const sampleFile = path.join(fakeHome, "report.pdf");
+    fs.mkdirSync(fakeHome, { recursive: true });
+    fs.writeFileSync(sampleFile, "pdf-bytes");
+
+    try {
+      const trashed: string[] = [];
+      const mockTrash = async (p: string): Promise<void> => {
+        trashed.push(p);
+      };
+
+      assert.equal(isProtectedDeletePath("/", fakeHome, "darwin"), true);
+      assert.equal(isProtectedDeletePath("C:\\", fakeHome, "win32"), true);
+      assert.equal(isProtectedDeletePath("D:/", fakeHome, "win32"), true);
+      assert.equal(isProtectedDeletePath(fakeHome, fakeHome, "darwin"), true);
+
+      const rootRes = await trashPath("/", mockTrash, fakeHome, "darwin");
+      assert.equal(rootRes.ok, false);
+
+      const winRootRes = await trashPath("C:\\", mockTrash, fakeHome, "win32");
+      assert.equal(winRootRes.ok, false);
+
+      const homeRes = await trashPath(fakeHome, mockTrash, fakeHome, "darwin");
+      assert.equal(homeRes.ok, false);
+      assert.equal(trashed.length, 0);
+
+      const fileRes = await trashPath(sampleFile, mockTrash, fakeHome, "darwin");
+      assert.equal(fileRes.ok, true);
+      assert.deepEqual(trashed, [sampleFile]);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("streams files in 64KB chunks with exact SHA-256 verification and rejects directories/NUL paths", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "velodeck-rfm-dl-"));
+    const bigFile = path.join(tmpDir, "payload.bin");
+    const emptyFile = path.join(tmpDir, "empty.txt");
+    const subDir = path.join(tmpDir, "subdir");
+
+    try {
+      // 160 KB random payload -> expects 3 chunks (64KB + 64KB + 32KB)
+      const payload = crypto.randomBytes(REMOTE_DOWNLOAD_CHUNK_SIZE * 2 + 32 * 1024);
+      const expectedSha = crypto.createHash("sha256").update(payload).digest("hex");
+      fs.writeFileSync(bigFile, payload);
+      fs.writeFileSync(emptyFile, "");
+      fs.mkdirSync(subDir);
+
+      const reader = openDownloadStream(bigFile);
+      assert.equal(reader.meta.fileName, "payload.bin");
+      assert.equal(reader.meta.size, payload.byteLength);
+      assert.equal(reader.meta.mimeType, "application/octet-stream");
+
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of reader) {
+        assert.ok(chunk.byteLength > 0);
+        assert.ok(chunk.byteLength <= REMOTE_DOWNLOAD_CHUNK_SIZE);
+        chunks.push(chunk);
+      }
+
+      assert.equal(chunks.length, 3);
+      const reassembled = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+      assert.equal(reassembled.byteLength, payload.byteLength);
+      assert.equal(reassembled.equals(payload), true);
+      assert.equal(reader.totalBytesRead, payload.byteLength);
+      assert.equal(reader.sha256, expectedSha);
+
+      // 0-byte file round-trip
+      const emptyReader = openDownloadStream(emptyFile);
+      const emptyStep = emptyReader.readNextChunk();
+      assert.equal(emptyStep.done, true);
+      assert.equal(emptyStep.size, 0);
+      assert.equal(
+        emptyStep.sha256,
+        crypto.createHash("sha256").update(Buffer.alloc(0)).digest("hex"),
+      );
+
+      // Directories and NUL-byte paths are rejected
+      assert.throws(() => openDownloadStream(subDir));
+      assert.throws(() => openDownloadStream(`${bigFile}\0.txt`));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

@@ -12,6 +12,7 @@ import {
   type ControlCmdMessage,
   type ControllerAuthMessage,
   type ControllerAuthedMessage,
+  type DesktopPowerOperation,
   type DeviceCapabilities,
   type DevicePlatform,
   type DeviceStatusMessage,
@@ -31,6 +32,7 @@ import {
   type StreamQuality,
   type TransportMode,
   type UserProfile,
+  type VideoCodecPreference,
   type WireMessage,
 } from "@velodeck/protocol";
 import { AuditLogger, type AuditEvent } from "./audit.js";
@@ -169,6 +171,25 @@ function isValidTransportMode(value: unknown): value is TransportMode {
   return value === "webrtc" || value === "ws-jpeg";
 }
 
+function isValidVideoCodecPreference(value: unknown): value is VideoCodecPreference {
+  return (
+    value === "auto" ||
+    value === "h264" ||
+    value === "hevc" ||
+    value === "av1" ||
+    value === "vp9"
+  );
+}
+
+function isValidDesktopPowerOperation(value: unknown): value is DesktopPowerOperation {
+  return (
+    value === "lock" ||
+    value === "sleep" ||
+    value === "restart" ||
+    value === "shutdown"
+  );
+}
+
 function isValidStreamQuality(value: unknown): value is StreamQuality {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return false;
@@ -178,16 +199,22 @@ function isValidStreamQuality(value: unknown): value is StreamQuality {
     typeof q.maxWidth === "number" &&
     Number.isFinite(q.maxWidth) &&
     q.maxWidth > 0 &&
+    q.maxWidth <= 7680 &&
     typeof q.fps === "number" &&
     Number.isFinite(q.fps) &&
     q.fps > 0 &&
+    q.fps <= 240 &&
     typeof q.bitrateKbps === "number" &&
     Number.isFinite(q.bitrateKbps) &&
     q.bitrateKbps > 0 &&
+    q.bitrateKbps <= 50_000 &&
     typeof q.jpegQuality === "number" &&
     Number.isFinite(q.jpegQuality) &&
     q.jpegQuality > 0 &&
-    (q.auto === undefined || typeof q.auto === "boolean")
+    q.jpegQuality <= 100 &&
+    (q.auto === undefined || typeof q.auto === "boolean") &&
+    (q.codec === undefined || isValidVideoCodecPreference(q.codec)) &&
+    (q.audioEnabled === undefined || typeof q.audioEnabled === "boolean")
   );
 }
 
@@ -467,6 +494,21 @@ function cloneCapabilities(cap: DeviceCapabilities): DeviceCapabilities {
   if (cap.p2pFileTransfer !== undefined) {
     copy.p2pFileTransfer = Boolean(cap.p2pFileTransfer);
   }
+  if (cap.desktopAudio !== undefined) {
+    copy.desktopAudio = Boolean(cap.desktopAudio);
+  }
+  if (cap.privacyScreen !== undefined) {
+    copy.privacyScreen = Boolean(cap.privacyScreen);
+  }
+  if (cap.fileManager !== undefined) {
+    copy.fileManager = Boolean(cap.fileManager);
+  }
+  if (cap.powerControl !== undefined) {
+    copy.powerControl = Boolean(cap.powerControl);
+  }
+  if (cap.highRefresh !== undefined) {
+    copy.highRefresh = Boolean(cap.highRefresh);
+  }
   return copy;
 }
 
@@ -499,6 +541,11 @@ function mergeCapabilities(
   if (typeof patch.mediaProjection === "boolean") merged.mediaProjection = patch.mediaProjection;
   if (typeof patch.rootOrShizuku === "boolean") merged.rootOrShizuku = patch.rootOrShizuku;
   if (typeof patch.p2pFileTransfer === "boolean") merged.p2pFileTransfer = patch.p2pFileTransfer;
+  if (typeof patch.desktopAudio === "boolean") merged.desktopAudio = patch.desktopAudio;
+  if (typeof patch.privacyScreen === "boolean") merged.privacyScreen = patch.privacyScreen;
+  if (typeof patch.fileManager === "boolean") merged.fileManager = patch.fileManager;
+  if (typeof patch.powerControl === "boolean") merged.powerControl = patch.powerControl;
+  if (typeof patch.highRefresh === "boolean") merged.highRefresh = patch.highRefresh;
   return merged;
 }
 
@@ -1927,6 +1974,20 @@ export class VeloDeckHub {
     if (forcePortraitActive !== undefined) {
       summary.forcePortraitActive = forcePortraitActive;
     }
+    const privacyScreenActive =
+      typeof msg.privacyScreenActive === "boolean"
+        ? msg.privacyScreenActive
+        : prev?.privacyScreenActive;
+    if (privacyScreenActive !== undefined) {
+      summary.privacyScreenActive = privacyScreenActive;
+    }
+    const audioEnabled =
+      typeof msg.audioEnabled === "boolean"
+        ? msg.audioEnabled
+        : prev?.audioEnabled;
+    if (audioEnabled !== undefined) {
+      summary.audioEnabled = audioEnabled;
+    }
     // Validate directUrl strictly (ws:// or wss:// with RFC1918/CGNAT private IPv4 only)
     const validatedIncomingUrl =
       msg.directUrl !== undefined ? validateDirectUrl(msg.directUrl) : undefined;
@@ -2001,6 +2062,12 @@ export class VeloDeckHub {
     }
     if (typeof msg.forcePortraitActive === "boolean") {
       s.forcePortraitActive = msg.forcePortraitActive;
+    }
+    if (typeof msg.privacyScreenActive === "boolean") {
+      s.privacyScreenActive = msg.privacyScreenActive;
+    }
+    if (typeof msg.audioEnabled === "boolean") {
+      s.audioEnabled = msg.audioEnabled;
     }
     const telemetryDeviceType = sanitizeDeviceType(msg.deviceType);
     if (telemetryDeviceType !== undefined) {
@@ -2486,6 +2553,10 @@ export class VeloDeckHub {
       bitrateKbps: msg.quality.bitrateKbps,
       jpegQuality: msg.quality.jpegQuality,
       ...(typeof msg.quality.auto === "boolean" ? { auto: msg.quality.auto } : {}),
+      ...(msg.quality.codec !== undefined ? { codec: msg.quality.codec } : {}),
+      ...(typeof msg.quality.audioEnabled === "boolean"
+        ? { audioEnabled: msg.quality.audioEnabled }
+        : {}),
     };
     const forwarded: SessionRequestMessage = {
       type: "session.request",
@@ -2602,12 +2673,32 @@ export class VeloDeckHub {
       }
     }
 
-    if (cmd.action === "black_screen" || cmd.action === "force_portrait") {
+    if (
+      cmd.action === "black_screen" ||
+      cmd.action === "force_portrait" ||
+      cmd.action === "privacy_screen" ||
+      cmd.action === "audio_toggle"
+    ) {
       if (typeof cmd.enabled !== "boolean") {
         this.sendError(conn.ws, "INVALID_MESSAGE", "Invalid boolean enabled flag", {
           sessionId: msg.sessionId,
           deviceId: msg.deviceId,
         });
+        return;
+      }
+    }
+
+    if (cmd.action === "power") {
+      if (!isValidDesktopPowerOperation(cmd.operation)) {
+        this.sendError(
+          conn.ws,
+          "INVALID_MESSAGE",
+          "power requires operation in 'lock' | 'sleep' | 'restart' | 'shutdown'",
+          {
+            sessionId: msg.sessionId,
+            deviceId: msg.deviceId,
+          },
+        );
         return;
       }
     }
@@ -2851,6 +2942,7 @@ export class VeloDeckHub {
     }
 
     let inSessionAuditEvent: AuditEvent | null = null;
+    let inSessionAuditDetail: string | undefined;
     switch (cmd.action) {
       case "wake":
         inSessionAuditEvent = "control.wake";
@@ -2864,6 +2956,14 @@ export class VeloDeckHub {
       case "force_portrait":
         inSessionAuditEvent = "control.force_portrait";
         break;
+      case "privacy_screen":
+        inSessionAuditEvent = "control.privacy_screen";
+        inSessionAuditDetail = cmd.enabled ? "on" : "off";
+        break;
+      case "power":
+        inSessionAuditEvent = "control.power";
+        inSessionAuditDetail = cmd.operation;
+        break;
       default:
         break;
     }
@@ -2875,6 +2975,7 @@ export class VeloDeckHub {
         userId: conn.userId,
         deviceId: session.deviceId,
         sessionId: session.sessionId,
+        ...(inSessionAuditDetail !== undefined ? { detail: inSessionAuditDetail } : {}),
       });
     }
 

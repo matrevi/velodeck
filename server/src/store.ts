@@ -112,6 +112,21 @@ function cloneCapabilities(cap: DeviceCapabilities): DeviceCapabilities {
   if (cap.p2pFileTransfer !== undefined) {
     copy.p2pFileTransfer = Boolean(cap.p2pFileTransfer);
   }
+  if (cap.desktopAudio !== undefined) {
+    copy.desktopAudio = Boolean(cap.desktopAudio);
+  }
+  if (cap.privacyScreen !== undefined) {
+    copy.privacyScreen = Boolean(cap.privacyScreen);
+  }
+  if (cap.fileManager !== undefined) {
+    copy.fileManager = Boolean(cap.fileManager);
+  }
+  if (cap.powerControl !== undefined) {
+    copy.powerControl = Boolean(cap.powerControl);
+  }
+  if (cap.highRefresh !== undefined) {
+    copy.highRefresh = Boolean(cap.highRefresh);
+  }
   return copy;
 }
 
@@ -165,6 +180,12 @@ export function cloneDeviceSummary(summary: DeviceSummary): DeviceSummary {
   }
   if (summary.forcePortraitActive !== undefined) {
     copy.forcePortraitActive = summary.forcePortraitActive;
+  }
+  if (summary.privacyScreenActive !== undefined) {
+    copy.privacyScreenActive = summary.privacyScreenActive;
+  }
+  if (summary.audioEnabled !== undefined) {
+    copy.audioEnabled = summary.audioEnabled;
   }
   if (summary.directUrl !== undefined) {
     copy.directUrl = summary.directUrl;

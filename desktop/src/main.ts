@@ -100,10 +100,10 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-// Enable Chromium hardware video decode flags (never disabling GPU acceleration)
+// Enable Chromium hardware video decode/encode flags (never disabling GPU acceleration)
 app.commandLine.appendSwitch(
   "enable-features",
-  "PlatformHEVCDecoderSupport,VaapiVideoDecoder",
+  "PlatformHEVCDecoderSupport,PlatformHEVCEncoderSupport,VaapiVideoDecoder",
 );
 
 function getDesktopPlatform(): DesktopPlatform {
@@ -160,7 +160,7 @@ const windowPresetMap = new WeakMap<BrowserWindow, WindowPreset>();
 
 function getControllerWindows(): BrowserWindow[] {
   return BrowserWindow.getAllWindows().filter(
-    (w) => !w.isDestroyed() && !hostManager?.isWorkerWindow(w),
+    (w) => !w.isDestroyed() && !hostManager?.isInternalWindow(w),
   );
 }
 
@@ -225,7 +225,7 @@ function emitWindowState(win: BrowserWindow): void {
 
 function getTargetWindow(): BrowserWindow | null {
   const focused = BrowserWindow.getFocusedWindow();
-  if (focused && !focused.isDestroyed() && !hostManager?.isWorkerWindow(focused)) {
+  if (focused && !focused.isDestroyed() && !hostManager?.isInternalWindow(focused)) {
     return focused;
   }
   if (primaryWindow && !primaryWindow.isDestroyed()) {
@@ -615,6 +615,22 @@ function buildTrayContextMenu(): Menu {
           } as MenuItemConstructorOptions,
         ]
       : []),
+    {
+      label: "隐私防窥黑屏",
+      type: "checkbox",
+      checked: Boolean(hostState?.privacyScreenActive),
+      click: (item) => {
+        void hostManager?.setHostPrivacyScreen(item.checked);
+      },
+    },
+    {
+      label: "开机自启",
+      type: "checkbox",
+      checked: Boolean(hostState?.autoLaunch),
+      click: (item) => {
+        void hostManager?.updateHostConfig({ autoLaunch: item.checked });
+      },
+    },
     { type: "separator" },
   ];
 
@@ -1376,6 +1392,41 @@ function registerIpcHandlers(): void {
       return hostManager.openPermissionSettings(kind);
     },
   );
+
+  ipcMain.handle(
+    "velodeck:host-set-privacy-screen",
+    (event, enabled: unknown) => {
+      if (!isTrustedIpcEvent(event)) {
+        throw new Error("Untrusted IPC sender");
+      }
+      if (!hostManager) {
+        throw new Error("Host manager unavailable");
+      }
+      return hostManager.setHostPrivacyScreen(Boolean(enabled));
+    },
+  );
+
+  ipcMain.handle("velodeck:clipboard-write-text", (event, text: unknown) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (typeof text !== "string") {
+      return false;
+    }
+    clipboard.writeText(text.slice(0, 64 * 1024));
+    return true;
+  });
+
+  ipcMain.handle("velodeck:clipboard-read-text", (event) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    try {
+      return clipboard.readText().slice(0, 64 * 1024);
+    } catch {
+      return "";
+    }
+  });
 }
 
 // Single-instance lock: second launch focuses existing window (or creates one if hidden)

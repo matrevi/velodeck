@@ -56,12 +56,21 @@ export interface DesktopHostState {
   permissions: DesktopHostPermissions;
   lastError: string | null;
   lastReceivedFile: { fileName: string; savedPath: string; at: number } | null;
+  autoLaunch: boolean;
+  preventSleep: boolean;
+  audioCaptureEnabled: boolean;
+  clipboardAutoSync: boolean;
+  privacyScreenActive: boolean;
 }
 
 export interface DesktopHostConfigPatch {
   deviceName?: string;
   controlPassword?: string;
   activeDisplayId?: string;
+  autoLaunch?: boolean;
+  preventSleep?: boolean;
+  audioCaptureEnabled?: boolean;
+  clipboardAutoSync?: boolean;
 }
 
 export interface VeloDeckDesktopBridge {
@@ -99,6 +108,9 @@ export interface VeloDeckDesktopBridge {
   disconnectHostSession(): Promise<DesktopHostState>;
   refreshHostPermissions(): Promise<DesktopHostPermissions>;
   openPermissionSettings(kind: "accessibility" | "screen"): Promise<void>;
+  setHostPrivacyScreen(enabled: boolean): Promise<DesktopHostState>;
+  writeClipboardText(text: string): Promise<boolean>;
+  readClipboardText(): Promise<string>;
 }
 
 function readBootstrapInfo(): DesktopBootstrapInfo {
@@ -278,6 +290,18 @@ const bridge: VeloDeckDesktopBridge = Object.freeze({
 
   async openPermissionSettings(kind: "accessibility" | "screen"): Promise<void> {
     await ipcRenderer.invoke("velodeck:host-open-permission-settings", kind);
+  },
+
+  setHostPrivacyScreen(enabled: boolean): Promise<DesktopHostState> {
+    return ipcRenderer.invoke("velodeck:host-set-privacy-screen", Boolean(enabled));
+  },
+
+  writeClipboardText(text: string): Promise<boolean> {
+    return ipcRenderer.invoke("velodeck:clipboard-write-text", text);
+  },
+
+  readClipboardText(): Promise<string> {
+    return ipcRenderer.invoke("velodeck:clipboard-read-text");
   },
 });
 

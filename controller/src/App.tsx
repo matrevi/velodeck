@@ -1122,6 +1122,31 @@ export function App() {
     [desktopBridge, showToast],
   );
 
+  const handleSetHostPrivacyScreen = useCallback(
+    async (enabled: boolean) => {
+      if (
+        !desktopBridge ||
+        typeof desktopBridge.setHostPrivacyScreen !== "function"
+      ) {
+        return;
+      }
+      try {
+        const next = await desktopBridge.setHostPrivacyScreen(enabled);
+        if (next) setHostState(next);
+        showToast(
+          "info",
+          enabled
+            ? "已开启本机隐私防窥黑屏（按 Cmd/Ctrl+Opt/Alt+Esc 可随时解除）"
+            : "已解除本机隐私防窥黑屏",
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "切换本机隐私黑屏失败";
+        showToast("error", msg);
+      }
+    },
+    [desktopBridge, showToast],
+  );
+
   const desktopHostHandlers = useMemo<DesktopHostHandlers | undefined>(() => {
     if (!desktopBridge || !hasDesktopHostBridge(desktopBridge)) {
       return undefined;
@@ -1137,6 +1162,10 @@ export function App() {
       onDisconnectSession: handleDisconnectHostSession,
       onRefreshPermissions: handleRefreshHostPermissions,
       onOpenPermissionSettings: handleOpenPermissionSettings,
+      onSetPrivacyScreen:
+        typeof desktopBridge.setHostPrivacyScreen === "function"
+          ? handleSetHostPrivacyScreen
+          : undefined,
     };
   }, [
     desktopBridge,
@@ -1150,6 +1179,7 @@ export function App() {
     handleDisconnectHostSession,
     handleRefreshHostPermissions,
     handleOpenPermissionSettings,
+    handleSetHostPrivacyScreen,
   ]);
 
   function handleExitViewport() {

@@ -375,10 +375,39 @@ export function translateControlCommandToNativeEvents(
               modifiers: noMod,
             },
           ];
+        case "volume_mute":
+          return [
+            {
+              action: "key_event",
+              phase: "press",
+              code: "AudioVolumeMute",
+              key: "AudioVolumeMute",
+              modifiers: noMod,
+            },
+          ];
         default:
           return [];
       }
     }
+
+    case "power": {
+      const op =
+        typeof cmd.operation === "string"
+          ? cmd.operation
+          : typeof cmd.op === "string"
+            ? cmd.op
+            : "";
+      if (op === "lock") {
+        return [{ action: "lock" }];
+      }
+      // sleep / restart / shutdown are handled by powerAndPrivacy.executePowerAction
+      return [];
+    }
+
+    case "privacy_screen":
+    case "audio_toggle":
+      // Handled at hostManager / hostWorkerRenderer level, never injected as HID events
+      return [];
 
     case "text": {
       const text = typeof cmd.text === "string" ? cmd.text.slice(0, MAX_TEXT_LENGTH) : "";
