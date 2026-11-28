@@ -1,4 +1,13 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -99,15 +108,16 @@ import {
   type DesktopWindowState,
 } from "../desktop/bridge";
 import {
+  CrossOsKeymapSession,
   detectLocalOsPlatform,
   formatDesktopOsShortLabel,
   isCrossOsDesktopPair,
   loadKeyboardMappingMode,
-  mapKeyboardEventForTarget,
   saveKeyboardMappingMode,
   toDesktopOsPlatform,
   type DesktopOsPlatform,
   type KeyboardMappingMode,
+  type MappedKeyCommand,
 } from "../desktop/keymap";
 import {
   SessionRecorder,
@@ -151,6 +161,7 @@ interface RemoteViewportProps {
   onSetWindowPreset?: (preset: DesktopWindowPreset) => Promise<void> | void;
   onOpenNewWindow?: () => Promise<void> | void;
   onShowToast?: (level: "info" | "warn" | "error", text: string) => void;
+  onRecordingStateChange?: (recording: boolean) => void;
   suppressKeyboard?: boolean;
   isActiveTab?: boolean;
   hasTabBar?: boolean;
@@ -258,7 +269,8 @@ function isLocalDesktopAppShortcut(e: KeyboardEvent): boolean {
       lower === "c" ||
       lower === "s" ||
       lower === "b" ||
-      lower === "p"
+      lower === "p" ||
+      lower === "r"
     );
   }
   return (
@@ -354,6 +366,7 @@ export function RemoteViewport({
   onSetWindowPreset,
   onOpenNewWindow,
   onShowToast,
+  onRecordingStateChange,
   suppressKeyboard = false,
   isActiveTab = true,
   hasTabBar = false,
@@ -364,6 +377,7 @@ export function RemoteViewport({
   const macDesktop = isMacDesktop();
   const localOs = useMemo(() => detectLocalOsPlatform(), []);
 
+  const viewportWrapperRef = useRef<HTMLDivElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const mediaStageRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -373,8 +387,13 @@ export function RemoteViewport({
   const dragCounterRef = useRef(0);
   const apkAbortRef = useRef<AbortController | null>(null);
   const recorderRef = useRef<SessionRecorder | null>(null);
+  const recordedStreamRef = useRef<MediaStream | null>(null);
+  const recordedStreamIsSyntheticRef = useRef(false);
+  const recordedTransportRef = useRef<TransportMode | null>(null);
   const onShowToastRef = useRef(onShowToast);
   onShowToastRef.current = onShowToast;
+  const onRecordingStateChangeRef = useRef(onRecordingStateChange);
+  onRecordingStateChangeRef.current = onRecordingStateChange;
   const isActiveTabRef = useRef(isActiveTab);
   isActiveTabRef.current = isActiveTab;
 
@@ -421,6 +440,10 @@ export function RemoteViewport({
     width: number;
     height: number;
   }>({ width: 0, height: 0 });
+  const [surfaceScroll, setSurfaceScroll] = useState<{
+    left: number;
+    top: number;
+  }>({ left: 0, top: 0 });
 
   const [pinValue, setPinValue] = useState("");
   const [inputText, setInputText] = useState("");
@@ -477,6 +500,8 @@ export function RemoteViewport({
   const kbTextTimerRef = useRef<number | null>(null);
 
   const isDesktopTarget = device?.deviceType === "desktop";
+  const isDesktopTargetRef = useRef(isDesktopTarget);
+  isDesktopTargetRef.current = isDesktopTarget;
   const targetDesktopOs = toDesktopOsPlatform(device?.osPlatform);
   const targetDeviceId = clientState.activeDeviceId ?? device?.deviceId ?? "";
 
@@ -526,8 +551,21 @@ export function RemoteViewport({
   const desktopMoveLastSentRef = useRef(0);
   const desktopMovePendingRef = useRef<{ x: number; y: number } | null>(null);
   const desktopMoveTimerRef = useRef<number | null>(null);
+  const pendingRelDxRef = useRef(0);
+  const pendingRelDyRef = useRef(0);
+  const relMoveTimerRef = useRef<number | null>(null);
+  const relClickDistAccRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
   const desktopPressedButtonsRef = useRef<
-    Map<string, { pointerId: number; button: MouseButton; x: number; y: number }>
+    Map<
+      string,
+      {
+        pointerId: number;
+        button: MouseButton;
+        x: number;
+        y: number;
+        locked: boolean;
+      }
+    >
   >(new Map());
   const desktopClickTrackerRef = useRef<{
     button: MouseButton;
@@ -536,9 +574,7 @@ export function RemoteViewport({
     clientY: number;
     count: number;
   } | null>(null);
-  const desktopPressedKeysRef = useRef<
-    Map<string, { code: string; key: string }>
-  >(new Map());
+  const keymapSessionRef = useRef<CrossOsKeymapSession>(new CrossOsKeymapSession());
   const desktopTouchRef = useRef<{
     pointers: Map<number, DesktopTouchPointer>;
     mode:
@@ -574,21 +610,87 @@ export function RemoteViewport({
     dragStarted: false,
   });
 
+  const dispatchKeyCommands = useCallback(
+    (commands: MappedKeyCommand[]) => {
+      for (const cmd of commands) {
+        client.sendCommand(
+          {
+            action: "key_event",
+            phase: cmd.phase,
+            code: cmd.code,
+            key: cmd.key,
+            modifiers: cmd.modifiers,
+          },
+          targetDeviceId,
+        );
+      }
+    },
+    [client, targetDeviceId],
+  );
+
+  const releaseDesktopKeys = useCallback(() => {
+    const released = keymapSessionRef.current.releaseAll();
+    if (released.length > 0) {
+      dispatchKeyCommands(released);
+    }
+  }, [dispatchKeyCommands]);
+
+  const flushRelativeMouseMove = useCallback(
+    (resetRemainder = false) => {
+      if (relMoveTimerRef.current !== null) {
+        window.clearTimeout(relMoveTimerRef.current);
+        relMoveTimerRef.current = null;
+      }
+      const sendDx = Math.trunc(pendingRelDxRef.current);
+      const sendDy = Math.trunc(pendingRelDyRef.current);
+      if (resetRemainder) {
+        pendingRelDxRef.current = 0;
+        pendingRelDyRef.current = 0;
+      } else {
+        pendingRelDxRef.current -= sendDx;
+        pendingRelDyRef.current -= sendDy;
+      }
+      if (sendDx !== 0 || sendDy !== 0) {
+        client.sendCommand(
+          { action: "mouse_move_relative", dx: sendDx, dy: sendDy },
+          targetDeviceId,
+        );
+      }
+    },
+    [client, targetDeviceId],
+  );
+
+  const clearRelativeMouseMove = useCallback(() => {
+    if (relMoveTimerRef.current !== null) {
+      window.clearTimeout(relMoveTimerRef.current);
+      relMoveTimerRef.current = null;
+    }
+    pendingRelDxRef.current = 0;
+    pendingRelDyRef.current = 0;
+    relClickDistAccRef.current = { dx: 0, dy: 0 };
+  }, []);
+
   const resetDesktopInputs = useCallback(() => {
     if (desktopMoveTimerRef.current !== null) {
       window.clearTimeout(desktopMoveTimerRef.current);
       desktopMoveTimerRef.current = null;
     }
     desktopMovePendingRef.current = null;
+    clearRelativeMouseMove();
 
     for (const entry of desktopPressedButtonsRef.current.values()) {
       client.sendCommand(
-        {
-          action: "mouse_up",
-          x: entry.x,
-          y: entry.y,
-          button: entry.button,
-        },
+        entry.locked || pointerLockedRef.current
+          ? {
+              action: "mouse_up",
+              button: entry.button,
+            }
+          : {
+              action: "mouse_up",
+              x: entry.x,
+              y: entry.y,
+              button: entry.button,
+            },
         targetDeviceId,
       );
     }
@@ -616,20 +718,8 @@ export function RemoteViewport({
     touch.mode = "idle";
     touch.dragStarted = false;
 
-    for (const entry of desktopPressedKeysRef.current.values()) {
-      client.sendCommand(
-        {
-          action: "key_event",
-          phase: "up",
-          code: entry.code,
-          key: entry.key,
-          modifiers: { ctrl: false, alt: false, shift: false, meta: false },
-        },
-        targetDeviceId,
-      );
-    }
-    desktopPressedKeysRef.current.clear();
-  }, [client, targetDeviceId]);
+    releaseDesktopKeys();
+  }, [client, targetDeviceId, clearRelativeMouseMove, releaseDesktopKeys]);
 
   // Track surface bounds for crisp virtual cursor placement in desktop trackpad mode
   useEffect(() => {
@@ -669,26 +759,55 @@ export function RemoteViewport({
     }
   }, []);
 
-  const stopAndSaveRecording = useCallback(async (reasonPrefix?: string) => {
-    const recorder = recorderRef.current;
-    if (!recorder) {
-      setIsRecording(false);
-      setRecordingDurationSec(0);
-      return;
+  const cleanupSyntheticRecordedStream = useCallback(() => {
+    if (recordedStreamIsSyntheticRef.current && recordedStreamRef.current) {
+      for (const track of recordedStreamRef.current.getTracks()) {
+        try {
+          track.stop();
+        } catch {
+          // Ignore track stop errors
+        }
+      }
     }
-    const result = await recorder.stop();
-    setIsRecording(false);
-    setRecordingDurationSec(0);
-    if (result && result.blob.size > 0) {
-      triggerRecordingDownload(result.blob, result.fileName);
-      onShowToastRef.current?.(
-        "info",
-        reasonPrefix
-          ? `${reasonPrefix}，录屏已保存 (${result.fileName})`
-          : `录屏已保存 (${result.fileName})`,
-      );
-    }
+    recordedStreamRef.current = null;
+    recordedStreamIsSyntheticRef.current = false;
+    recordedTransportRef.current = null;
   }, []);
+
+  const stopAndSaveRecording = useCallback(
+    async (reasonPrefix?: string) => {
+      const recorder = recorderRef.current;
+      if (!recorder) {
+        cleanupSyntheticRecordedStream();
+        setIsRecording(false);
+        setRecordingDurationSec(0);
+        return;
+      }
+      let result = null;
+      try {
+        result = await recorder.stop();
+      } finally {
+        cleanupSyntheticRecordedStream();
+        setIsRecording(false);
+        setRecordingDurationSec(0);
+      }
+      if (result && result.blob.size > 0) {
+        triggerRecordingDownload(result.blob, result.fileName);
+        onShowToastRef.current?.(
+          "info",
+          reasonPrefix
+            ? `${reasonPrefix}，录屏已保存 (${result.fileName})`
+            : `录屏已保存 (${result.fileName})`,
+        );
+      }
+    },
+    [cleanupSyntheticRecordedStream],
+  );
+
+  // Notify parent when recording state changes (and force false on unmount)
+  useEffect(() => {
+    onRecordingStateChangeRef.current?.(isRecording);
+  }, [isRecording]);
 
   // Reconnect countdown at 1Hz (P2)
   useEffect(() => {
@@ -725,6 +844,10 @@ export function RemoteViewport({
         window.clearTimeout(desktopMoveTimerRef.current);
         desktopMoveTimerRef.current = null;
       }
+      if (relMoveTimerRef.current !== null) {
+        window.clearTimeout(relMoveTimerRef.current);
+        relMoveTimerRef.current = null;
+      }
       if (desktopTouchRef.current.longPressTimer !== null) {
         window.clearTimeout(desktopTouchRef.current.longPressTimer);
         desktopTouchRef.current.longPressTimer = null;
@@ -737,26 +860,40 @@ export function RemoteViewport({
       apkAbortRef.current = null;
       if (recorderRef.current?.isRecording()) {
         void recorderRef.current.stop().then((result) => {
+          cleanupSyntheticRecordedStream();
           if (result && result.blob.size > 0) {
             triggerRecordingDownload(result.blob, result.fileName);
             onShowToastRef.current?.("info", `录屏已保存 (${result.fileName})`);
           }
         });
+      } else {
+        cleanupSyntheticRecordedStream();
       }
+      onRecordingStateChangeRef.current?.(false);
     };
-  }, []);
+  }, [cleanupSyntheticRecordedStream]);
 
-  // Auto-stop and save local recording if session ends, errors out, or drops its media stream
+  // Auto-stop and save local recording if session stops streaming, transport switches, or WebRTC stream changes
   useEffect(() => {
     if (!isRecording) return;
-    const streamDropped =
-      clientState.activeTransport === "webrtc" && clientState.mediaStream === null;
-    const sessionLost =
-      clientState.sessionStatus === "ended" ||
-      clientState.sessionStatus === "error" ||
+    const transportChanged =
+      recordedTransportRef.current !== null &&
+      recordedTransportRef.current !== clientState.activeTransport;
+    const webrtcStreamChanged =
+      clientState.activeTransport === "webrtc" &&
+      (clientState.mediaStream === null ||
+        (recordedStreamRef.current !== null &&
+          recordedStreamRef.current !== clientState.mediaStream));
+    const sessionNotStreaming =
+      clientState.sessionStatus !== "streaming" ||
       clientState.socketStatus === "error";
-    if (streamDropped || sessionLost) {
-      void stopAndSaveRecording("会话已断开");
+    if (transportChanged || webrtcStreamChanged || sessionNotStreaming) {
+      const reason = transportChanged
+        ? "传输通道已切换"
+        : webrtcStreamChanged
+          ? "视频流已切换"
+          : "会话已断开";
+      void stopAndSaveRecording(reason);
     }
   }, [
     isRecording,
@@ -767,7 +904,7 @@ export function RemoteViewport({
     stopAndSaveRecording,
   ]);
 
-  // Reset first-frame gates on sessionId / mediaStream change (P0-2)
+  // Reset first-frame gates & cached mediaSize on session / device / stream change (P0-2)
   useEffect(() => {
     hasVideoFrameRef.current = false;
     setHasVideoFrame(false);
@@ -777,6 +914,10 @@ export function RemoteViewport({
     hasCanvasFrameRef.current = false;
     setHasCanvasFrame(false);
   }, [clientState.sessionId]);
+
+  useEffect(() => {
+    setMediaSize({ width: 0, height: 0 });
+  }, [clientState.sessionId, targetDeviceId]);
 
   // Reset desktop zoom, audio mute, and power confirmation when target device or session changes
   useEffect(() => {
@@ -804,8 +945,13 @@ export function RemoteViewport({
 
   // Auto two-way clipboard sync for desktop targets: remote -> local system clipboard
   useEffect(() => {
+    if (!isActiveTab) {
+      if (clientState.lastClipboardAt > lastSyncedClipAtRef.current) {
+        lastSyncedClipAtRef.current = clientState.lastClipboardAt;
+      }
+      return;
+    }
     if (
-      !isActiveTab ||
       !isDesktopTarget ||
       !autoClipboardSync ||
       !canClipboard ||
@@ -1129,6 +1275,7 @@ export function RemoteViewport({
         }
       }
       if (
+        isActiveTabRef.current &&
         clientState.activeTransport === "webrtc" &&
         clientState.sessionStatus === "streaming"
       ) {
@@ -1137,6 +1284,7 @@ export function RemoteViewport({
     };
 
     const handleWindowBlur = () => {
+      pointerLockShortcutActiveRef.current = false;
       recognizer.reset();
       if (isDesktopTarget) {
         resetDesktopInputs();
@@ -1200,8 +1348,14 @@ export function RemoteViewport({
         surfaceRef.current && document.pointerLockElement === surfaceRef.current,
       );
       setPointerLocked(locked);
+      pointerLockShortcutActiveRef.current = false;
+      if (!locked) {
+        clearRelativeMouseMove();
+        desktopClickTrackerRef.current = null;
+      }
     };
     const handleLockError = () => {
+      if (!isActiveTabRef.current || !isDesktopTargetRef.current) return;
       setPointerLocked(false);
       onShowToastRef.current?.("warn", "无法锁定相对鼠标指针，请先点击画面后重试");
     };
@@ -1214,7 +1368,7 @@ export function RemoteViewport({
         exitPointerLockSafe();
       }
     };
-  }, [exitPointerLockSafe]);
+  }, [exitPointerLockSafe, clearRelativeMouseMove]);
 
   // Automatically release pointer lock & whiteboard on viewOnly, modal open, tab switch, permission block, or session end
   useEffect(() => {
@@ -1225,7 +1379,8 @@ export function RemoteViewport({
       viewOnly ||
       !canMouse ||
       whiteboardActive ||
-      activePanel !== "none";
+      activePanel !== "none" ||
+      suppressKeyboard;
     if (
       shouldReleaseLock &&
       typeof document !== "undefined" &&
@@ -1242,14 +1397,16 @@ export function RemoteViewport({
     canMouse,
     whiteboardActive,
     activePanel,
+    suppressKeyboard,
+    pointerLocked,
     exitPointerLockSafe,
   ]);
 
   useEffect(() => {
-    if (!isDesktopTarget || !isStreamingReady || viewOnly) {
+    if (!isDesktopTarget || !isStreamingReady || viewOnly || !isActiveTab) {
       setWhiteboardActive(false);
     }
-  }, [isDesktopTarget, isStreamingReady, viewOnly]);
+  }, [isDesktopTarget, isStreamingReady, viewOnly, isActiveTab]);
 
   useEffect(() => {
     if (activePanel === "terminal" && !canTerminal) {
@@ -1305,31 +1462,49 @@ export function RemoteViewport({
       return;
     }
     const onKeyDown = (e: KeyboardEvent) => {
-      if (isEditableTarget(e.target) || e.isComposing) return;
+      if (isEditableTarget(e.target) || e.isComposing || e.keyCode === 229) return;
       if (
         (e.metaKey || e.ctrlKey) &&
         !e.altKey &&
         !e.shiftKey &&
-        e.key.toLowerCase() === "g"
+        (e.code === "KeyG" || e.key.toLowerCase() === "g")
       ) {
         e.preventDefault();
         e.stopPropagation();
+        keymapSessionRef.current.cancelPendingModifier();
+        if (e.repeat) return;
         pointerLockShortcutActiveRef.current = true;
         handleTogglePointerLock();
       }
     };
     const onKeyUp = (e: KeyboardEvent) => {
-      if (pointerLockShortcutActiveRef.current && e.key.toLowerCase() === "g") {
+      if (!pointerLockShortcutActiveRef.current) return;
+      const isGKey = e.code === "KeyG" || e.key.toLowerCase() === "g";
+      const isModKey =
+        e.key === "Meta" ||
+        e.key === "Control" ||
+        e.code === "MetaLeft" ||
+        e.code === "MetaRight" ||
+        e.code === "ControlLeft" ||
+        e.code === "ControlRight";
+      if (isGKey) {
         pointerLockShortcutActiveRef.current = false;
         e.preventDefault();
         e.stopPropagation();
+      } else if (isModKey) {
+        pointerLockShortcutActiveRef.current = false;
       }
+    };
+    const onBlur = () => {
+      pointerLockShortcutActiveRef.current = false;
     };
     window.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("keyup", onKeyUp, true);
+    window.addEventListener("blur", onBlur);
     return () => {
       window.removeEventListener("keydown", onKeyDown, true);
       window.removeEventListener("keyup", onKeyUp, true);
+      window.removeEventListener("blur", onBlur);
       pointerLockShortcutActiveRef.current = false;
     };
   }, [
@@ -1342,7 +1517,7 @@ export function RemoteViewport({
     handleTogglePointerLock,
   ]);
 
-  // Desktop target: Full keydown / keyup forwarding with cross-OS smart keymap, modifier state & local Electron shortcut guard
+  // Desktop target: Full keydown / keyup forwarding with stateful CrossOsKeymapSession & local Electron shortcut guard
   useEffect(() => {
     if (
       !isDesktopTarget ||
@@ -1350,23 +1525,12 @@ export function RemoteViewport({
       !isActiveTab ||
       viewOnly ||
       !canKeyboard ||
+      whiteboardActive ||
       (activePanel !== "none" && activePanel !== "shortcuts") ||
       suppressKeyboard
     ) {
-      if (isDesktopTarget && desktopPressedKeysRef.current.size > 0) {
-        for (const entry of desktopPressedKeysRef.current.values()) {
-          client.sendCommand(
-            {
-              action: "key_event",
-              phase: "up",
-              code: entry.code,
-              key: entry.key,
-              modifiers: { ctrl: false, alt: false, shift: false, meta: false },
-            },
-            targetDeviceId,
-          );
-        }
-        desktopPressedKeysRef.current.clear();
+      if (isDesktopTarget) {
+        releaseDesktopKeys();
       }
       return;
     }
@@ -1381,13 +1545,14 @@ export function RemoteViewport({
         return;
       }
       if (desktopApp && isLocalDesktopAppShortcut(e)) {
+        keymapSessionRef.current.cancelPendingModifier();
         return;
       }
       if (shouldPreventDefaultForDesktopKey(e)) {
         e.preventDefault();
       }
 
-      const mapped = mapKeyboardEventForTarget(
+      const cmds = keymapSessionRef.current.handleKeyDown(
         {
           code: e.code,
           key: e.key,
@@ -1401,22 +1566,9 @@ export function RemoteViewport({
         localOs,
         targetDesktopOs,
         keymapMode,
+        e.repeat,
       );
-
-      desktopPressedKeysRef.current.set(e.code, {
-        code: mapped.code,
-        key: mapped.key,
-      });
-      client.sendCommand(
-        {
-          action: "key_event",
-          phase: "down",
-          code: mapped.code,
-          key: mapped.key,
-          modifiers: mapped.modifiers,
-        },
-        targetDeviceId,
-      );
+      dispatchKeyCommands(cmds);
     };
 
     const handleDesktopKeyUp = (e: KeyboardEvent) => {
@@ -1429,15 +1581,14 @@ export function RemoteViewport({
         return;
       }
       if (desktopApp && isLocalDesktopAppShortcut(e)) {
+        keymapSessionRef.current.cancelPendingModifier();
         return;
       }
       if (shouldPreventDefaultForDesktopKey(e)) {
         e.preventDefault();
       }
 
-      const tracked = desktopPressedKeysRef.current.get(e.code);
-      desktopPressedKeysRef.current.delete(e.code);
-      const mapped = mapKeyboardEventForTarget(
+      const cmds = keymapSessionRef.current.handleKeyUp(
         {
           code: e.code,
           key: e.key,
@@ -1452,17 +1603,7 @@ export function RemoteViewport({
         targetDesktopOs,
         keymapMode,
       );
-
-      client.sendCommand(
-        {
-          action: "key_event",
-          phase: "up",
-          code: tracked?.code ?? mapped.code,
-          key: tracked?.key ?? mapped.key,
-          modifiers: mapped.modifiers,
-        },
-        targetDeviceId,
-      );
+      dispatchKeyCommands(cmds);
     };
 
     window.addEventListener("keydown", handleDesktopKeyDown);
@@ -1470,34 +1611,23 @@ export function RemoteViewport({
     return () => {
       window.removeEventListener("keydown", handleDesktopKeyDown);
       window.removeEventListener("keyup", handleDesktopKeyUp);
-      for (const entry of desktopPressedKeysRef.current.values()) {
-        client.sendCommand(
-          {
-            action: "key_event",
-            phase: "up",
-            code: entry.code,
-            key: entry.key,
-            modifiers: { ctrl: false, alt: false, shift: false, meta: false },
-          },
-          targetDeviceId,
-        );
-      }
-      desktopPressedKeysRef.current.clear();
+      releaseDesktopKeys();
     };
   }, [
-    client,
-    targetDeviceId,
     isDesktopTarget,
     desktopApp,
     isStreamingReady,
     isActiveTab,
     viewOnly,
     canKeyboard,
+    whiteboardActive,
     activePanel,
     suppressKeyboard,
     localOs,
     targetDesktopOs,
     keymapMode,
+    dispatchKeyCommands,
+    releaseDesktopKeys,
   ]);
 
   // P1-6: Android target desktop keyboard & paste shortcuts when streaming and no utility sheet is open
@@ -1531,7 +1661,7 @@ export function RemoteViewport({
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (isEditableTarget(e.target) || e.isComposing) return;
+      if (isEditableTarget(e.target) || e.isComposing || e.keyCode === 229) return;
 
       if (e.key === "Escape") {
         e.preventDefault();
@@ -1639,9 +1769,9 @@ export function RemoteViewport({
   }
 
   function addRipple(clientX: number, clientY: number) {
-    const surface = surfaceRef.current;
-    if (!surface) return;
-    const rect = surface.getBoundingClientRect();
+    const container = viewportWrapperRef.current ?? surfaceRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
     const id = ++rippleSeqRef.current;
     setRipples((prev) => [
       ...prev.slice(-6),
@@ -1727,13 +1857,15 @@ export function RemoteViewport({
       return { x: 0, y: 0 };
     }
     const sRect = surface.getBoundingClientRect();
-    const content = getRenderedContentSize();
-    const baseBox = computeContentRect(
-      sRect.width,
-      sRect.height,
-      content.width,
-      content.height,
-    );
+    const baseBox =
+      viewStyle === "stretch"
+        ? { width: sRect.width, height: sRect.height }
+        : computeContentRect(
+            sRect.width,
+            sRect.height,
+            getRenderedContentSize().width,
+            getRenderedContentSize().height,
+          );
     const maxPanX = Math.max(0, (baseBox.width * zoom - sRect.width) / 2);
     const maxPanY = Math.max(0, (baseBox.height * zoom - sRect.height) / 2);
     return {
@@ -1948,10 +2080,15 @@ export function RemoteViewport({
       touch.twoFingerStartMidY = midY;
       touch.twoFingerMidX = midX;
       touch.twoFingerMidY = midY;
-      // When already zoomed in, 2-finger gestures seamlessly pan & pinch-zoom;
-      // at 1x fit-to-screen, classify pinch-scale change vs parallel 2-finger scroll.
+      // In 1:1 original mode, disable 2-finger pinch-zoom and keep 2-finger scrolling.
+      // Otherwise, when already zoomed in, 2-finger gestures seamlessly pan & pinch-zoom;
+      // at 1x, classify pinch-scale change vs parallel 2-finger scroll.
       touch.mode =
-        viewZoomRef.current > 1.05 ? "two_finger_zoom_pan" : "two_finger_pending";
+        viewStyle === "original"
+          ? "two_finger_scroll"
+          : viewZoomRef.current > 1.05
+            ? "two_finger_zoom_pan"
+            : "two_finger_pending";
     } else {
       if (touch.longPressTimer !== null) {
         window.clearTimeout(touch.longPressTimer);
@@ -1987,27 +2124,31 @@ export function RemoteViewport({
       const midY = (pts[0]!.lastY + pts[1]!.lastY) / 2;
 
       if (touch.mode === "two_finger_pending") {
-        const distDelta = Math.abs(currDist - touch.twoFingerStartDist);
-        const scaleRatio = currDist / Math.max(1, touch.twoFingerStartDist);
-        const midDelta = Math.hypot(
-          midX - touch.twoFingerStartMidX,
-          midY - touch.twoFingerStartMidY,
-        );
-        if (
-          distDelta >= DESKTOP_PINCH_DIST_THRESHOLD_PX ||
-          scaleRatio >= 1.12 ||
-          scaleRatio <= 0.89
-        ) {
-          touch.mode = "two_finger_zoom_pan";
-          touch.twoFingerLastDist = currDist;
-          touch.twoFingerMidX = midX;
-          touch.twoFingerMidY = midY;
-          return;
-        }
-        if (midDelta >= DESKTOP_SCROLL_MID_THRESHOLD_PX && distDelta < 10) {
+        if (viewStyle === "original") {
           touch.mode = "two_finger_scroll";
         } else {
-          return;
+          const distDelta = Math.abs(currDist - touch.twoFingerStartDist);
+          const scaleRatio = currDist / Math.max(1, touch.twoFingerStartDist);
+          const midDelta = Math.hypot(
+            midX - touch.twoFingerStartMidX,
+            midY - touch.twoFingerStartMidY,
+          );
+          if (
+            distDelta >= DESKTOP_PINCH_DIST_THRESHOLD_PX ||
+            scaleRatio >= 1.12 ||
+            scaleRatio <= 0.89
+          ) {
+            touch.mode = "two_finger_zoom_pan";
+            touch.twoFingerLastDist = currDist;
+            touch.twoFingerMidX = midX;
+            touch.twoFingerMidY = midY;
+            return;
+          }
+          if (midDelta >= DESKTOP_SCROLL_MID_THRESHOLD_PX && distDelta < 10) {
+            touch.mode = "two_finger_scroll";
+          } else {
+            return;
+          }
         }
       }
 
@@ -2341,8 +2482,13 @@ export function RemoteViewport({
         }
       }
 
-      flushDesktopMoveTimer();
-      lastDesktopPointerNormRef.current = { x: norm.x, y: norm.y };
+      if (isLocked) {
+        flushRelativeMouseMove(false);
+        relClickDistAccRef.current = { dx: 0, dy: 0 };
+      } else {
+        flushDesktopMoveTimer();
+        lastDesktopPointerNormRef.current = { x: norm.x, y: norm.y };
+      }
 
       const now = Date.now();
       const prevClick = desktopClickTrackerRef.current;
@@ -2351,8 +2497,9 @@ export function RemoteViewport({
         prevClick &&
         prevClick.button === button &&
         now - prevClick.at <= DESKTOP_MULTI_CLICK_WINDOW_MS &&
-        Math.hypot(e.clientX - prevClick.clientX, e.clientY - prevClick.clientY) <=
-          DESKTOP_MULTI_CLICK_MAX_DIST_PX
+        (isLocked ||
+          Math.hypot(e.clientX - prevClick.clientX, e.clientY - prevClick.clientY) <=
+            DESKTOP_MULTI_CLICK_MAX_DIST_PX)
       ) {
         trackedCount = Math.min(3, prevClick.count + 1);
       }
@@ -2365,7 +2512,7 @@ export function RemoteViewport({
       };
       const clickCount = Math.max(
         1,
-        Math.min(3, e.detail > 1 ? e.detail : trackedCount),
+        Math.min(3, !isLocked && e.detail > 1 ? e.detail : trackedCount),
       );
 
       desktopPressedButtonsRef.current.set(`${e.pointerId}:${button}`, {
@@ -2373,16 +2520,23 @@ export function RemoteViewport({
         button,
         x: norm.x,
         y: norm.y,
+        locked: isLocked,
       });
 
       client.sendCommand(
-        {
-          action: "mouse_down",
-          x: norm.x,
-          y: norm.y,
-          button,
-          clickCount,
-        },
+        isLocked
+          ? {
+              action: "mouse_down",
+              button,
+              clickCount,
+            }
+          : {
+              action: "mouse_down",
+              x: norm.x,
+              y: norm.y,
+              button,
+              clickCount,
+            },
         targetDeviceId,
       );
       return;
@@ -2439,13 +2593,28 @@ export function RemoteViewport({
       }
       if (!isStreamingReady) return;
       if (pointerLockedRef.current) {
-        const dx = Math.round(e.movementX);
-        const dy = Math.round(e.movementY);
-        if (dx !== 0 || dy !== 0) {
-          client.sendCommand(
-            { action: "mouse_move_relative", dx, dy },
-            targetDeviceId,
-          );
+        const rawDx = Number.isFinite(e.movementX) ? e.movementX : 0;
+        const rawDy = Number.isFinite(e.movementY) ? e.movementY : 0;
+        if (rawDx !== 0 || rawDy !== 0) {
+          pendingRelDxRef.current += rawDx;
+          pendingRelDyRef.current += rawDy;
+          relClickDistAccRef.current.dx += rawDx;
+          relClickDistAccRef.current.dy += rawDy;
+          if (
+            desktopClickTrackerRef.current &&
+            Math.hypot(
+              relClickDistAccRef.current.dx,
+              relClickDistAccRef.current.dy,
+            ) > DESKTOP_MULTI_CLICK_MAX_DIST_PX
+          ) {
+            desktopClickTrackerRef.current = null;
+          }
+          if (relMoveTimerRef.current === null) {
+            relMoveTimerRef.current = window.setTimeout(() => {
+              relMoveTimerRef.current = null;
+              flushRelativeMouseMove(false);
+            }, 12);
+          }
         }
         return;
       }
@@ -2491,6 +2660,7 @@ export function RemoteViewport({
       const button = mapMouseButton(e.button);
       if (!button) return;
       const key = `${e.pointerId}:${button}`;
+      const trackedEntry = desktopPressedButtonsRef.current.get(key);
       const hadButton = desktopPressedButtonsRef.current.delete(key);
       try {
         if (e.currentTarget.hasPointerCapture(e.pointerId)) {
@@ -2499,11 +2669,23 @@ export function RemoteViewport({
       } catch {
         // Ignore release failures
       }
-      if (!isStreamingReady && !hadButton) return;
-      const norm = pointerLockedRef.current
-        ? lastDesktopPointerNormRef.current
-        : (mapClientToNormalized(e.clientX, e.clientY) ??
-          lastDesktopPointerNormRef.current);
+      if (!canMouse || !hadButton) return;
+      const isLockedRelease =
+        pointerLockedRef.current || Boolean(trackedEntry?.locked);
+      if (isLockedRelease) {
+        flushRelativeMouseMove(false);
+        client.sendCommand(
+          {
+            action: "mouse_up",
+            button,
+          },
+          targetDeviceId,
+        );
+        return;
+      }
+      const norm =
+        mapClientToNormalized(e.clientX, e.clientY) ??
+        lastDesktopPointerNormRef.current;
       flushDesktopMoveTimer();
       lastDesktopPointerNormRef.current = { x: norm.x, y: norm.y };
       client.sendCommand(
@@ -2541,12 +2723,17 @@ export function RemoteViewport({
         if (entry.pointerId === e.pointerId) {
           desktopPressedButtonsRef.current.delete(key);
           client.sendCommand(
-            {
-              action: "mouse_up",
-              x: entry.x,
-              y: entry.y,
-              button: entry.button,
-            },
+            entry.locked || pointerLockedRef.current
+              ? {
+                  action: "mouse_up",
+                  button: entry.button,
+                }
+              : {
+                  action: "mouse_up",
+                  x: entry.x,
+                  y: entry.y,
+                  button: entry.button,
+                },
             targetDeviceId,
           );
         }
@@ -2583,16 +2770,28 @@ export function RemoteViewport({
   // Non-passive wheel listener for remote PC targets so preventDefault blocks browser scroll/back-swipe cleanly
   const desktopWheelHandlerRef = useRef<(e: WheelEvent) => void>(() => {});
   desktopWheelHandlerRef.current = (e: WheelEvent) => {
-    if (viewOnly || !isStreamingReady || !canMouse) return;
+    if (viewOnly || !isStreamingReady || !canMouse || whiteboardActive) return;
     e.preventDefault();
-    const norm = pointerLockedRef.current
-      ? { ...lastDesktopPointerNormRef.current, inside: true }
-      : mapClientToNormalized(e.clientX, e.clientY);
-    if (!norm || !norm.inside) return;
     const modeScale = e.deltaMode === 1 ? 32 : e.deltaMode === 2 ? 400 : 1;
     const deltaX = Math.round(e.deltaX * modeScale);
     const deltaY = Math.round(e.deltaY * modeScale);
     if (deltaX === 0 && deltaY === 0) return;
+
+    if (pointerLockedRef.current) {
+      flushRelativeMouseMove(false);
+      client.sendCommand(
+        {
+          action: "mouse_wheel",
+          deltaX,
+          deltaY,
+        },
+        targetDeviceId,
+      );
+      return;
+    }
+
+    const norm = mapClientToNormalized(e.clientX, e.clientY);
+    if (!norm || !norm.inside) return;
     client.sendCommand(
       {
         action: "mouse_wheel",
@@ -2605,19 +2804,9 @@ export function RemoteViewport({
     );
   };
 
-  useEffect(() => {
-    if (!isDesktopTarget) return;
-    const surface = surfaceRef.current;
-    if (!surface) return;
-    const listener = (e: WheelEvent) => desktopWheelHandlerRef.current(e);
-    surface.addEventListener("wheel", listener, { passive: false });
-    return () => {
-      surface.removeEventListener("wheel", listener);
-    };
-  }, [isDesktopTarget]);
-
-  // P0-3 & P0-4: Accurate letterbox wheel coordinates + normalized deltaMode + strict non-overlapping cooldown
-  function handleWheel(e: React.WheelEvent<HTMLDivElement>) {
+  // P0-3 & P0-4: Accurate letterbox wheel coordinates + normalized deltaMode + strict non-overlapping cooldown (non-passive so 1:1 original never dual-scrolls)
+  const androidWheelHandlerRef = useRef<(e: WheelEvent) => void>(() => {});
+  androidWheelHandlerRef.current = (e: WheelEvent) => {
     if (viewOnly || isDesktopTarget || e.ctrlKey || !isStreamingReady) return;
     const targetEl = getActiveMediaElement();
     if (!targetEl) return;
@@ -2634,6 +2823,8 @@ export function RemoteViewport({
       effectiveH,
     );
     if (!norm.inside) return;
+
+    e.preventDefault();
 
     const modeScale = e.deltaMode === 1 ? 32 : e.deltaMode === 2 ? 400 : 1;
     const acc = wheelAccumRef.current;
@@ -2689,7 +2880,23 @@ export function RemoteViewport({
     }
 
     acc.timer = window.setTimeout(dispatchWheelSwipe, remainingCooldown);
-  }
+  };
+
+  useEffect(() => {
+    const surface = surfaceRef.current;
+    if (!surface) return;
+    const listener = (e: WheelEvent) => {
+      if (isDesktopTargetRef.current) {
+        desktopWheelHandlerRef.current(e);
+      } else {
+        androidWheelHandlerRef.current(e);
+      }
+    };
+    surface.addEventListener("wheel", listener, { passive: false });
+    return () => {
+      surface.removeEventListener("wheel", listener);
+    };
+  }, []);
 
   const handleToggleDock = useCallback(() => {
     setDockExpanded((prev) => {
@@ -2763,7 +2970,9 @@ export function RemoteViewport({
     }
 
     let stream: MediaStream | null = null;
+    let isSynthetic = false;
     if (
+      clientState.activeTransport === "webrtc" &&
       clientState.mediaStream &&
       clientState.mediaStream.getTracks().length > 0
     ) {
@@ -2774,6 +2983,12 @@ export function RemoteViewport({
       typeof canvasRef.current.captureStream === "function"
     ) {
       stream = canvasRef.current.captureStream(30);
+      isSynthetic = true;
+    } else if (
+      clientState.mediaStream &&
+      clientState.mediaStream.getTracks().length > 0
+    ) {
+      stream = clientState.mediaStream;
     }
 
     if (!stream || stream.getTracks().length === 0) {
@@ -2791,11 +3006,26 @@ export function RemoteViewport({
           onShowToastRef.current?.("error", err.message || "本地录屏异常中断");
           void stopAndSaveRecording();
         },
+        onStreamEnded: () => {
+          void stopAndSaveRecording("视频流已中断");
+        },
       });
+      recordedStreamRef.current = stream;
+      recordedStreamIsSyntheticRef.current = isSynthetic;
+      recordedTransportRef.current = clientState.activeTransport;
       setIsRecording(true);
       setRecordingDurationSec(0);
       onShowToast?.("info", "已开始本地录屏，点击红色 REC 按钮即可停止并保存");
     } catch (err) {
+      if (isSynthetic) {
+        for (const track of stream.getTracks()) {
+          try {
+            track.stop();
+          } catch {
+            // Ignore track stop errors
+          }
+        }
+      }
       const msg = err instanceof Error ? err.message : "启动本地录屏失败";
       onShowToast?.("error", msg);
     }
@@ -3438,7 +3668,12 @@ export function RemoteViewport({
   const isPhonePreset = desktopWindowState?.preset === "phone";
   const remoteDisplays = device?.displays ?? [];
   const hasMultiDisplays = isDesktopTarget && remoteDisplays.length > 1;
-  const virtualCursorPosition = useMemo(() => {
+  const [virtualCursorPosition, setVirtualCursorPosition] = useState<{
+    left: number;
+    top: number;
+  } | null>(null);
+
+  useLayoutEffect(() => {
     if (
       !isDesktopTarget ||
       touchInputMode !== "trackpad" ||
@@ -3446,50 +3681,46 @@ export function RemoteViewport({
       surfaceSize.width <= 0 ||
       surfaceSize.height <= 0
     ) {
-      return null;
+      setVirtualCursorPosition((prev) => (prev === null ? prev : null));
+      return;
     }
-    const contentW =
-      clientState.activeTransport === "webrtc" &&
-      videoRef.current &&
-      videoRef.current.videoWidth > 0
-        ? videoRef.current.videoWidth
-        : clientState.activeTransport === "ws-jpeg" &&
-            canvasRef.current &&
-            canvasRef.current.width > 0
-          ? canvasRef.current.width
-          : clientState.screenWidth || 1920;
-    const contentH =
-      clientState.activeTransport === "webrtc" &&
-      videoRef.current &&
-      videoRef.current.videoHeight > 0
-        ? videoRef.current.videoHeight
-        : clientState.activeTransport === "ws-jpeg" &&
-            canvasRef.current &&
-            canvasRef.current.height > 0
-          ? canvasRef.current.height
-          : clientState.screenHeight || 1080;
-    const box = computeContentRect(
-      surfaceSize.width,
-      surfaceSize.height,
-      contentW,
-      contentH,
+    const wrapper = viewportWrapperRef.current ?? surfaceRef.current;
+    const box = getSurfaceContentBox();
+    if (!wrapper || !box || box.contentBox.width <= 0 || box.contentBox.height <= 0) {
+      setVirtualCursorPosition((prev) => (prev === null ? prev : null));
+      return;
+    }
+    const wRect = wrapper.getBoundingClientRect();
+    const nextLeft =
+      box.rect.left -
+      wRect.left +
+      box.contentBox.left +
+      virtualCursor.x * box.contentBox.width;
+    const nextTop =
+      box.rect.top -
+      wRect.top +
+      box.contentBox.top +
+      virtualCursor.y * box.contentBox.height;
+    setVirtualCursorPosition((prev) =>
+      prev &&
+      Math.abs(prev.left - nextLeft) < 0.25 &&
+      Math.abs(prev.top - nextTop) < 0.25
+        ? prev
+        : { left: nextLeft, top: nextTop },
     );
-    const cx = surfaceSize.width / 2;
-    const cy = surfaceSize.height / 2;
-    const baseLeft = box.left + virtualCursor.x * box.width;
-    const baseTop = box.top + virtualCursor.y * box.height;
-    return {
-      left: cx + viewPan.x + (baseLeft - cx) * viewZoom,
-      top: cy + viewPan.y + (baseTop - cy) * viewZoom,
-    };
   }, [
     isDesktopTarget,
     touchInputMode,
     isStreamingReady,
     hasVideoFrame,
     hasCanvasFrame,
+    viewStyle,
+    mediaSize.width,
+    mediaSize.height,
     surfaceSize.width,
     surfaceSize.height,
+    surfaceScroll.left,
+    surfaceScroll.top,
     clientState.activeTransport,
     clientState.screenWidth,
     clientState.screenHeight,
@@ -3516,10 +3747,12 @@ export function RemoteViewport({
     !viewOnly &&
     !pointerLocked &&
     !whiteboardActive
-      ? mapRemoteCursorToCss(
-          clientState.remoteCursorShape,
-          clientState.remoteCursorVisible,
-        )
+      ? !canMouse
+        ? "not-allowed"
+        : mapRemoteCursorToCss(
+            clientState.remoteCursorShape,
+            clientState.remoteCursorVisible,
+          )
       : undefined;
 
   const dpr =
@@ -3538,6 +3771,32 @@ export function RemoteViewport({
   const originalCssH = Math.max(1, Math.round(rawOriginalH / dpr));
   const mediaObjectFitClass =
     viewStyle === "adaptive" ? "object-contain" : "object-fill";
+  const adaptiveMediaBox = useMemo(() => {
+    if (
+      viewStyle !== "adaptive" ||
+      !isDesktopTarget ||
+      surfaceSize.width <= 0 ||
+      surfaceSize.height <= 0
+    ) {
+      return null;
+    }
+    return computeContentRect(
+      surfaceSize.width,
+      surfaceSize.height,
+      rawOriginalW,
+      rawOriginalH,
+    );
+  }, [
+    viewStyle,
+    isDesktopTarget,
+    surfaceSize.width,
+    surfaceSize.height,
+    rawOriginalW,
+    rawOriginalH,
+  ]);
+  const showViewOnlyGrabCursor =
+    viewOnly &&
+    (viewStyle === "original" || (isDesktopTarget && viewZoom > 1.01));
 
   return (
     <div
@@ -3863,98 +4122,141 @@ export function RemoteViewport({
         </header>
       )}
 
-      {/* Pitch-Black OLED Remote Screen Surface */}
+      {/* Pitch-Black OLED Remote Screen Surface + Non-Scrolling Overlay Wrapper */}
       <div
-        ref={surfaceRef}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerCancel}
-        onMouseDown={handleMouseDown}
-        onContextMenu={handleContextMenu}
-        onAuxClick={handleAuxClick}
-        onWheel={isDesktopTarget ? undefined : handleWheel}
-        style={activeSurfaceCursor ? { cursor: activeSurfaceCursor } : undefined}
-        className={`relative w-full ${
-          viewStyle === "original"
-            ? `overflow-auto ${viewOnly ? "cursor-grab active:cursor-grabbing" : "touch-none"}`
-            : "overflow-hidden touch-none"
-        } ${showDesktopTopBar || hasTabBar ? "min-h-0 flex-1" : "h-full"}`}
+        ref={viewportWrapperRef}
+        className={`relative w-full overflow-hidden ${
+          showDesktopTopBar || hasTabBar ? "min-h-0 flex-1" : "h-full"
+        }`}
       >
         <div
-          ref={mediaStageRef}
-          style={
-            viewStyle !== "original" &&
-            isDesktopTarget &&
-            (viewZoom > 1 || viewPan.x !== 0 || viewPan.y !== 0)
-              ? {
-                  transform: `translate3d(${viewPan.x}px, ${viewPan.y}px, 0) scale(${viewZoom})`,
-                  transformOrigin: "center center",
-                  willChange: "transform",
-                }
-              : undefined
-          }
-          className={
+          ref={surfaceRef}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerCancel}
+          onMouseDown={handleMouseDown}
+          onContextMenu={handleContextMenu}
+          onAuxClick={handleAuxClick}
+          onScroll={(e) => {
+            if (
+              viewStyle === "original" &&
+              isDesktopTarget &&
+              touchInputMode === "trackpad"
+            ) {
+              const target = e.currentTarget;
+              setSurfaceScroll((prev) =>
+                prev.left === target.scrollLeft && prev.top === target.scrollTop
+                  ? prev
+                  : { left: target.scrollLeft, top: target.scrollTop },
+              );
+            }
+          }}
+          className={`relative h-full w-full ${
             viewStyle === "original"
-              ? "pointer-events-none flex min-h-full min-w-full items-center justify-center"
-              : "pointer-events-none absolute inset-0 h-full w-full"
-          }
+              ? `overflow-auto ${
+                  showViewOnlyGrabCursor
+                    ? "cursor-grab active:cursor-grabbing"
+                    : "touch-none"
+                }`
+              : `overflow-hidden touch-none ${
+                  showViewOnlyGrabCursor
+                    ? "cursor-grab active:cursor-grabbing"
+                    : ""
+                }`
+          }`}
         >
           <div
+            ref={mediaStageRef}
             style={
-              viewStyle === "original"
-                ? { width: originalCssW, height: originalCssH }
+              viewStyle !== "original" &&
+              isDesktopTarget &&
+              (viewZoom > 1 || viewPan.x !== 0 || viewPan.y !== 0)
+                ? {
+                    transform: `translate3d(${viewPan.x}px, ${viewPan.y}px, 0) scale(${viewZoom})`,
+                    transformOrigin: "center center",
+                    willChange: "transform",
+                  }
                 : undefined
             }
             className={
               viewStyle === "original"
-                ? "pointer-events-none relative shrink-0"
+                ? "pointer-events-none flex min-h-full min-w-full w-max h-max"
                 : "pointer-events-none absolute inset-0 h-full w-full"
             }
           >
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              muted={!isDesktopTarget || audioMuted}
-              disablePictureInPicture
-              disableRemotePlayback
-              style={{ willChange: "transform" }}
-              onLoadedMetadata={(e) => {
-                const el = e.currentTarget;
-                if (el.videoWidth > 0 && el.videoHeight > 0) {
-                  markVideoFrameReady();
-                }
-              }}
-              onLoadedData={(e) => {
-                const el = e.currentTarget;
-                if (el.videoWidth > 0 && el.videoHeight > 0) {
-                  markVideoFrameReady();
-                }
-              }}
-              onPlaying={(e) => {
-                const el = e.currentTarget;
-                if (el.videoWidth > 0 && el.videoHeight > 0) {
-                  markVideoFrameReady();
-                }
-              }}
-              onResize={(e) => {
-                const el = e.currentTarget;
-                if (el.videoWidth > 0 && el.videoHeight > 0) {
-                  markVideoFrameReady();
-                }
-              }}
-              className={`pointer-events-none absolute inset-0 h-full w-full ${mediaObjectFitClass} ${
-                isWebRtcVisible ? "opacity-100" : "opacity-0"
-              }`}
-            />
+            <div
+              style={
+                viewStyle === "original"
+                  ? {
+                      width: originalCssW,
+                      height: originalCssH,
+                      cursor: activeSurfaceCursor,
+                    }
+                  : adaptiveMediaBox
+                    ? {
+                        left: adaptiveMediaBox.left,
+                        top: adaptiveMediaBox.top,
+                        width: adaptiveMediaBox.width,
+                        height: adaptiveMediaBox.height,
+                        cursor: activeSurfaceCursor,
+                      }
+                    : activeSurfaceCursor
+                      ? { cursor: activeSurfaceCursor }
+                      : undefined
+              }
+              className={
+                viewStyle === "original"
+                  ? "pointer-events-auto relative m-auto shrink-0"
+                  : adaptiveMediaBox
+                    ? "pointer-events-auto absolute"
+                    : "pointer-events-auto absolute inset-0 h-full w-full"
+              }
+            >
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted={!isDesktopTarget || audioMuted}
+                disablePictureInPicture
+                disableRemotePlayback
+                style={{ willChange: "transform" }}
+                onLoadedMetadata={(e) => {
+                  const el = e.currentTarget;
+                  if (el.videoWidth > 0 && el.videoHeight > 0) {
+                    markVideoFrameReady();
+                  }
+                }}
+                onLoadedData={(e) => {
+                  const el = e.currentTarget;
+                  if (el.videoWidth > 0 && el.videoHeight > 0) {
+                    markVideoFrameReady();
+                  }
+                }}
+                onPlaying={(e) => {
+                  const el = e.currentTarget;
+                  if (el.videoWidth > 0 && el.videoHeight > 0) {
+                    markVideoFrameReady();
+                  }
+                }}
+                onResize={(e) => {
+                  const el = e.currentTarget;
+                  if (el.videoWidth > 0 && el.videoHeight > 0) {
+                    markVideoFrameReady();
+                  }
+                }}
+                className={`pointer-events-none absolute inset-0 h-full w-full ${mediaObjectFitClass} ${
+                  isWebRtcVisible ? "opacity-100" : "opacity-0"
+                }`}
+              />
 
-            <canvas
-              ref={canvasRef}
-              className={`pointer-events-none absolute inset-0 h-full w-full ${mediaObjectFitClass} ${
-                !isWebRtcVisible && hasCanvasFrame ? "opacity-100" : "opacity-0"
-              }`}
-            />
+              <canvas
+                ref={canvasRef}
+                className={`pointer-events-none absolute inset-0 h-full w-full ${mediaObjectFitClass} ${
+                  !isWebRtcVisible && hasCanvasFrame ? "opacity-100" : "opacity-0"
+                }`}
+              />
+            </div>
           </div>
         </div>
 
@@ -3962,7 +4264,7 @@ export function RemoteViewport({
           <span
             key={ripple.id}
             style={{ left: ripple.x, top: ripple.y }}
-            className="animate-touch-ripple pointer-events-none absolute h-10 w-10 rounded-full border-2 border-[#60A5FA] bg-[#2563EB]/20"
+            className="animate-touch-ripple pointer-events-none absolute z-20 h-10 w-10 rounded-full border-2 border-[#60A5FA] bg-[#2563EB]/20"
           />
         ))}
 
@@ -3987,7 +4289,8 @@ export function RemoteViewport({
         {/* Whiteboard Annotation Layer (Desktop targets) */}
         {isDesktopTarget && isStreamingReady && (
           <WhiteboardLayer
-            active={whiteboardActive}
+            active={whiteboardActive && isActiveTab}
+            resetKey={`${clientState.sessionId ?? ""}:${device?.activeDisplayId ?? ""}`}
             topOffsetPx={showDesktopTopBar ? 12 : 52}
             mapClientToNormalized={mapClientToNormalized}
             getSurfaceContentBox={getSurfaceContentBox}
@@ -4052,14 +4355,18 @@ export function RemoteViewport({
         </div>
       )}
 
-      {/* Desktop Floating Zoom Control Badge (shown when zoomed > 1.05x in adaptive mode) */}
-      {isDesktopTarget && isStreamingReady && viewStyle === "adaptive" && viewZoom > 1.05 && (
+      {/* Desktop Floating Zoom Control Badge (shown when zoomed > 1.05x in adaptive or stretch mode) */}
+      {isDesktopTarget && isStreamingReady && viewStyle !== "original" && viewZoom > 1.05 && (
         <div
-          className={`pointer-events-none ${overlayPosClass} left-3 top-0 z-50 flex items-center gap-1.5`}
+          className={`pointer-events-none ${overlayPosClass} left-3 top-0 z-50 flex items-center gap-1.5 ${
+            !showDesktopTopBar && !isFloatingChrome ? "mt-11 sm:mt-0" : ""
+          }`}
           style={{
             paddingTop: showDesktopTopBar
               ? "3.25rem"
-              : "max(0.75rem, env(safe-area-inset-top))",
+              : hasTabBar
+                ? "0.75rem"
+                : "max(0.75rem, env(safe-area-inset-top))",
           }}
         >
           <div className="pointer-events-auto inline-flex items-center gap-1 rounded-full border border-[#2C313D] bg-[#111318] px-2 py-1 text-xs text-zinc-100 shadow-[0_8px_24px_rgba(0,0,0,0.65)]">
@@ -4116,7 +4423,7 @@ export function RemoteViewport({
           (isDesktopTarget && clientState.unreadChatCount > 0) ||
           (isDesktopTarget && isStreamingReady && viewZoom <= 1.05)) && (
           <div
-            className={`pointer-events-none ${overlayPosClass} left-3 top-0 z-50 flex flex-wrap items-center gap-1.5`}
+            className={`pointer-events-none ${overlayPosClass} left-3 top-0 z-50 mt-11 flex max-w-[calc(100%-1.5rem)] flex-wrap items-center gap-1.5 sm:mt-0 sm:max-w-[calc(100%-18rem)]`}
             style={{ paddingTop: hasTabBar ? "0.75rem" : "max(0.75rem, env(safe-area-inset-top))" }}
           >
             {viewOnly && (
@@ -4253,6 +4560,7 @@ export function RemoteViewport({
           isDesktopTarget={isDesktopTarget}
           desktopApp={desktopApp}
           embedded={hasTabBar}
+          topInsetPx={macDesktop && !hasTabBar ? 28 : 0}
           viewStyle={viewStyle}
           viewOnly={viewOnly}
           isRecording={isRecording}
@@ -4263,6 +4571,8 @@ export function RemoteViewport({
             isDesktopTarget ? isPrivacyActive : Boolean(device?.blackScreenActive)
           }
           isBlockInputActive={isBlockInputActive}
+          isPointerLocked={pointerLocked}
+          pointerLockDisabled={!isStreamingReady || viewOnly || !canMouse}
           isWhiteboardActive={whiteboardActive}
           terminalDisabled={!canTerminal}
           unreadChatCount={clientState.unreadChatCount}
@@ -4272,6 +4582,12 @@ export function RemoteViewport({
           onToggleViewOnly={handleToggleViewOnly}
           onToggleRecording={handleToggleRecording}
           onToggleAudio={isDesktopTarget ? handleToggleDesktopAudio : undefined}
+          onOpenQuality={
+            isDesktopTarget
+              ? () => setActivePanel((p) => (p === "quality" ? "none" : "quality"))
+              : undefined
+          }
+          onTogglePointerLock={isDesktopTarget ? handleTogglePointerLock : undefined}
           onOpenShortcuts={() =>
             setActivePanel((p) =>
               isDesktopTarget
@@ -4294,6 +4610,14 @@ export function RemoteViewport({
           onToggleBlockInput={isDesktopTarget ? handleToggleBlockInput : undefined}
           onToggleWhiteboard={isDesktopTarget ? handleToggleWhiteboard : undefined}
           onOpenChat={isDesktopTarget ? handleOpenChat : undefined}
+          onAndroidBack={!isDesktopTarget ? () => sendKey("back") : undefined}
+          onAndroidHome={!isDesktopTarget ? () => sendKey("home") : undefined}
+          onAndroidRecents={!isDesktopTarget ? () => sendKey("recents") : undefined}
+          onOpenUnlock={
+            !isDesktopTarget
+              ? () => setActivePanel((p) => (p === "unlock" ? "none" : "unlock"))
+              : undefined
+          }
           onTogglePrivacyOrBlackScreen={() => {
             if (isDesktopTarget) {
               handleTogglePrivacyScreen();
@@ -4850,6 +5174,7 @@ export function RemoteViewport({
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={(e) => {
+                if (e.nativeEvent.isComposing || e.keyCode === 229) return;
                 if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
                   e.preventDefault();
                   handleSendText();
@@ -4873,16 +5198,30 @@ export function RemoteViewport({
               <div className="flex items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={() => sendKey("backspace")}
-                  className="btn-shell inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs"
+                  disabled={isDesktopTarget && !canKeyboard}
+                  onClick={() => {
+                    if (isDesktopTarget && !canKeyboard) {
+                      onShowToast?.("warn", "被控端当前会话未开放键盘输入权限");
+                      return;
+                    }
+                    sendKey("backspace");
+                  }}
+                  className="btn-shell inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <Delete className="h-3.5 w-3.5" />
                   退格
                 </button>
                 <button
                   type="button"
-                  onClick={() => sendKey("enter")}
-                  className="btn-shell inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs"
+                  disabled={isDesktopTarget && !canKeyboard}
+                  onClick={() => {
+                    if (isDesktopTarget && !canKeyboard) {
+                      onShowToast?.("warn", "被控端当前会话未开放键盘输入权限");
+                      return;
+                    }
+                    sendKey("enter");
+                  }}
+                  className="btn-shell inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <CornerDownLeft className="h-3.5 w-3.5" />
                   回车
@@ -4893,7 +5232,7 @@ export function RemoteViewport({
             <div className="grid grid-cols-2 gap-2">
               <button
                 type="button"
-                disabled={!inputText}
+                disabled={!inputText || (isDesktopTarget && !canKeyboard)}
                 onClick={handleSendText}
                 className="btn-primary flex h-10 items-center justify-center gap-1.5 rounded-lg text-xs font-medium disabled:cursor-not-allowed"
               >
@@ -4903,7 +5242,7 @@ export function RemoteViewport({
 
               <button
                 type="button"
-                disabled={!inputText}
+                disabled={!inputText || (isDesktopTarget && !canClipboard)}
                 onClick={handlePushClipboard}
                 className="btn-shell flex h-10 items-center justify-center gap-1.5 rounded-lg text-xs font-medium disabled:opacity-40"
               >
@@ -5013,6 +5352,10 @@ export function RemoteViewport({
             targetPlatform={device?.osPlatform}
             onSendKeyEvent={(cmd) => {
               if (guardViewOnly()) return;
+              if (!canKeyboard) {
+                onShowToast?.("warn", "被控端当前会话未开放键盘输入权限");
+                return;
+              }
               client.sendCommand(cmd, targetDeviceId);
             }}
             onClose={() => setActivePanel("none")}
@@ -5084,13 +5427,14 @@ export function RemoteViewport({
         </DarkSheet>
       )}
 
-      {/* Remote Interactive Terminal Sheet (Desktop Targets) */}
-      {isActiveTab && isDesktopTarget && activePanel === "terminal" && (
+      {/* Remote Interactive Terminal Sheet (Desktop Targets) - kept mounted while hidden in background tabs to preserve PTY */}
+      {isDesktopTarget && activePanel === "terminal" && (
         <RemoteTerminalSheet
           client={client}
           terminalReady={clientState.terminalReady}
           deviceName={device?.name || device?.model || "远端电脑"}
           disabled={!canTerminal}
+          isActiveTab={isActiveTab}
           onShowToast={onShowToast}
           onClose={() => setActivePanel("none")}
         />
@@ -5219,8 +5563,15 @@ export function RemoteViewport({
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
-                  onClick={() => setActivePanel("files")}
-                  className="flex h-10 items-center justify-between rounded-lg border border-[#2C313D] bg-[#191D26] px-3 text-xs font-medium text-zinc-100 transition hover:bg-[#232836]"
+                  disabled={!canFileTransfer}
+                  onClick={() => {
+                    if (!canFileTransfer) {
+                      onShowToast?.("warn", "被控端当前会话未开放文件管理权限");
+                      return;
+                    }
+                    setActivePanel("files");
+                  }}
+                  className="flex h-10 items-center justify-between rounded-lg border border-[#2C313D] bg-[#191D26] px-3 text-xs font-medium text-zinc-100 transition hover:bg-[#232836] disabled:cursor-not-allowed disabled:opacity-45"
                 >
                   <span className="inline-flex items-center gap-1.5">
                     <FolderOpen
@@ -6406,6 +6757,7 @@ function DarkSheet({
   useEffect(() => {
     if (!active) return;
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Escape") {
         e.preventDefault();
         onClose();

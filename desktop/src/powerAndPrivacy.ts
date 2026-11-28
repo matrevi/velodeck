@@ -467,7 +467,10 @@ export class PrivacyCurtainManager {
 
     if (this.platform === "darwin") {
       win.setAlwaysOnTop(true, "screen-saver", ignoreMouseEvents ? 0 : 1);
-      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      win.setVisibleOnAllWorkspaces(true, {
+        visibleOnFullScreen: true,
+        skipTransformProcessType: true,
+      });
     } else {
       win.setAlwaysOnTop(true, "screen-saver");
     }

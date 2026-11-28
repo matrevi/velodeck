@@ -4,6 +4,7 @@ import type { WhiteboardPoint, WhiteboardStroke } from "@velodeck/protocol";
 
 export interface WhiteboardLayerProps {
   active: boolean;
+  resetKey?: string;
   topOffsetPx?: number;
   mapClientToNormalized: (
     clientX: number,
@@ -24,7 +25,32 @@ interface FadingStroke extends WhiteboardStroke {
 
 const STROKE_LIFETIME_MS = 8_000;
 const STROKE_FADE_MS = 1_500;
-const MAX_POINTS_PER_STROKE = 256;
+const MAX_IN_DRAG_POINTS = 1024;
+const MAX_COMMIT_POINTS = 256;
+
+function downsamplePoints(
+  points: WhiteboardPoint[],
+  maxCount: number,
+): WhiteboardPoint[] {
+  if (points.length <= maxCount) {
+    return points.slice();
+  }
+  if (maxCount <= 1) {
+    return points.length > 0 ? [points[0]!] : [];
+  }
+  const lastIdx = points.length - 1;
+  if (maxCount === 2) {
+    return [points[0]!, points[lastIdx]!];
+  }
+  const result: WhiteboardPoint[] = [points[0]!];
+  const step = lastIdx / (maxCount - 1);
+  for (let i = 1; i < maxCount - 1; i += 1) {
+    const idx = Math.min(lastIdx - 1, Math.max(1, Math.round(i * step)));
+    result.push(points[idx]!);
+  }
+  result.push(points[lastIdx]!);
+  return result;
+}
 
 const INK_COLORS: Array<{ hex: string; label: string }> = [
   { hex: "#EF4444", label: "红色" },
@@ -54,6 +80,7 @@ function clampUnit(v: number): number {
 
 export function WhiteboardLayer({
   active,
+  resetKey,
   topOffsetPx = 12,
   mapClientToNormalized,
   getSurfaceContentBox,
@@ -204,11 +231,27 @@ export function WhiteboardLayer({
   }, []);
 
   useEffect(() => {
+    activeStrokeRef.current = null;
+    fadingStrokesRef.current = [];
+    setHasVisibleStrokes(false);
+    if (rafRef.current !== null) {
+      window.cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }, [resetKey]);
+
+  useEffect(() => {
     if (!active) {
       activeStrokeRef.current = null;
       return;
     }
     const handleKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
@@ -266,14 +309,16 @@ export function WhiteboardLayer({
 
     const norm = mapClientToNormalized(e.clientX, e.clientY);
     if (!norm) return;
-    const pts = current.stroke.points;
-    if (pts.length >= MAX_POINTS_PER_STROKE) return;
-
     const nx = clampUnit(norm.x);
     const ny = clampUnit(norm.y);
+    let pts = current.stroke.points;
     const prev = pts[pts.length - 1];
     if (prev && Math.hypot(nx - prev.x, ny - prev.y) < 0.0025) {
       return;
+    }
+    if (pts.length >= MAX_IN_DRAG_POINTS) {
+      pts = downsamplePoints(pts, Math.floor(MAX_IN_DRAG_POINTS / 2));
+      current.stroke.points = pts;
     }
     pts.push({ x: nx, y: ny });
     scheduleRender();
@@ -295,12 +340,20 @@ export function WhiteboardLayer({
     const finished = current.stroke;
     activeStrokeRef.current = null;
     if (!cancelled && finished.points.length > 0) {
-      fadingStrokesRef.current.push({
+      const committedPoints = downsamplePoints(
+        finished.points,
+        MAX_COMMIT_POINTS,
+      );
+      const committedStroke: WhiteboardStroke = {
         ...finished,
-        points: [...finished.points],
+        points: committedPoints,
+      };
+      fadingStrokesRef.current.push({
+        ...committedStroke,
+        points: [...committedPoints],
         createdAt: performance.now(),
       });
-      onCommitStroke(finished);
+      onCommitStroke(committedStroke);
     }
     scheduleRender();
   }
@@ -316,6 +369,13 @@ export function WhiteboardLayer({
       onPointerMove={active ? handlePointerMove : undefined}
       onPointerUp={active ? (e) => finishStroke(e, false) : undefined}
       onPointerCancel={active ? (e) => finishStroke(e, true) : undefined}
+      onWheel={
+        active
+          ? (e) => {
+              e.stopPropagation();
+            }
+          : undefined
+      }
       className={`absolute inset-0 z-30 select-none ${
         active ? "cursor-crosshair touch-none" : "pointer-events-none"
       }`}

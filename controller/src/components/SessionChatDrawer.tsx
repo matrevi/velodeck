@@ -34,20 +34,34 @@ export function SessionChatDrawer({
   const [draft, setDraft] = useState("");
   const listRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const isNearBottomRef = useRef(true);
+  const hasInitialScrolledRef = useRef(false);
+  const isComposingRef = useRef(false);
+
+  const lastMessage =
+    messages.length > 0 ? messages[messages.length - 1] : undefined;
+  const lastMessageId = lastMessage?.id;
+  const lastMessageSender = lastMessage?.sender;
 
   useEffect(() => {
     onMarkRead();
-  }, [onMarkRead, messages.length]);
+  }, [onMarkRead, messages.length, lastMessageId]);
 
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [messages.length]);
+    const isOwnMessage = lastMessageSender === "controller";
+    if (!hasInitialScrolledRef.current || isOwnMessage || isNearBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+      isNearBottomRef.current = true;
+      hasInitialScrolledRef.current = true;
+    }
+  }, [messages.length, lastMessageId, lastMessageSender]);
 
   useEffect(() => {
-    window.setTimeout(() => inputRef.current?.focus(), 30);
+    const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 30);
     const handleKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
@@ -55,11 +69,22 @@ export function SessionChatDrawer({
       }
     };
     window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener("keydown", handleKey);
+    };
   }, [onClose]);
+
+  function handleListScroll() {
+    const el = listRef.current;
+    if (!el) return;
+    isNearBottomRef.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight <= 64;
+  }
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (isComposingRef.current) return;
     const trimmed = draft.trim();
     if (!trimmed || disabled) return;
     if (onSendMessage(trimmed)) {
@@ -110,6 +135,7 @@ export function SessionChatDrawer({
         {/* Message List */}
         <div
           ref={listRef}
+          onScroll={handleListScroll}
           className="min-h-0 flex-1 space-y-2.5 overflow-y-auto bg-[#0B0D12] p-3.5 select-text"
         >
           {messages.length === 0 ? (
@@ -139,7 +165,7 @@ export function SessionChatDrawer({
                     <span className="font-mono">{formatChatTime(msg.ts)}</span>
                   </div>
                   <div
-                    className={`max-w-[85%] break-words rounded-xl border px-3 py-2 text-xs leading-relaxed ${
+                    className={`max-w-[85%] whitespace-pre-wrap break-words rounded-xl border px-3 py-2 text-xs leading-relaxed ${
                       isLocal
                         ? "border-[#2563EB] bg-[#2563EB] text-white"
                         : "border-[#2C313D] bg-[#191D26] text-zinc-100"
@@ -164,11 +190,25 @@ export function SessionChatDrawer({
             disabled={disabled}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => e.stopPropagation()}
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              isComposingRef.current = false;
+            }}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.nativeEvent.isComposing || e.keyCode === 229) {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                }
+                return;
+              }
+            }}
             placeholder={
               disabled ? "当前连接暂不支持发送消息" : "输入消息，按 Enter 发送..."
             }
-            maxLength={2000}
+            maxLength={1000}
             className="h-9 min-w-0 flex-1 rounded-lg border border-[#2C313D] bg-[#0B0D12] px-3 text-xs text-white placeholder:text-zinc-500 focus:border-[#2563EB] focus:outline-none disabled:opacity-50"
           />
           <button

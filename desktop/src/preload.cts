@@ -33,6 +33,7 @@ export interface DesktopDisplayInfo {
   width: number;
   height: number;
   primary: boolean;
+  scaleFactor?: number;
 }
 
 export interface DesktopHostPermissions {

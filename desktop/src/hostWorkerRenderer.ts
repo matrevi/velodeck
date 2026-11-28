@@ -190,6 +190,7 @@ interface HostWorkerBridge {
   sendWol(
     macAddress: string,
     broadcastIp?: string,
+    sessionId?: string,
   ): Promise<{ ok: boolean; error?: string }>;
   whiteboardCommand(
     op: "stroke" | "clear",
@@ -239,6 +240,8 @@ const HEARTBEAT_WATCHDOG_MS = 40_000;
 const WS_JPEG_MAX_BUFFERED_BYTES = 128 * 1024;
 const FILE_DC_HIGH_WATERMARK = 512 * 1024;
 const FILE_DC_LOW_THRESHOLD = 256 * 1024;
+const TERMINAL_DC_MAX_BUFFERED_BYTES = 256 * 1024;
+const MAX_CHAT_TEXT_LENGTH = 1000;
 const MAX_LAN_BITRATE_KBPS = 30_000;
 const TURN_AUTO_CEILING_KBPS = 2400;
 const TURN_MANUAL_CEILING_KBPS = 2600;
@@ -648,7 +651,7 @@ class DesktopHostWorkerEngine {
   }
 
   public pushCursorUpdate(shape: HostCursorShape, visible: boolean): void {
-    if (!this.sessionId || !this.config) {
+    if (!this.hasApprovedSession() || !this.config) {
       return;
     }
     const payload: Record<string, unknown> = {
@@ -674,7 +677,18 @@ class DesktopHostWorkerEngine {
   }
 
   public pushTerminalEvent(event: HostTerminalEventPayload): void {
-    if (!this.sessionId || !this.terminalDc || this.terminalDc.readyState !== "open") {
+    if (
+      !this.hasApprovedSession() ||
+      !this.terminalDc ||
+      this.terminalDc.readyState !== "open"
+    ) {
+      return;
+    }
+    if (
+      event.type === "term_data" &&
+      this.terminalDc.bufferedAmount > TERMINAL_DC_MAX_BUFFERED_BYTES
+    ) {
+      // Drop excess burst data to prevent SCTP send buffer exhaustion on high-output commands
       return;
     }
     try {
@@ -685,7 +699,11 @@ class DesktopHostWorkerEngine {
   }
 
   public sendHostChatMessage(message: HostChatMessagePayload): void {
-    if (!this.sessionId || !this.config) {
+    if (!this.hasApprovedSession() || !this.config) {
+      return;
+    }
+    const cleanText = message.text.slice(0, MAX_CHAT_TEXT_LENGTH);
+    if (!cleanText) {
       return;
     }
     const payload: Record<string, unknown> = {
@@ -695,7 +713,7 @@ class DesktopHostWorkerEngine {
       id: message.id,
       sender: "host",
       ...(message.senderName ? { senderName: message.senderName } : {}),
-      text: message.text,
+      text: cleanText,
       ts: message.ts,
     };
     if (this.controlDc && this.controlDc.readyState === "open") {
@@ -711,7 +729,7 @@ class DesktopHostWorkerEngine {
 
   public pushLocalClipboard(text: string): void {
     if (
-      !this.sessionId ||
+      !this.hasApprovedSession() ||
       !this.config ||
       !text ||
       this.sessionPermissions.clipboard === false
@@ -733,6 +751,23 @@ class DesktopHostWorkerEngine {
       }
     }
     this.sendJson(payload);
+  }
+
+  private hasApprovedSession(sid?: string): boolean {
+    if (!this.sessionId || this.pendingApprovalSessionId !== null) {
+      return false;
+    }
+    if (sid !== undefined) {
+      return sid.length > 0 && sid === this.sessionId;
+    }
+    return true;
+  }
+
+  private hasFullControlPermission(): boolean {
+    return (
+      this.sessionPermissions.keyboard !== false &&
+      this.sessionPermissions.mouse !== false
+    );
   }
 
   public disconnectSession(reason = "host_disconnected"): void {
@@ -1127,7 +1162,7 @@ class DesktopHostWorkerEngine {
       case "rtc.offer": {
         const sid = typeof msg.sessionId === "string" ? msg.sessionId : "";
         const sdp = typeof msg.sdp === "string" ? msg.sdp : "";
-        if (sid && sdp && sid === this.sessionId) {
+        if (sid && sdp && this.hasApprovedSession(sid)) {
           void this.handleRemoteOffer(sid, sdp);
         }
         break;
@@ -1136,7 +1171,7 @@ class DesktopHostWorkerEngine {
       case "rtc.answer": {
         const sid = typeof msg.sessionId === "string" ? msg.sessionId : "";
         const sdp = typeof msg.sdp === "string" ? msg.sdp : "";
-        if (sid && sdp && sid === this.sessionId) {
+        if (sid && sdp && this.hasApprovedSession(sid)) {
           void this.handleRemoteAnswer(sid, sdp);
         }
         break;
@@ -1145,19 +1180,33 @@ class DesktopHostWorkerEngine {
       case "rtc.ice": {
         const sid = typeof msg.sessionId === "string" ? msg.sessionId : "";
         const candidate = msg.candidate as RTCIceCandidateInit | undefined;
-        if (sid && candidate && sid === this.sessionId) {
+        if (sid && candidate && this.hasApprovedSession(sid)) {
           void this.handleRemoteIce(sid, candidate);
         }
         break;
       }
 
       case "control.cmd": {
+        const msgSid = typeof msg.sessionId === "string" ? msg.sessionId : "";
+        const cmd =
+          msg.command && typeof msg.command === "object"
+            ? (msg.command as Record<string, unknown>)
+            : null;
+        const action = typeof cmd?.action === "string" ? cmd.action : "";
+        const isSessionlessWol = action === "wol" && msgSid === "";
+        if (!isSessionlessWol && !this.hasApprovedSession(msgSid)) {
+          break;
+        }
         void this.handleControlCmd(msg, false);
         break;
       }
 
       case "clipboard.sync": {
-        if (this.sessionPermissions.clipboard === false) {
+        const sid = typeof msg.sessionId === "string" ? msg.sessionId : "";
+        if (
+          !this.hasApprovedSession(sid) ||
+          this.sessionPermissions.clipboard === false
+        ) {
           break;
         }
         const text = typeof msg.text === "string" ? msg.text : "";
@@ -1169,8 +1218,8 @@ class DesktopHostWorkerEngine {
 
       case "chat.msg": {
         const sid = typeof msg.sessionId === "string" ? msg.sessionId : "";
-        if (!sid || sid === this.sessionId) {
-          this.handleIncomingChatMsg(sid || this.sessionId || "", msg);
+        if (this.hasApprovedSession(sid)) {
+          this.handleIncomingChatMsg(sid, msg);
         }
         break;
       }
@@ -1344,6 +1393,22 @@ class DesktopHostWorkerEngine {
         ? (msg.iceServers as IceServerConfig[])
         : this.iceServers;
 
+    // Concurrent session protection in confirm mode: never kick a live session before approval
+    if (
+      this.config.accessMode === "confirm" &&
+      this.sessionId &&
+      this.sessionId !== sid &&
+      !this.pendingApprovalSessionId
+    ) {
+      this.sendJson({
+        type: "session.end",
+        sessionId: sid,
+        deviceId: this.config.deviceId,
+        reason: "host_busy",
+      });
+      return;
+    }
+
     // Tear down any previous session cleanly before starting new one
     if (this.sessionId && this.sessionId !== sid) {
       this.teardownSession(true, "replaced_by_new_session");
@@ -1352,12 +1417,12 @@ class DesktopHostWorkerEngine {
     }
 
     const gen = ++this.sessionGeneration;
-    this.sessionId = sid;
     this.activeQuality = quality;
     this.sessionPermissions = { ...FULL_SESSION_PERMISSIONS };
 
-    // Host approval gate when accessMode === "confirm"
+    // Host approval gate when accessMode === "confirm": keep sessionId null until approved
     if (this.config.accessMode === "confirm") {
+      this.sessionId = null;
       this.pendingApprovalSessionId = sid;
       this.sendJson({
         type: "session.pending",
@@ -1397,6 +1462,7 @@ class DesktopHostWorkerEngine {
         return;
       }
 
+      this.sessionId = sid;
       this.sessionPermissions = normalizeSessionPermissions(approval.permissions);
       this.sendJson({
         type: "session.permissions",
@@ -1404,6 +1470,8 @@ class DesktopHostWorkerEngine {
         deviceId: this.config.deviceId,
         permissions: this.sessionPermissions,
       });
+    } else {
+      this.sessionId = sid;
     }
 
     this.audioEnabled = Boolean(
@@ -1471,6 +1539,17 @@ class DesktopHostWorkerEngine {
       this.activeTransport = "ws-jpeg";
     }
 
+    // Report activeSessionId to HostManager BEFORE advertising session.ready so main-process
+    // session-scoped IPC guards are already armed when the first controller message arrives.
+    this.report({
+      status: "controlling",
+      activeSessionId: sid,
+      activeTransport: this.activeTransport,
+      activeDisplayId: captured.display.id,
+      audioEnabled: this.isAudioEffectivelyEnabled(),
+      lastError: null,
+    });
+
     this.sendJson({
       type: "session.ready",
       sessionId: sid,
@@ -1479,15 +1558,6 @@ class DesktopHostWorkerEngine {
       screenWidth: captured.display.width,
       screenHeight: captured.display.height,
       rotation: 0,
-    });
-
-    this.report({
-      status: "controlling",
-      activeSessionId: sid,
-      activeTransport: this.activeTransport,
-      activeDisplayId: captured.display.id,
-      audioEnabled: this.isAudioEffectivelyEnabled(),
-      lastError: null,
     });
 
     this.sendTelemetry();
@@ -2095,6 +2165,9 @@ class DesktopHostWorkerEngine {
   }
 
   private handleDataChannelControlText(sid: string, raw: string): void {
+    if (!this.hasApprovedSession(sid)) {
+      return;
+    }
     if (raw === '{"type":"dc.ping"}') {
       return;
     }
@@ -2116,7 +2189,7 @@ class DesktopHostWorkerEngine {
       if (msgSid && msgSid !== sid) {
         return;
       }
-      void this.handleControlCmd(obj, true);
+      void this.handleControlCmd({ ...obj, sessionId: sid }, true);
     } else if (obj.type === "clipboard.sync") {
       if (this.sessionPermissions.clipboard === false) {
         return;
@@ -2134,6 +2207,9 @@ class DesktopHostWorkerEngine {
     sid: string,
     obj: Record<string, unknown>,
   ): void {
+    if (!this.hasApprovedSession(sid)) {
+      return;
+    }
     const rawText = typeof obj.text === "string" ? obj.text.trim() : "";
     if (!rawText) return;
     const id =
@@ -2152,7 +2228,7 @@ class DesktopHostWorkerEngine {
       id,
       sender: "controller",
       ...(senderName ? { senderName } : {}),
-      text: rawText.slice(0, 2000),
+      text: rawText.slice(0, MAX_CHAT_TEXT_LENGTH),
       ts,
     });
   }
@@ -2758,8 +2834,13 @@ class DesktopHostWorkerEngine {
     if (!cmd) return;
 
     const action = typeof cmd.action === "string" ? cmd.action : "";
-    const sid =
-      typeof msg.sessionId === "string" ? msg.sessionId : this.sessionId ?? "";
+    const msgSid = typeof msg.sessionId === "string" ? msg.sessionId : "";
+    const isSessionlessWol = !viaDataChannel && action === "wol" && msgSid === "";
+    if (!isSessionlessWol && !this.hasApprovedSession(msgSid)) {
+      return;
+    }
+
+    const sid = isSessionlessWol ? "" : msgSid;
     const seq = typeof msg.seq === "number" ? msg.seq : undefined;
 
     let ok = true;
@@ -2865,6 +2946,11 @@ class DesktopHostWorkerEngine {
       }
 
       case "privacy_screen": {
+        if (!this.hasFullControlPermission()) {
+          ok = false;
+          detail = "被控端未授予完整键鼠控制权限，无法控制隐私黑屏";
+          break;
+        }
         const enabled = Boolean(cmd.enabled);
         const res = await getBridge()?.setPrivacyScreen(enabled);
         ok = res?.ok ?? false;
@@ -2875,6 +2961,11 @@ class DesktopHostWorkerEngine {
       }
 
       case "block_input": {
+        if (!this.hasFullControlPermission()) {
+          ok = false;
+          detail = "被控端未授予完整键鼠控制权限，无法锁定本机输入";
+          break;
+        }
         const enabled = Boolean(cmd.enabled);
         const res = await getBridge()?.setBlockInput(enabled);
         ok = res?.ok ?? false;
@@ -2885,10 +2976,19 @@ class DesktopHostWorkerEngine {
       }
 
       case "wol": {
+        if (!isSessionlessWol && !this.hasFullControlPermission()) {
+          ok = false;
+          detail = "被控端未授予完整键鼠控制权限，无法发送局域网唤醒";
+          break;
+        }
         const macAddress = typeof cmd.macAddress === "string" ? cmd.macAddress : "";
         const broadcastIp =
           typeof cmd.broadcastIp === "string" ? cmd.broadcastIp : undefined;
-        const res = await getBridge()?.sendWol(macAddress, broadcastIp);
+        const res = await getBridge()?.sendWol(
+          macAddress,
+          broadcastIp,
+          isSessionlessWol ? "" : sid,
+        );
         ok = res?.ok ?? false;
         detail = res?.error;
         break;
@@ -2913,6 +3013,11 @@ class DesktopHostWorkerEngine {
       }
 
       case "power": {
+        if (!this.hasFullControlPermission()) {
+          ok = false;
+          detail = "被控端未授予完整键鼠控制权限，无法执行电源操作";
+          break;
+        }
         const operation =
           typeof cmd.operation === "string"
             ? cmd.operation
@@ -3065,6 +3170,13 @@ class DesktopHostWorkerEngine {
         });
       }
     }
+
+    // Always report null session to HostManager so full cleanup (block_input, privacyCurtain,
+    // whiteboardOverlay, held keys, timers, terminals) runs even on direct A->B takeover or approval cancel.
+    this.report({
+      activeSessionId: null,
+      activeTransport: null,
+    });
   }
 }
 

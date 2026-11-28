@@ -1,12 +1,24 @@
-import { memo, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import {
+  ArrowLeft,
   Circle,
+  Crosshair,
   Eye,
   EyeOff,
   FolderOpen,
+  Gauge,
   GripHorizontal,
   GripVertical,
+  Home,
   Keyboard,
+  Layers,
   Lock,
   LogOut,
   Maximize2,
@@ -18,6 +30,7 @@ import {
   SlidersHorizontal,
   Square,
   Terminal,
+  Unlock,
   Volume2,
   VolumeX,
 } from "lucide-react";
@@ -211,6 +224,7 @@ export interface FloatingEdgeToolbarProps {
   isDesktopTarget: boolean;
   desktopApp: boolean;
   embedded?: boolean;
+  topInsetPx?: number;
   viewStyle: ViewportViewStyle;
   viewOnly: boolean;
   isRecording: boolean;
@@ -219,6 +233,8 @@ export interface FloatingEdgeToolbarProps {
   isAudioLive: boolean;
   isPrivacyOrBlackScreenActive: boolean;
   isBlockInputActive?: boolean;
+  isPointerLocked?: boolean;
+  pointerLockDisabled?: boolean;
   isWhiteboardActive?: boolean;
   terminalDisabled?: boolean;
   unreadChatCount?: number;
@@ -230,15 +246,23 @@ export interface FloatingEdgeToolbarProps {
   onToggleAudio?: () => void;
   onOpenShortcuts: () => void;
   onOpenFiles: () => void;
+  onOpenQuality?: () => void;
+  onTogglePointerLock?: () => void;
   onOpenTerminal?: () => void;
   onToggleBlockInput?: () => void;
   onToggleWhiteboard?: () => void;
   onOpenChat?: () => void;
+  onAndroidBack?: () => void;
+  onAndroidHome?: () => void;
+  onAndroidRecents?: () => void;
+  onOpenUnlock?: () => void;
   onTogglePrivacyOrBlackScreen: () => void;
   onToggleAlwaysOnTop?: () => void;
   onOpenMore: () => void;
   onExit: () => void;
 }
+
+const EDGE_MARGIN_PX = 8;
 
 export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
   client,
@@ -249,6 +273,7 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
   isDesktopTarget,
   desktopApp,
   embedded = false,
+  topInsetPx = 0,
   viewStyle,
   viewOnly,
   isRecording,
@@ -257,6 +282,8 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
   isAudioLive,
   isPrivacyOrBlackScreenActive,
   isBlockInputActive = false,
+  isPointerLocked = false,
+  pointerLockDisabled = false,
   isWhiteboardActive = false,
   terminalDisabled = false,
   unreadChatCount = 0,
@@ -268,10 +295,16 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
   onToggleAudio,
   onOpenShortcuts,
   onOpenFiles,
+  onOpenQuality,
+  onTogglePointerLock,
   onOpenTerminal,
   onToggleBlockInput,
   onToggleWhiteboard,
   onOpenChat,
+  onAndroidBack,
+  onAndroidHome,
+  onAndroidRecents,
+  onOpenUnlock,
   onTogglePrivacyOrBlackScreen,
   onToggleAlwaysOnTop,
   onOpenMore,
@@ -290,6 +323,14 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
   const [dragPreview, setDragPreview] = useState<FloatingToolbarPosition | null>(
     null,
   );
+  const [containerSize, setContainerSize] = useState<{
+    width: number;
+    height: number;
+  }>({ width: 0, height: 0 });
+  const [toolbarSize, setToolbarSize] = useState<{
+    width: number;
+    height: number;
+  }>({ width: 0, height: 0 });
 
   const rootRef = useRef<HTMLDivElement | null>(null);
   const collapseTimerRef = useRef<number | null>(null);
@@ -327,6 +368,72 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
 
   const activePos = dragPreview ?? position;
   const isVertical = activePos.edge === "left" || activePos.edge === "right";
+  const safeTopInset = Math.max(0, topInsetPx);
+
+  // Measure container and toolbar dimensions to strictly clamp within viewport bounds
+  useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+
+    const measure = () => {
+      const offsetParent = embedded ? el.offsetParent : null;
+      const cWidth =
+        offsetParent instanceof HTMLElement
+          ? offsetParent.clientWidth
+          : typeof window !== "undefined"
+            ? window.innerWidth
+            : 1280;
+      const cHeight =
+        offsetParent instanceof HTMLElement
+          ? offsetParent.clientHeight
+          : typeof window !== "undefined"
+            ? window.innerHeight
+            : 800;
+      const tRect = el.getBoundingClientRect();
+      setContainerSize((prev) =>
+        prev.width === cWidth && prev.height === cHeight
+          ? prev
+          : { width: cWidth, height: cHeight },
+      );
+      setToolbarSize((prev) =>
+        Math.abs(prev.width - tRect.width) < 0.5 &&
+        Math.abs(prev.height - tRect.height) < 0.5
+          ? prev
+          : { width: tRect.width, height: tRect.height },
+      );
+    };
+
+    measure();
+
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver(measure);
+      observer.observe(el);
+      const offsetParent = embedded ? el.offsetParent : null;
+      if (offsetParent instanceof HTMLElement) {
+        observer.observe(offsetParent);
+      } else if (typeof document !== "undefined" && document.documentElement) {
+        observer.observe(document.documentElement);
+      }
+      window.addEventListener("resize", measure);
+      return () => {
+        observer.disconnect();
+        window.removeEventListener("resize", measure);
+      };
+    }
+
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [
+    embedded,
+    expanded,
+    activePos.edge,
+    isDesktopTarget,
+    isRecording,
+    viewOnly,
+    isBlockInputActive,
+    isPointerLocked,
+    unreadChatCount,
+  ]);
 
   const statusDotClass = isStreamingReady
     ? "bg-emerald-400"
@@ -345,11 +452,59 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
   );
 
   const positionStyle: React.CSSProperties = (() => {
+    const hasMetrics =
+      containerSize.width > 0 &&
+      containerSize.height > 0 &&
+      toolbarSize.width > 0 &&
+      toolbarSize.height > 0;
+
+    if (hasMetrics) {
+      const W = containerSize.width;
+      const H = containerSize.height;
+      const tw = toolbarSize.width;
+      const th = toolbarSize.height;
+      const minLeft = EDGE_MARGIN_PX;
+      const maxLeft = Math.max(minLeft, W - tw - EDGE_MARGIN_PX);
+      const clampedLeft = Math.round(
+        Math.max(minLeft, Math.min(maxLeft, activePos.ratio * W - tw / 2)),
+      );
+      const minTop = Math.max(EDGE_MARGIN_PX, safeTopInset);
+      const maxTop = Math.max(minTop, H - th - EDGE_MARGIN_PX);
+      const clampedTop = Math.round(
+        Math.max(minTop, Math.min(maxTop, activePos.ratio * H - th / 2)),
+      );
+
+      switch (activePos.edge) {
+        case "top":
+          return {
+            top: safeTopInset,
+            left: clampedLeft,
+          };
+        case "bottom":
+          return {
+            bottom: 0,
+            left: clampedLeft,
+          };
+        case "left":
+          return {
+            left: 0,
+            top: clampedTop,
+            maxHeight: Math.max(80, H - minTop - EDGE_MARGIN_PX),
+          };
+        case "right":
+          return {
+            right: 0,
+            top: clampedTop,
+            maxHeight: Math.max(80, H - minTop - EDGE_MARGIN_PX),
+          };
+      }
+    }
+
     const pct = `${Math.round(activePos.ratio * 1000) / 10}%`;
     switch (activePos.edge) {
       case "top":
         return {
-          top: 0,
+          top: safeTopInset,
           left: pct,
           transform: "translateX(-50%)",
         };
@@ -377,7 +532,7 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
   const edgeRadiusClass = (() => {
     switch (activePos.edge) {
       case "top":
-        return "rounded-b-lg border-t-0";
+        return safeTopInset > 0 ? "rounded-lg" : "rounded-b-lg border-t-0";
       case "bottom":
         return "rounded-t-lg border-b-0";
       case "left":
@@ -491,11 +646,12 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
         ref={rootRef}
         style={positionStyle}
         onMouseEnter={() => {
+          if (dragging || dragStateRef.current) return;
           cancelScheduledCollapse();
           setExpanded(true);
         }}
         onMouseLeave={() => {
-          if (!dragging) {
+          if (!dragging && !dragStateRef.current) {
             scheduleCollapse();
           }
         }}
@@ -503,7 +659,11 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
         onPointerMove={(e) => e.stopPropagation()}
         onPointerUp={(e) => e.stopPropagation()}
         onWheel={(e) => e.stopPropagation()}
-        className={`${posClass} z-[55] select-none`}
+        className={`${posClass} z-[55] select-none ${
+          isVertical
+            ? "flex max-h-[calc(100%-1rem)] flex-col"
+            : "max-w-[calc(100%-1rem)]"
+        }`}
       >
         {!expanded ? (
           /* Ultra-slim edge-snapped collapsed pill */
@@ -558,6 +718,16 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
               </span>
             )}
 
+            {isDesktopTarget && isBlockInputActive && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded bg-amber-500/25 px-1 py-0.5 text-[9px] font-semibold leading-none text-amber-200"
+                title="远端物理键鼠已锁定"
+              >
+                <Lock className="h-2.5 w-2.5 shrink-0" />
+                {!isVertical && <span>键鼠锁</span>}
+              </span>
+            )}
+
             {isDesktopTarget && unreadChatCount > 0 && (
               <span
                 className="inline-flex items-center gap-0.5 rounded bg-[#2563EB] px-1 py-0.5 font-mono text-[9px] font-semibold leading-none text-white"
@@ -574,7 +744,9 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
             role="toolbar"
             aria-label="沉浸模式悬浮控制栏"
             className={`flex items-center gap-1 border border-[#2C313D] bg-[#111318] p-1.5 text-zinc-200 shadow-[0_14px_36px_rgba(0,0,0,0.82)] ${edgeRadiusClass} ${
-              isVertical ? "flex-col" : "max-w-[calc(100vw-1rem)] flex-row flex-wrap justify-center"
+              isVertical
+                ? "min-h-0 flex-col overflow-y-auto"
+                : "max-w-full flex-row flex-wrap justify-center"
             }`}
           >
             {/* Drag-to-snap grip handle */}
@@ -661,6 +833,50 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
               onClick={onToggleRecording}
             />
 
+            {/* Android Navigation & Unlock Controls */}
+            {!isDesktopTarget &&
+              (onAndroidBack || onAndroidHome || onAndroidRecents || onOpenUnlock) && (
+                <>
+                  {onAndroidBack && (
+                    <EdgeActionButton
+                      vertical={isVertical}
+                      icon={<ArrowLeft className="h-3.5 w-3.5" />}
+                      label="返回"
+                      title="返回上一页 (Back)"
+                      onClick={onAndroidBack}
+                    />
+                  )}
+                  {onAndroidHome && (
+                    <EdgeActionButton
+                      vertical={isVertical}
+                      icon={<Home className="h-3.5 w-3.5" />}
+                      label="桌面"
+                      title="返回手机桌面 (Home)"
+                      onClick={onAndroidHome}
+                    />
+                  )}
+                  {onAndroidRecents && (
+                    <EdgeActionButton
+                      vertical={isVertical}
+                      icon={<Layers className="h-3.5 w-3.5" />}
+                      label="多任务"
+                      title="打开多任务切换 (Recents)"
+                      onClick={onAndroidRecents}
+                    />
+                  )}
+                  {onOpenUnlock && (
+                    <EdgeActionButton
+                      vertical={isVertical}
+                      icon={<Unlock className="h-3.5 w-3.5 text-emerald-400" />}
+                      label="解锁"
+                      title="锁屏解锁 / PIN 码解锁"
+                      onClick={onOpenUnlock}
+                    />
+                  )}
+                  <ToolbarDivider vertical={isVertical} />
+                </>
+              )}
+
             {/* Desktop Audio */}
             {isDesktopTarget && onToggleAudio && (
               <EdgeActionButton
@@ -679,11 +895,39 @@ export const FloatingEdgeToolbar = memo(function FloatingEdgeToolbar({
               />
             )}
 
+            {/* Desktop Quality / Codec / Volume Sheet */}
+            {isDesktopTarget && onOpenQuality && (
+              <EdgeActionButton
+                vertical={isVertical}
+                icon={<Gauge className="h-3.5 w-3.5 text-amber-400" />}
+                label="画质"
+                title="桌面画质、刷新率、编码器与音量"
+                onClick={onOpenQuality}
+              />
+            )}
+
+            {/* Desktop Relative Mouse Lock (Cmd/Ctrl+G) */}
+            {isDesktopTarget && onTogglePointerLock && (
+              <EdgeActionButton
+                vertical={isVertical}
+                icon={<Crosshair className="h-3.5 w-3.5 text-blue-400" />}
+                label={isPointerLocked ? "已锁鼠标" : "相对鼠标"}
+                title={
+                  isPointerLocked
+                    ? "退出相对鼠标锁定模式 (Esc / Cmd/Ctrl+G)"
+                    : "开启相对鼠标锁定模式 (Cmd/Ctrl+G)"
+                }
+                active={isPointerLocked}
+                disabled={pointerLockDisabled}
+                onClick={onTogglePointerLock}
+              />
+            )}
+
             {/* Shortcuts / Input */}
             <EdgeActionButton
               vertical={isVertical}
               icon={<Keyboard className="h-3.5 w-3.5 text-sky-300" />}
-              label="快捷键"
+              label={isDesktopTarget ? "快捷键" : "输入"}
               title={isDesktopTarget ? "打开桌面快捷键键盘" : "打开文字输入与剪贴板"}
               onClick={onOpenShortcuts}
             />

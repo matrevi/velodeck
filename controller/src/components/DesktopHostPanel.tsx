@@ -45,7 +45,7 @@ import { MIN_PASSWORD_LENGTH, type SavedAccountSession } from "../state/auth";
 export interface DesktopHostHandlers {
   onStartHost: () => Promise<void>;
   onStopHost: () => Promise<void>;
-  onUpdateConfig: (patch: DesktopHostConfigPatch) => Promise<void>;
+  onUpdateConfig: (patch: DesktopHostConfigPatch) => Promise<boolean>;
   onRegeneratePassword: () => Promise<void>;
   onBindAccount: () => Promise<void>;
   onUnbindAccount: () => Promise<void>;
@@ -60,7 +60,7 @@ export interface DesktopHostHandlers {
     permissions: SessionPermissions,
   ) => Promise<void>;
   onRejectSession?: (sessionId: string) => Promise<void>;
-  onSendChatMessage?: (text: string) => Promise<void>;
+  onSendChatMessage?: (text: string) => Promise<boolean>;
 }
 
 export interface DesktopHostPanelProps {
@@ -302,8 +302,10 @@ export function DesktopHostPanel({
     setPasswordError(null);
     setSavingPassword(true);
     try {
-      await handlers.onUpdateConfig({ controlPassword: trimmed });
-      setEditingPassword(false);
+      const ok = await handlers.onUpdateConfig({ controlPassword: trimmed });
+      if (ok) {
+        setEditingPassword(false);
+      }
     } finally {
       setSavingPassword(false);
     }
@@ -330,8 +332,10 @@ export function DesktopHostPanel({
     }
     setSavingName(true);
     try {
-      await handlers.onUpdateConfig({ deviceName: trimmed });
-      setEditingName(false);
+      const ok = await handlers.onUpdateConfig({ deviceName: trimmed });
+      if (ok) {
+        setEditingName(false);
+      }
     } finally {
       setSavingName(false);
     }
@@ -469,8 +473,10 @@ export function DesktopHostPanel({
     if (!trimmed || sendingChat || !handlers.onSendChatMessage) return;
     setSendingChat(true);
     try {
-      await handlers.onSendChatMessage(trimmed);
-      setChatDraft("");
+      const ok = await handlers.onSendChatMessage(trimmed);
+      if (ok) {
+        setChatDraft("");
+      }
     } finally {
       setSendingChat(false);
     }
@@ -826,7 +832,7 @@ export function DesktopHostPanel({
                       value={chatDraft}
                       onChange={(e) => setChatDraft(e.target.value)}
                       placeholder="回复控制端消息..."
-                      maxLength={2000}
+                      maxLength={1000}
                       className="field h-8 min-w-0 flex-1 rounded-md px-2.5 text-xs"
                     />
                     <button

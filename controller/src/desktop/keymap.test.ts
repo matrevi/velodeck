@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  CrossOsKeymapSession,
   KEYMAP_MODE_STORAGE_KEY,
   detectLocalOsPlatform,
   isCrossOsDesktopPair,
@@ -143,8 +144,6 @@ describe("mapKeyboardEventForTarget", () => {
       ["Digit0", "0"],
       ["Backspace", "Backspace"],
       ["Enter", "Enter"],
-      ["ArrowLeft", "ArrowLeft"],
-      ["ArrowRight", "ArrowRight"],
       ["ArrowUp", "ArrowUp"],
       ["ArrowDown", "ArrowDown"],
       ["BracketLeft", "["],
@@ -166,6 +165,68 @@ describe("mapKeyboardEventForTarget", () => {
         });
       }
     }
+  });
+
+  it("remaps Mac Cmd+ArrowLeft/ArrowRight to Home/End without Ctrl while preserving Shift", () => {
+    for (const targetOs of ["win32", "linux"] as const) {
+      expect(
+        mapKeyboardEventForTarget(
+          { code: "ArrowLeft", key: "ArrowLeft", modifiers: { meta: true } },
+          "darwin",
+          targetOs,
+          "smart",
+        ),
+      ).toEqual({
+        code: "Home",
+        key: "Home",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      });
+
+      expect(
+        mapKeyboardEventForTarget(
+          {
+            code: "ArrowRight",
+            key: "ArrowRight",
+            modifiers: { meta: true, shift: true },
+          },
+          "darwin",
+          targetOs,
+          "smart",
+        ),
+      ).toEqual({
+        code: "End",
+        key: "End",
+        modifiers: { ctrl: false, alt: false, shift: true, meta: false },
+      });
+    }
+  });
+
+  it("does not remap Cmd+Alt or Ctrl+Alt combos (e.g. Cmd+Opt+I)", () => {
+    expect(
+      mapKeyboardEventForTarget(
+        { code: "KeyI", key: "i", modifiers: { meta: true, alt: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual({
+      code: "KeyI",
+      key: "i",
+      modifiers: { ctrl: false, alt: true, shift: false, meta: true },
+    });
+
+    expect(
+      mapKeyboardEventForTarget(
+        { code: "KeyC", key: "c", modifiers: { ctrl: true, alt: true } },
+        "win32",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual({
+      code: "KeyC",
+      key: "c",
+      modifiers: { ctrl: true, alt: true, shift: false, meta: false },
+    });
   });
 
   it("preserves Shift/Alt alongside remapped Cmd -> Ctrl (e.g. Cmd+Shift+Z -> Ctrl+Shift+Z)", () => {
@@ -331,5 +392,677 @@ describe("keymap helpers & persistence", () => {
     expect(isCrossOsDesktopPair("darwin", "darwin")).toBe(false);
     expect(isCrossOsDesktopPair("win32", "linux")).toBe(false);
     expect(isCrossOsDesktopPair("darwin", undefined)).toBe(false);
+  });
+});
+
+describe("CrossOsKeymapSession", () => {
+  it("Mac -> Win smart Cmd+L never emits MetaLeft down and flushes suppressed macOS keyup on Meta up", () => {
+    const session = new CrossOsKeymapSession();
+
+    // 1. MetaLeft down is buffered (VK_LWIN is NOT pressed on Windows)
+    expect(
+      session.handleKeyDown(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+
+    // Repeated MetaLeft down while held emits nothing
+    expect(
+      session.handleKeyDown(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+        true,
+      ),
+    ).toEqual([]);
+
+    // 2. KeyL down synthesizes ControlLeft down + KeyL down (never MetaLeft!)
+    expect(
+      session.handleKeyDown(
+        { code: "KeyL", key: "l", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "ControlLeft",
+        key: "Control",
+        modifiers: { ctrl: true, alt: false, shift: false, meta: false },
+      },
+      {
+        phase: "down",
+        code: "KeyL",
+        key: "l",
+        modifiers: { ctrl: true, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    // 3. macOS Chromium omits KeyL keyup; MetaLeft up MUST release KeyL up and ControlLeft up
+    expect(
+      session.handleKeyUp(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: false } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "up",
+        code: "KeyL",
+        key: "l",
+        modifiers: { ctrl: true, alt: false, shift: false, meta: false },
+      },
+      {
+        phase: "up",
+        code: "ControlLeft",
+        key: "Control",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    // 4. Late KeyL up after Meta flush is ignored cleanly (no duplicate keyup)
+    expect(
+      session.handleKeyUp(
+        { code: "KeyL", key: "l", modifiers: { meta: false } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+  });
+
+  it("Mac -> Win smart handles Cmd+Shift+Z without ever sending MetaLeft down", () => {
+    const session = new CrossOsKeymapSession();
+
+    expect(
+      session.handleKeyDown(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+
+    expect(
+      session.handleKeyDown(
+        { code: "ShiftLeft", key: "Shift", modifiers: { meta: true, shift: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "ShiftLeft",
+        key: "Shift",
+        modifiers: { ctrl: false, alt: false, shift: true, meta: false },
+      },
+    ]);
+
+    expect(
+      session.handleKeyDown(
+        { code: "KeyZ", key: "Z", modifiers: { meta: true, shift: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "ControlLeft",
+        key: "Control",
+        modifiers: { ctrl: true, alt: false, shift: true, meta: false },
+      },
+      {
+        phase: "down",
+        code: "KeyZ",
+        key: "Z",
+        modifiers: { ctrl: true, alt: false, shift: true, meta: false },
+      },
+    ]);
+
+    expect(
+      session.handleKeyUp(
+        { code: "MetaLeft", key: "Meta", modifiers: { shift: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "up",
+        code: "KeyZ",
+        key: "Z",
+        modifiers: { ctrl: true, alt: false, shift: true, meta: false },
+      },
+      {
+        phase: "up",
+        code: "ControlLeft",
+        key: "Control",
+        modifiers: { ctrl: false, alt: false, shift: true, meta: false },
+      },
+    ]);
+  });
+
+  it("Mac -> Win smart maps Cmd+ArrowLeft/ArrowRight to Home/End without ControlLeft", () => {
+    const session = new CrossOsKeymapSession();
+
+    expect(
+      session.handleKeyDown(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+
+    expect(
+      session.handleKeyDown(
+        {
+          code: "ArrowLeft",
+          key: "ArrowLeft",
+          modifiers: { meta: true, shift: true },
+        },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "Home",
+        key: "Home",
+        modifiers: { ctrl: false, alt: false, shift: true, meta: false },
+      },
+    ]);
+
+    expect(
+      session.handleKeyUp(
+        {
+          code: "ArrowLeft",
+          key: "ArrowLeft",
+          modifiers: { meta: true, shift: true },
+        },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "up",
+        code: "Home",
+        key: "Home",
+        modifiers: { ctrl: false, alt: false, shift: true, meta: false },
+      },
+    ]);
+
+    expect(
+      session.handleKeyDown(
+        { code: "ArrowRight", key: "ArrowRight", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "End",
+        key: "End",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    expect(
+      session.handleKeyUp(
+        { code: "MetaLeft", key: "Meta", modifiers: {} },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "up",
+        code: "End",
+        key: "End",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+    ]);
+  });
+
+  it("Mac -> Win smart maps Cmd+Space to a single MetaLeft press with zero duplicate Meta events", () => {
+    const session = new CrossOsKeymapSession();
+
+    expect(
+      session.handleKeyDown(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+
+    expect(
+      session.handleKeyDown(
+        { code: "Space", key: " ", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "press",
+        code: "MetaLeft",
+        key: "Meta",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    // Key repeat on Cmd+Space must not re-fire
+    expect(
+      session.handleKeyDown(
+        { code: "Space", key: " ", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+        true,
+      ),
+    ).toEqual([]);
+
+    expect(
+      session.handleKeyUp(
+        { code: "Space", key: " ", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+
+    expect(
+      session.handleKeyUp(
+        { code: "MetaLeft", key: "Meta", modifiers: {} },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+  });
+
+  it("Mac -> Win smart flushes buffered MetaLeft for non-mapped combos (Cmd+D, Cmd+Opt+I)", () => {
+    const session = new CrossOsKeymapSession();
+
+    // Cmd+D -> Win+D
+    expect(
+      session.handleKeyDown(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+
+    expect(
+      session.handleKeyDown(
+        { code: "KeyD", key: "d", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "MetaLeft",
+        key: "Meta",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+      },
+      {
+        phase: "down",
+        code: "KeyD",
+        key: "d",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+      },
+    ]);
+
+    expect(
+      session.handleKeyUp(
+        { code: "MetaLeft", key: "Meta", modifiers: {} },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "up",
+        code: "KeyD",
+        key: "d",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+      },
+      {
+        phase: "up",
+        code: "MetaLeft",
+        key: "Meta",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    // Cmd+Opt+I must NOT be remapped to Ctrl+I
+    expect(
+      session.handleKeyDown(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+    expect(
+      session.handleKeyDown(
+        { code: "AltLeft", key: "Alt", modifiers: { meta: true, alt: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "AltLeft",
+        key: "Alt",
+        modifiers: { ctrl: false, alt: true, shift: false, meta: false },
+      },
+    ]);
+    expect(
+      session.handleKeyDown(
+        { code: "KeyI", key: "i", modifiers: { meta: true, alt: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "MetaLeft",
+        key: "Meta",
+        modifiers: { ctrl: false, alt: true, shift: false, meta: true },
+      },
+      {
+        phase: "down",
+        code: "KeyI",
+        key: "i",
+        modifiers: { ctrl: false, alt: true, shift: false, meta: true },
+      },
+    ]);
+  });
+
+  it("supports standalone Meta tap and cancels it cleanly on cancelPendingModifier()", () => {
+    const session = new CrossOsKeymapSession();
+
+    // Standalone tap -> single MetaLeft press
+    expect(
+      session.handleKeyDown(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+    expect(
+      session.handleKeyUp(
+        { code: "MetaLeft", key: "Meta", modifiers: {} },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "press",
+        code: "MetaLeft",
+        key: "Meta",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    // Local Electron shortcut consumes Cmd -> cancelPendingModifier() suppresses Win Start Menu
+    expect(
+      session.handleKeyDown(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+    session.cancelPendingModifier();
+    expect(
+      session.handleKeyUp(
+        { code: "MetaLeft", key: "Meta", modifiers: {} },
+        "darwin",
+        "win32",
+        "smart",
+      ),
+    ).toEqual([]);
+  });
+
+  it("Win/Linux -> Mac smart buffers ControlLeft, synthesizes MetaLeft, and flushes ControlLeft on Ctrl+D", () => {
+    const session = new CrossOsKeymapSession();
+
+    // Ctrl+C -> MetaLeft down + KeyC down (never holds ControlLeft on macOS!)
+    expect(
+      session.handleKeyDown(
+        { code: "ControlLeft", key: "Control", modifiers: { ctrl: true } },
+        "win32",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([]);
+
+    expect(
+      session.handleKeyDown(
+        { code: "KeyC", key: "c", modifiers: { ctrl: true } },
+        "win32",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "MetaLeft",
+        key: "Meta",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+      },
+      {
+        phase: "down",
+        code: "KeyC",
+        key: "c",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+      },
+    ]);
+
+    expect(
+      session.handleKeyUp(
+        { code: "KeyC", key: "c", modifiers: { ctrl: true } },
+        "win32",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "up",
+        code: "KeyC",
+        key: "c",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+      },
+    ]);
+
+    expect(
+      session.handleKeyUp(
+        { code: "ControlLeft", key: "Control", modifiers: {} },
+        "win32",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "up",
+        code: "MetaLeft",
+        key: "Meta",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    // Non-mapped Ctrl+D (terminal EOF) flushes ControlLeft down first
+    expect(
+      session.handleKeyDown(
+        { code: "ControlLeft", key: "Control", modifiers: { ctrl: true } },
+        "linux",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([]);
+
+    expect(
+      session.handleKeyDown(
+        { code: "KeyD", key: "d", modifiers: { ctrl: true } },
+        "linux",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "ControlLeft",
+        key: "Control",
+        modifiers: { ctrl: true, alt: false, shift: false, meta: false },
+      },
+      {
+        phase: "down",
+        code: "KeyD",
+        key: "d",
+        modifiers: { ctrl: true, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    expect(
+      session.handleKeyUp(
+        { code: "KeyD", key: "d", modifiers: { ctrl: true } },
+        "linux",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "up",
+        code: "KeyD",
+        key: "d",
+        modifiers: { ctrl: true, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    expect(
+      session.handleKeyUp(
+        { code: "ControlLeft", key: "Control", modifiers: {} },
+        "linux",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "up",
+        code: "ControlLeft",
+        key: "Control",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+    ]);
+  });
+
+  it("raw/same-OS passes through directly while still flushing held non-modifiers on macOS Meta up and releaseAll()", () => {
+    const session = new CrossOsKeymapSession();
+
+    expect(
+      session.handleKeyDown(
+        { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+        "darwin",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "MetaLeft",
+        key: "Meta",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+      },
+    ]);
+    expect(
+      session.handleKeyDown(
+        { code: "KeyC", key: "c", modifiers: { meta: true } },
+        "darwin",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "down",
+        code: "KeyC",
+        key: "c",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+      },
+    ]);
+
+    // macOS omits KeyC keyup -> MetaLeft up flushes KeyC up then MetaLeft up
+    expect(
+      session.handleKeyUp(
+        { code: "MetaLeft", key: "Meta", modifiers: {} },
+        "darwin",
+        "darwin",
+        "smart",
+      ),
+    ).toEqual([
+      {
+        phase: "up",
+        code: "KeyC",
+        key: "c",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: true },
+      },
+      {
+        phase: "up",
+        code: "MetaLeft",
+        key: "Meta",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    // releaseAll() releases non-modifiers before modifiers (including synthesized ControlLeft)
+    session.handleKeyDown(
+      { code: "MetaLeft", key: "Meta", modifiers: { meta: true } },
+      "darwin",
+      "win32",
+      "smart",
+    );
+    session.handleKeyDown(
+      { code: "KeyA", key: "a", modifiers: { meta: true } },
+      "darwin",
+      "win32",
+      "smart",
+    );
+
+    expect(session.releaseAll()).toEqual([
+      {
+        phase: "up",
+        code: "KeyA",
+        key: "a",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+      {
+        phase: "up",
+        code: "ControlLeft",
+        key: "Control",
+        modifiers: { ctrl: false, alt: false, shift: false, meta: false },
+      },
+    ]);
+
+    expect(session.releaseAll()).toEqual([]);
   });
 });

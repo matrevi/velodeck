@@ -77,6 +77,8 @@ export interface LaunchViewProps {
   onReturnToAccountDashboard: () => void;
   onOpenConnections: () => void;
   onOpenServerSettings?: () => void;
+  hasTabBar?: boolean;
+  hostPendingApproval?: boolean;
 }
 
 export function LaunchView({
@@ -99,6 +101,8 @@ export function LaunchView({
   onReturnToAccountDashboard,
   onOpenConnections,
   onOpenServerSettings,
+  hasTabBar = false,
+  hostPendingApproval = false,
 }: LaunchViewProps) {
   const desktopApp = isDesktopApp();
   const macDesktop = isMacDesktop();
@@ -295,14 +299,22 @@ export function LaunchView({
   ];
 
   return (
-    <div className="flex min-h-[100dvh] flex-col bg-[#F4F5F7] text-[#111318]">
+    <div
+      className={`flex flex-col bg-[#F4F5F7] text-[#111318] ${
+        hasTabBar ? "min-h-full" : "min-h-[100dvh]"
+      }`}
+    >
       {/* Committed Deep-Ink Hardware Shell Header */}
       <header
-        className={`${desktopApp ? "desktop-drag-region" : "safe-top"} sticky top-0 z-30 border-b border-[#232732] bg-[#111318] text-white`}
+        className={`${
+          hasTabBar ? "" : desktopApp ? "desktop-drag-region" : "safe-top"
+        } sticky top-0 z-30 border-b border-[#232732] bg-[#111318] text-white`}
       >
         <div
           className={`mx-auto flex h-14 max-w-5xl items-center justify-between gap-3 ${
-            macDesktop ? "pl-[80px] pr-4 sm:pl-[80px] sm:pr-6" : "px-4 sm:px-6"
+            macDesktop && !hasTabBar
+              ? "pl-[80px] pr-4 sm:pl-[80px] sm:pr-6"
+              : "px-4 sm:px-6"
           }`}
         >
           <div className="flex min-w-0 items-center gap-2.5">
@@ -468,30 +480,37 @@ export function LaunchView({
                 >
                   <Monitor className="h-4 w-4" />
                   <span>本机被控</span>
-                  {(hostState.status === "online" ||
-                    hostState.status === "controlling" ||
-                    hostState.status === "connecting" ||
-                    hostState.status === "error") && (
+                  {hostPendingApproval || Boolean(hostState.pendingApproval) ? (
                     <span
-                      className={`h-2 w-2 rounded-full ${
-                        hostState.status === "controlling"
-                          ? "bg-[#2563EB]"
-                          : hostState.status === "online"
-                            ? "bg-[#16A34A]"
-                            : hostState.status === "error"
-                              ? "bg-[#DC2626]"
-                              : "bg-[#D97706]"
-                      }`}
-                      title={
-                        hostState.status === "controlling"
-                          ? "正在被远控"
-                          : hostState.status === "online"
-                            ? "本机被控在线"
-                            : hostState.status === "error"
-                              ? "连接异常"
-                              : "连接中"
-                      }
+                      className="h-2 w-2 animate-pulse rounded-full bg-[#F59E0B]"
+                      title="有待审批的远程接入请求"
                     />
+                  ) : (
+                    (hostState.status === "online" ||
+                      hostState.status === "controlling" ||
+                      hostState.status === "connecting" ||
+                      hostState.status === "error") && (
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          hostState.status === "controlling"
+                            ? "bg-[#2563EB]"
+                            : hostState.status === "online"
+                              ? "bg-[#16A34A]"
+                              : hostState.status === "error"
+                                ? "bg-[#DC2626]"
+                                : "bg-[#D97706]"
+                        }`}
+                        title={
+                          hostState.status === "controlling"
+                            ? "正在被远控"
+                            : hostState.status === "online"
+                              ? "本机被控在线"
+                              : hostState.status === "error"
+                                ? "连接异常"
+                                : "连接中"
+                        }
+                      />
+                    )
                   )}
                 </button>
               )}

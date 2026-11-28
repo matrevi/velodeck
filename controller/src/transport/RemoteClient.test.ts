@@ -290,6 +290,36 @@ describe("isAllowedDataChannelMessage", () => {
     for (const msg of forgedMessages) {
       expect(isAllowedDataChannelMessage(msg, "sess-1")).toBe(false);
     }
+
+    // Inbound DC chat.msg MUST strictly have sender === "host" (reject spoofed "controller")
+    expect(
+      isAllowedDataChannelMessage(
+        {
+          type: "chat.msg",
+          sessionId: "sess-1",
+          deviceId: "dev-1",
+          id: "c-1",
+          sender: "controller",
+          text: "spoofed",
+          ts: Date.now(),
+        },
+        "sess-1",
+      ),
+    ).toBe(false);
+    expect(
+      isAllowedDataChannelMessage(
+        {
+          type: "chat.msg",
+          sessionId: "sess-1",
+          deviceId: "dev-1",
+          id: "c-2",
+          sender: "host",
+          text: "legit",
+          ts: Date.now(),
+        },
+        "sess-1",
+      ),
+    ).toBe(true);
   });
 });
 
@@ -2990,5 +3020,234 @@ describe("RemoteClient Pro Desktop features (FS RPC, chunked download, targetDir
     expect(client.getState().sessionStatus).toBe("negotiating");
 
     client.disconnect();
+  });
+
+  it("returns empty termId from openTerminal when terminal channel is not open", async () => {
+    const { client, pc } = await setupDesktopSession();
+
+    // Closed / not open channel must return "" instead of a fake termId
+    pc.terminalDc!.readyState = "connecting";
+    expect(client.openTerminal(80, 24)).toBe("");
+    expect(pc.terminalDc!.sent).toHaveLength(0);
+
+    // When send() throws, return ""
+    pc.terminalDc!.readyState = "open";
+    const origSend = pc.terminalDc!.send.bind(pc.terminalDc);
+    pc.terminalDc!.send = () => {
+      throw new Error("dc send failure");
+    };
+    expect(client.openTerminal(80, 24)).toBe("");
+    pc.terminalDc!.send = origSend;
+
+    client.disconnect();
+  });
+
+  it("localizes rejected_by_host and host_busy session.end reasons and clears sessionPermissions on fallback/offline", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { client, ws, pc } = await setupDesktopSession();
+      const sess1 = client.getState().sessionId!;
+
+      // Set sessionPermissions and simulate WebRTC fallback -> sessionPermissions MUST clear
+      ws.emitJson({
+        type: "session.permissions",
+        sessionId: sess1,
+        deviceId: "pc-1",
+        permissions: { keyboard: false, mouse: true },
+      });
+      expect(client.getState().sessionPermissions).toEqual({
+        keyboard: false,
+        mouse: true,
+      });
+
+      pc.iceConnectionState = "failed";
+      pc.oniceconnectionstatechange?.();
+      expect(client.getState().sessionStatus).toBe("fallback");
+      expect(client.getState().sessionPermissions).toBeNull();
+
+      // session.end rejected_by_host
+      const fallbackSessId = client.getState().sessionId!;
+      ws.emitJson({
+        type: "session.end",
+        sessionId: fallbackSessId,
+        deviceId: "pc-1",
+        reason: "rejected_by_host",
+      });
+      expect(client.getState().errorMessage).toBe("被控电脑拒绝了接入请求");
+
+      // session.end host_busy
+      client.startSession("pc-1", { preferredTransport: "webrtc" });
+      const busySessId = client.getState().sessionId!;
+      ws.emitJson({
+        type: "session.end",
+        sessionId: busySessId,
+        deviceId: "pc-1",
+        reason: "host_busy",
+      });
+      expect(client.getState().errorMessage).toBe("被控电脑当前已有活跃控制会话");
+
+      // Offline reconnect branch clears sessionPermissions
+      client.startSession("pc-1", { preferredTransport: "webrtc" });
+      const offlineSessId = client.getState().sessionId!;
+      ws.emitJson({
+        type: "session.permissions",
+        sessionId: offlineSessId,
+        deviceId: "pc-1",
+        permissions: { terminal: false },
+      });
+      ws.emitJson({
+        type: "controller.authed",
+        clientId: "ctrl-desktop-test",
+        serverTime: Date.now(),
+        mode: "relay",
+        authType: "account",
+        user: { userId: "u1", username: "alice", displayName: "Alice" },
+        devices: [{ ...makeDesktopDevice("pc-1"), online: false }],
+        iceServers: [],
+      });
+      expect(client.getState().sessionStatus).toBe("error");
+      expect(client.getState().sessionPermissions).toBeNull();
+
+      client.disconnect();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("gates sendWolRelay on connected socketStatus and resolves sendWolRelayWithAck on ACK/timeout/disconnect", async () => {
+    vi.useFakeTimers();
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+    globalThis.RTCPeerConnection =
+      FakeRTCPeerConnection as unknown as typeof RTCPeerConnection;
+
+    const client = new RemoteClient("ctrl-wol-ack");
+    // Before connected -> rejected cleanly
+    expect(client.sendWolRelay("pc-1", "AA:BB:CC:DD:EE:FF")).toBe(false);
+    expect(
+      await client.sendWolRelayWithAck("pc-1", "AA:BB:CC:DD:EE:FF"),
+    ).toMatchObject({ ok: false });
+
+    client.connectWithAccount({
+      wsUrl: "wss://velodeck.example.com/ws",
+      authToken: "jwt-valid",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      preferredTransport: "webrtc",
+    });
+
+    const ws = FakeWebSocket.instances[0]!;
+    ws.emitOpen();
+    // Still authenticating (not connected) -> rejected cleanly
+    expect(client.sendWolRelay("pc-1", "AA:BB:CC:DD:EE:FF")).toBe(false);
+
+    ws.emitJson({
+      type: "controller.authed",
+      clientId: "ctrl-wol-ack",
+      serverTime: Date.now(),
+      mode: "relay",
+      authType: "account",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      devices: [makeDesktopDevice("pc-1"), makeDesktopDevice("pc-2")],
+      iceServers: [],
+    });
+
+    // 1. Peer 1 returns negative ACK -> resolves { ok: false } without spurious toast
+    const ackPromise1 = client.sendWolRelayWithAck(
+      "pc-1",
+      "AA:BB:CC:DD:EE:FF",
+      "192.168.1.255",
+      2000,
+    );
+    const sent1 = parseSentMessages(ws).find(
+      (m) => m.type === "control.cmd" && m.deviceId === "pc-1",
+    );
+    expect(sent1).toBeDefined();
+    ws.emitJson({
+      type: "control.ack",
+      sessionId: "",
+      deviceId: "pc-1",
+      seq: sent1!.seq,
+      ok: false,
+      message: "subnet unreachable",
+    });
+    expect(await ackPromise1).toEqual({
+      ok: false,
+      message: "subnet unreachable",
+    });
+    expect(client.getState().lastNotice).toBeNull();
+
+    // 2. Peer 2 returns positive ACK -> resolves { ok: true }
+    const ackPromise2 = client.sendWolRelayWithAck(
+      "pc-2",
+      "AA:BB:CC:DD:EE:FF",
+      "192.168.1.255",
+      2000,
+    );
+    const sent2 = parseSentMessages(ws).find(
+      (m) => m.type === "control.cmd" && m.deviceId === "pc-2",
+    );
+    ws.emitJson({
+      type: "control.ack",
+      sessionId: "",
+      deviceId: "pc-2",
+      seq: sent2!.seq,
+      ok: true,
+    });
+    expect(await ackPromise2).toEqual({ ok: true, message: undefined });
+
+    // 3. Timeout resolves { ok: false }
+    const timeoutPromise = client.sendWolRelayWithAck(
+      "pc-2",
+      "AA:BB:CC:DD:EE:FF",
+      undefined,
+      1000,
+    );
+    vi.advanceTimersByTime(1000);
+    expect(await timeoutPromise).toMatchObject({ ok: false });
+
+    client.disconnect();
+  });
+
+  it("tears down peer connection, aborts pending FS requests, and detaches listeners on UNAUTHORIZED error and close 4001", async () => {
+    const { client, ws, pc } = await setupDesktopSession();
+    const sessId = client.getState().sessionId!;
+    ws.emitJson({
+      type: "session.permissions",
+      sessionId: sessId,
+      deviceId: "pc-1",
+      permissions: { keyboard: true },
+    });
+
+    const fsPromise = client.listRemoteFsRoots();
+    ws.emitJson({
+      type: "error",
+      code: "UNAUTHORIZED",
+      message: "token expired",
+    });
+
+    await expect(fsPromise).rejects.toThrow();
+    expect(pc.connectionState).toBe("closed");
+    expect(client.getState().socketStatus).toBe("error");
+    expect(client.getState().sessionPermissions).toBeNull();
+
+    // Test terminal close code 4001 cleanup as well
+    FakeWebSocket.instances = [];
+    FakeRTCPeerConnection.instances = [];
+    const setup2 = await setupDesktopSession();
+    const sessId2 = setup2.client.getState().sessionId!;
+    setup2.ws.emitJson({
+      type: "session.permissions",
+      sessionId: sessId2,
+      deviceId: "pc-1",
+      permissions: { mouse: true },
+    });
+    const fsPromise2 = setup2.client.listRemoteFsRoots();
+    setup2.ws.onclose?.({ code: 4001, reason: "revoked" } as CloseEvent);
+
+    await expect(fsPromise2).rejects.toThrow();
+    expect(setup2.pc.connectionState).toBe("closed");
+    expect(setup2.client.getState().socketStatus).toBe("error");
+    expect(setup2.client.getState().errorCode).toBe("UNAUTHORIZED");
+    expect(setup2.client.getState().sessionPermissions).toBeNull();
   });
 });

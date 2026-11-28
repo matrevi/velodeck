@@ -446,6 +446,9 @@ export class VeloDeckStore {
         // Every persisted device starts offline until its live WebSocket connects.
         cloned.summary.online = false;
         cloned.summary.deviceId = resolvedDeviceId;
+        if (cloned.summary.blockInputActive === true) {
+          cloned.summary.blockInputActive = false;
+        }
         if (cloned.controlCode && CONTROL_CODE_PATTERN.test(cloned.controlCode)) {
           cloned.summary.controlCode = cloned.controlCode;
           this.deviceIdByControlCode.set(cloned.controlCode, cloned.deviceId);
@@ -866,7 +869,11 @@ export class VeloDeckStore {
     this.persist();
   }
 
-  public updateDeviceSummaryInMemory(deviceId: string, summary: DeviceSummary): void {
+  public updateDeviceSummary(
+    deviceId: string,
+    summary: DeviceSummary,
+    persist = false,
+  ): void {
     if (!isValidDeviceId(deviceId)) {
       return;
     }
@@ -877,6 +884,13 @@ export class VeloDeckStore {
     const cloned = cloneDeviceSummary(summary);
     cloned.controlCode = existing.controlCode;
     existing.summary = cloned;
+    if (persist) {
+      this.persist();
+    }
+  }
+
+  public updateDeviceSummaryInMemory(deviceId: string, summary: DeviceSummary): void {
+    this.updateDeviceSummary(deviceId, summary, false);
   }
 
   public listDevicesByOwner(userId: string): DeviceSummary[] {

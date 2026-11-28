@@ -74,12 +74,13 @@ interface DashboardViewProps {
   onLogoutAllSessions: () => Promise<void>;
   onControlDevice: (device: DeviceSummary) => void;
   onWakeDevice: (device: DeviceSummary) => void;
-  onSendWol?: (device: DeviceSummary) => Promise<void> | void;
+  onSendWol?: (device: DeviceSummary) => Promise<boolean> | boolean;
   onSendWolRaw?: (
     macAddress: string,
     peerName?: string,
     lanIp?: string,
-  ) => Promise<void> | void;
+    excludeDeviceId?: string,
+  ) => Promise<boolean> | boolean;
   onDiscoverLanPeers?: () => Promise<LanPeerInfo[]>;
   onConnectLanPeerCode?: (input: {
     controlCode: string;
@@ -208,6 +209,7 @@ export function DashboardView({
   const desktopServerHost = formatServerHostLabel(desktopServerUrl ?? apiBase);
   const [showIosBanner, setShowIosBanner] = useState(false);
   const [wakingDeviceId, setWakingDeviceId] = useState<string | null>(null);
+  const [wolSendingKey, setWolSendingKey] = useState<string | null>(null);
   const [wolSentKey, setWolSentKey] = useState<string | null>(null);
   const [copiedCodeDeviceId, setCopiedCodeDeviceId] = useState<string | null>(null);
   const [confirmUnbindId, setConfirmUnbindId] = useState<string | null>(null);
@@ -240,28 +242,36 @@ export function DashboardView({
   }
 
   async function handleWolDeviceClick(device: DeviceSummary) {
-    if (!onSendWol) return;
-    setWolSentKey(device.deviceId);
+    if (!onSendWol || wolSendingKey === device.deviceId) return;
+    setWolSendingKey(device.deviceId);
     try {
-      await onSendWol(device);
+      const ok = await onSendWol(device);
+      if (ok) {
+        setWolSentKey(device.deviceId);
+        window.setTimeout(() => {
+          setWolSentKey((curr) => (curr === device.deviceId ? null : curr));
+        }, 1600);
+      }
     } finally {
-      window.setTimeout(() => {
-        setWolSentKey((curr) => (curr === device.deviceId ? null : curr));
-      }, 1400);
+      setWolSendingKey((curr) => (curr === device.deviceId ? null : curr));
     }
   }
 
   async function handleWolPeerClick(peer: LanPeerInfo) {
     const mac = peer.macAddresses?.[0];
-    if (!mac || !onSendWolRaw) return;
     const key = `peer:${peer.deviceId}`;
-    setWolSentKey(key);
+    if (!mac || !onSendWolRaw || wolSendingKey === key) return;
+    setWolSendingKey(key);
     try {
-      await onSendWolRaw(mac, peer.name, peer.lanIp);
+      const ok = await onSendWolRaw(mac, peer.name, peer.lanIp, peer.deviceId);
+      if (ok) {
+        setWolSentKey(key);
+        window.setTimeout(() => {
+          setWolSentKey((curr) => (curr === key ? null : curr));
+        }, 1600);
+      }
     } finally {
-      window.setTimeout(() => {
-        setWolSentKey((curr) => (curr === key ? null : curr));
-      }, 1400);
+      setWolSendingKey((curr) => (curr === key ? null : curr));
     }
   }
 
@@ -322,7 +332,7 @@ export function DashboardView({
   const activeProfile = clientState.profile;
   const isAccountMode =
     clientState.authType === "account" ||
-    (!activeProfile && savedAccount !== null);
+    (clientState.authType !== "code" && !activeProfile && savedAccount !== null);
   const activeUser = clientState.user ?? savedAccount?.user ?? null;
   const accountLabel = activeUser
     ? activeUser.displayName || activeUser.username
@@ -648,6 +658,7 @@ export function DashboardView({
                       );
                       const hasCode = cleanCode.length === 9;
                       const primaryMac = peer.macAddresses?.[0] ?? "";
+                      const isWolSending = wolSendingKey === `peer:${peer.deviceId}`;
                       const isWolSent = wolSentKey === `peer:${peer.deviceId}`;
                       const isPromptingPwd = lanConnectPeerId === peer.deviceId;
                       return (
@@ -705,12 +716,23 @@ export function DashboardView({
                               {primaryMac && onSendWolRaw && (
                                 <button
                                   type="button"
+                                  disabled={isWolSending}
                                   onClick={() => void handleWolPeerClick(peer)}
-                                  className="btn-outline inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs font-medium text-[#B45309] hover:bg-[#FFFBEB]"
+                                  className="btn-outline inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs font-medium text-[#B45309] hover:bg-[#FFFBEB] disabled:opacity-60"
                                   title={`发送 Wake-on-LAN 魔术包至 ${primaryMac}`}
                                 >
-                                  <Power className="h-3.5 w-3.5" />
-                                  <span>{isWolSent ? "已发送" : "WOL"}</span>
+                                  {isWolSending ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : (
+                                    <Power className="h-3.5 w-3.5" />
+                                  )}
+                                  <span>
+                                    {isWolSending
+                                      ? "发送中"
+                                      : isWolSent
+                                        ? "已发送"
+                                        : "WOL"}
+                                  </span>
                                 </button>
                               )}
                             </div>
@@ -1102,15 +1124,22 @@ export function DashboardView({
                           onSendWol && (
                             <button
                               type="button"
+                              disabled={wolSendingKey === device.deviceId}
                               onClick={() => void handleWolDeviceClick(device)}
                               title={`发送 Wake-on-LAN 魔术包 (${device.macAddresses?.[0]})`}
-                              className="btn-outline inline-flex h-9 items-center justify-center gap-1 rounded-lg border-[#F59E0B]/50 bg-[#FFFBEB] px-3 text-xs font-medium text-[#92400E] hover:bg-[#FEF3C7]"
+                              className="btn-outline inline-flex h-9 items-center justify-center gap-1 rounded-lg border-[#F59E0B]/50 bg-[#FFFBEB] px-3 text-xs font-medium text-[#92400E] hover:bg-[#FEF3C7] disabled:opacity-60"
                             >
-                              <Power className="h-3.5 w-3.5 text-[#D97706]" />
+                              {wolSendingKey === device.deviceId ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin text-[#D97706]" />
+                              ) : (
+                                <Power className="h-3.5 w-3.5 text-[#D97706]" />
+                              )}
                               <span>
-                                {wolSentKey === device.deviceId
-                                  ? "已发送"
-                                  : "WOL 开机"}
+                                {wolSendingKey === device.deviceId
+                                  ? "发送中..."
+                                  : wolSentKey === device.deviceId
+                                    ? "已发送"
+                                    : "WOL 开机"}
                               </span>
                             </button>
                           )}

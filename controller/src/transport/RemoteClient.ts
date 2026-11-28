@@ -444,6 +444,17 @@ function mapServerErrorMessage(
   }
 }
 
+function formatSessionEndMessage(reason?: string): string {
+  switch (reason) {
+    case "rejected_by_host":
+      return "被控电脑拒绝了接入请求";
+    case "host_busy":
+      return "被控电脑当前已有活跃控制会话";
+    default:
+      return reason ? `会话已结束：${reason}` : "设备端已结束会话";
+  }
+}
+
 function getRequestWsUrl(req: ConnectRequest): string {
   return req.kind === "token" ? req.profile.wsUrl : req.wsUrl;
 }
@@ -502,7 +513,7 @@ export function isAllowedDataChannelMessage(
       typeof candidate.deviceId === "string" &&
       typeof candidate.id === "string" &&
       candidate.id.length > 0 &&
-      (candidate.sender === "controller" || candidate.sender === "host") &&
+      candidate.sender === "host" &&
       typeof candidate.text === "string" &&
       typeof candidate.ts === "number" &&
       Number.isFinite(candidate.ts)
@@ -693,6 +704,13 @@ export class RemoteClient {
   private prevRawFramesPerSecond: number | null = null;
 
   private cmdSeq = 0;
+  private readonly pendingWolAcks = new Map<
+    number,
+    {
+      relayDeviceId: string;
+      finish: (result: { ok: boolean; message?: string }) => void;
+    }
+  >();
   private noticeSeq = 0;
   private frameTimestamps: number[] = [];
   private lastFpsEmitAt = 0;
@@ -834,25 +852,26 @@ export class RemoteClient {
   }
 
   openTerminal(cols = 100, rows = 30): string {
+    const termDc = this.terminalDataChannel;
+    if (!termDc || termDc.readyState !== "open") {
+      return "";
+    }
     const termId = `term-${Date.now().toString(36)}-${++this.termSeq}`;
     const safeCols = Math.max(20, Math.min(300, Math.round(cols || 100)));
     const safeRows = Math.max(5, Math.min(120, Math.round(rows || 30)));
-    const termDc = this.terminalDataChannel;
-    if (termDc && termDc.readyState === "open") {
-      try {
-        termDc.send(
-          JSON.stringify({
-            type: "term_open",
-            termId,
-            cols: safeCols,
-            rows: safeRows,
-          }),
-        );
-      } catch {
-        // Ignore send failure; UI will reflect disconnected terminal state
-      }
+    try {
+      termDc.send(
+        JSON.stringify({
+          type: "term_open",
+          termId,
+          cols: safeCols,
+          rows: safeRows,
+        }),
+      );
+      return termId;
+    } catch {
+      return "";
     }
-    return termId;
   }
 
   sendTerminalInput(termId: string, data: string): boolean {
@@ -964,6 +983,9 @@ export class RemoteClient {
     macAddress: string,
     broadcastIp?: string,
   ): boolean {
+    if (this.state.socketStatus !== "connected") {
+      return false;
+    }
     const cleanRelayId = relayDeviceId.trim();
     const cleanMac = macAddress.trim();
     if (!cleanRelayId || !cleanMac) {
@@ -980,6 +1002,68 @@ export class RemoteClient {
       seq: ++this.cmdSeq,
       command,
     });
+  }
+
+  sendWolRelayWithAck(
+    relayDeviceId: string,
+    macAddress: string,
+    broadcastIp?: string,
+    timeoutMs = 4_000,
+  ): Promise<{ ok: boolean; message?: string }> {
+    if (this.state.socketStatus !== "connected") {
+      return Promise.resolve({ ok: false, message: "中继连接未就绪" });
+    }
+    const cleanRelayId = relayDeviceId.trim();
+    const cleanMac = macAddress.trim();
+    if (!cleanRelayId || !cleanMac) {
+      return Promise.resolve({ ok: false, message: "缺少中继设备或 MAC 地址" });
+    }
+    const cleanBroadcast = broadcastIp?.trim() || undefined;
+    const command: ControlCommand = cleanBroadcast
+      ? { action: "wol", macAddress: cleanMac, broadcastIp: cleanBroadcast }
+      : { action: "wol", macAddress: cleanMac };
+    const seq = ++this.cmdSeq;
+    const sent = this.sendJson({
+      type: "control.cmd",
+      sessionId: "",
+      deviceId: cleanRelayId,
+      seq,
+      command,
+    });
+    if (!sent) {
+      return Promise.resolve({ ok: false, message: "发送 WOL 中继指令失败" });
+    }
+
+    const safeTimeoutMs = Math.max(200, Math.min(30_000, Math.round(timeoutMs)));
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      const finish = (result: { ok: boolean; message?: string }) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        this.pendingWolAcks.delete(seq);
+        resolve(result);
+      };
+
+      this.pendingWolAcks.set(seq, { relayDeviceId: cleanRelayId, finish });
+      timer = setTimeout(() => {
+        finish({ ok: false, message: "等待 WOL 中继设备响应超时" });
+      }, safeTimeoutMs);
+    });
+  }
+
+  private abortPendingWolAcks(reason: string): void {
+    if (this.pendingWolAcks.size === 0) return;
+    const entries = Array.from(this.pendingWolAcks.values());
+    this.pendingWolAcks.clear();
+    for (const entry of entries) {
+      entry.finish({ ok: false, message: reason });
+    }
   }
 
   connect(profile: ConnectionProfile): void {
@@ -1112,6 +1196,7 @@ export class RemoteClient {
       fileChannelOpen: false,
       terminalReady: false,
       pendingApprovalMessage: null,
+      sessionPermissions: null,
       mediaStream: null,
       hasRemoteAudio: false,
     });
@@ -1125,6 +1210,7 @@ export class RemoteClient {
     this.clearReconnectTimer();
     this.clearAutoReRequestTimer();
     this.stopWsJpegFpsTimer();
+    this.abortPendingWolAcks("连接已断开");
     this.abortActiveFileTransferSilent();
     this.abortAllRemoteFsSilent("连接已断开");
     this.stopSession("client_disconnect");
@@ -2275,60 +2361,87 @@ export class RemoteClient {
     ws.onclose = (event) => {
       if (gen !== this.connectionGeneration) return;
       this.stopHeartbeat();
-      this.teardownPeerConnection();
       this.ws = null;
 
       if (this.intentionalDisconnect) {
+        this.teardownPeerConnection();
         return;
       }
 
       if (this.state.socketStatus === "error") {
+        this.teardownPeerConnection();
         return;
       }
 
       if (event.code === 4001) {
+        const readable = mapServerErrorMessage(
+          "UNAUTHORIZED",
+          event.reason || "",
+          request.kind,
+        );
         this.intentionalDisconnect = true;
         this.clearReconnectTimer();
+        this.detachBrowserListeners();
+        this.abortPendingWolAcks(readable);
+        this.abortActiveFileTransferSilent();
+        this.abortAllRemoteFsSilent(readable);
+        this.teardownPeerConnection();
         this.setState({
           socketStatus: "error",
           errorCode: "UNAUTHORIZED",
-          errorMessage: mapServerErrorMessage(
-            "UNAUTHORIZED",
-            event.reason || "",
-            request.kind,
-          ),
+          errorMessage: readable,
+          pendingApprovalMessage: null,
+          sessionPermissions: null,
         });
         return;
       }
 
       if (event.code === 4003) {
+        const readable = event.reason
+          ? `连接被设备拒绝（来源不受信任）：${event.reason}`
+          : "连接被设备拒绝：当前网页来源不在允许范围内 (FORBIDDEN_ORIGIN)";
         this.intentionalDisconnect = true;
         this.clearReconnectTimer();
+        this.detachBrowserListeners();
+        this.abortPendingWolAcks(readable);
+        this.abortActiveFileTransferSilent();
+        this.abortAllRemoteFsSilent(readable);
+        this.teardownPeerConnection();
         this.setState({
           socketStatus: "error",
           errorCode: "UNAUTHORIZED",
-          errorMessage: event.reason
-            ? `连接被设备拒绝（来源不受信任）：${event.reason}`
-            : "连接被设备拒绝：当前网页来源不在允许范围内 (FORBIDDEN_ORIGIN)",
+          errorMessage: readable,
+          pendingApprovalMessage: null,
+          sessionPermissions: null,
         });
         return;
       }
 
       if (event.code === 4029) {
+        const readable = mapServerErrorMessage(
+          "RATE_LIMITED",
+          event.reason || "",
+          request.kind,
+        );
         this.intentionalDisconnect = true;
         this.clearReconnectTimer();
+        this.detachBrowserListeners();
+        this.abortPendingWolAcks(readable);
+        this.abortActiveFileTransferSilent();
+        this.abortAllRemoteFsSilent(readable);
+        this.teardownPeerConnection();
         this.setState({
           socketStatus: "error",
           errorCode: "RATE_LIMITED",
-          errorMessage: mapServerErrorMessage(
-            "RATE_LIMITED",
-            event.reason || "",
-            request.kind,
-          ),
+          errorMessage: readable,
+          pendingApprovalMessage: null,
+          sessionPermissions: null,
         });
         return;
       }
 
+      this.abortPendingWolAcks("连接已断开");
+      this.teardownPeerConnection();
       this.scheduleReconnect(
         event.reason || `连接已断开 (code ${event.code})`,
       );
@@ -2480,6 +2593,7 @@ export class RemoteClient {
       fileChannelOpen: false,
       terminalReady: false,
       pendingApprovalMessage: null,
+      sessionPermissions: null,
       mediaStream: null,
       hasRemoteAudio: false,
       sessionStatus: this.state.activeDeviceId ? "requesting" : "idle",
@@ -2553,7 +2667,10 @@ export class RemoteClient {
             });
           } else {
             this.setState({
+              sessionId: null,
               sessionStatus: "error",
+              pendingApprovalMessage: null,
+              sessionPermissions: null,
               errorMessage: "设备当前离线，等待上线或点击唤醒",
             });
           }
@@ -2694,9 +2811,7 @@ export class RemoteClient {
           remoteCursorShape: "default",
           remoteCursorVisible: true,
           fps: 0,
-          errorMessage: parsed.reason
-            ? `会话已结束：${parsed.reason}`
-            : "设备端已结束会话",
+          errorMessage: formatSessionEndMessage(parsed.reason),
         });
         break;
       }
@@ -2757,10 +2872,17 @@ export class RemoteClient {
         ) {
           this.intentionalDisconnect = true;
           this.clearReconnectTimer();
+          this.detachBrowserListeners();
+          this.abortPendingWolAcks(readable);
+          this.abortActiveFileTransferSilent();
+          this.abortAllRemoteFsSilent(readable);
+          this.teardownPeerConnection();
           this.setState({
             socketStatus: "error",
             errorCode: parsed.code,
             errorMessage: readable,
+            pendingApprovalMessage: null,
+            sessionPermissions: null,
           });
           this.teardownSocket();
         } else if (
@@ -2836,10 +2958,18 @@ export class RemoteClient {
   }
 
   private handleControlAck(msg: ControlAckMessage): void {
+    let handledByWolAck = false;
+    if (typeof msg.seq === "number") {
+      const pendingWol = this.pendingWolAcks.get(msg.seq);
+      if (pendingWol && pendingWol.relayDeviceId === msg.deviceId) {
+        handledByWolAck = true;
+        pendingWol.finish({ ok: msg.ok, message: msg.message });
+      }
+    }
     for (const listener of this.ackListeners) {
       listener(msg);
     }
-    if (!msg.ok && msg.message) {
+    if (!handledByWolAck && !msg.ok && msg.message) {
       this.pushNotice("warn", msg.message);
     }
   }
@@ -3574,6 +3704,7 @@ export class RemoteClient {
       fileChannelOpen: false,
       terminalReady: false,
       pendingApprovalMessage: null,
+      sessionPermissions: null,
       fps: 0,
       errorCode: null,
       errorMessage: null,

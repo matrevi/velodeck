@@ -20,7 +20,9 @@ export interface WhiteboardOverlayManagerOptions {
 const STROKE_LIFETIME_MS = 8000;
 const IDLE_DESTROY_DELAY_MS = 8600;
 const MAX_STROKE_POINTS = 2000;
+const MAX_ACTIVE_STROKES = 64;
 const DEFAULT_STROKE_COLOR = "#ff3b30";
+const SAFE_STROKE_ID_REGEX = /^[A-Za-z0-9_-]{1,64}$/;
 const SAFE_COLOR_REGEX =
   /^(?:#[0-9a-fA-F]{3,8}|rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\))$/;
 
@@ -58,8 +60,10 @@ export function sanitizeWhiteboardStroke(raw: unknown): WhiteboardStroke | null 
     return null;
   }
 
-  const rawId = typeof obj.id === "string" ? obj.id.trim().slice(0, 64) : "";
-  const id = rawId || `stroke-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const rawId = typeof obj.id === "string" ? obj.id.trim() : "";
+  const id = SAFE_STROKE_ID_REGEX.test(rawId)
+    ? rawId
+    : `stroke-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
   const rawColor = typeof obj.color === "string" ? obj.color.trim() : "";
   const color = SAFE_COLOR_REGEX.test(rawColor) ? rawColor : DEFAULT_STROKE_COLOR;
@@ -179,6 +183,14 @@ function buildWhiteboardHtmlDataUrl(): string {
   window.__velodeckWhiteboard = {
     addStroke(stroke) {
       if (!stroke || !Array.isArray(stroke.points) || stroke.points.length === 0) return;
+      if (strokes.has(stroke.id)) {
+        strokes.delete(stroke.id);
+      } else if (strokes.size >= ${MAX_ACTIVE_STROKES}) {
+        const oldestKey = strokes.keys().next().value;
+        if (oldestKey !== undefined) {
+          strokes.delete(oldestKey);
+        }
+      }
       strokes.set(stroke.id, {
         id: stroke.id,
         color: stroke.color || "${DEFAULT_STROKE_COLOR}",
@@ -349,7 +361,10 @@ export class WhiteboardOverlayManager {
 
     if (this.platform === "darwin") {
       win.setAlwaysOnTop(true, "screen-saver", 2);
-      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      win.setVisibleOnAllWorkspaces(true, {
+        visibleOnFullScreen: true,
+        skipTransformProcessType: true,
+      });
     } else {
       win.setAlwaysOnTop(true, "screen-saver");
     }

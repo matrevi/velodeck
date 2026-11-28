@@ -6,6 +6,14 @@ export const PREFERRED_RECORDING_MIME_TYPES = [
   "video/mp4",
 ] as const;
 
+export const PREFERRED_VIDEO_ONLY_RECORDING_MIME_TYPES = [
+  "video/webm;codecs=vp9",
+  "video/webm;codecs=h264",
+  "video/webm;codecs=vp8",
+  "video/webm",
+  "video/mp4",
+] as const;
+
 export interface RecordingResult {
   blob: Blob;
   fileName: string;
@@ -41,17 +49,19 @@ export interface SessionRecorderOptions {
 export interface SessionRecorderStartHooks {
   onDuration?: (durationSec: number) => void;
   onError?: (err: Error) => void;
+  onStreamEnded?: () => void;
 }
 
 const DEFAULT_TIMESLICE_MS = 1000;
 const DEFAULT_STOP_TIMEOUT_MS = 3000;
 
 /**
- * Picks the best supported local recording container/codec in preference order:
- * `video/webm;codecs=vp9,opus` -> `video/webm;codecs=h264,opus` -> `video/webm;codecs=vp8,opus` -> `video/webm` -> `video/mp4`.
+ * Picks the best supported local recording container/codec in preference order.
+ * Uses audio+video codecs when `hasAudio` is true and video-only codecs when `hasAudio` is false.
  */
 export function pickSupportedRecordingMimeType(
   isTypeSupportedFn?: (mimeType: string) => boolean,
+  hasAudio = true,
 ): string | null {
   const checker =
     isTypeSupportedFn ??
@@ -64,7 +74,11 @@ export function pickSupportedRecordingMimeType(
     return null;
   }
 
-  for (const candidate of PREFERRED_RECORDING_MIME_TYPES) {
+  const candidates = hasAudio
+    ? PREFERRED_RECORDING_MIME_TYPES
+    : PREFERRED_VIDEO_ONLY_RECORDING_MIME_TYPES;
+
+  for (const candidate of candidates) {
     try {
       if (checker(candidate)) {
         return candidate;
@@ -140,7 +154,7 @@ export function triggerRecordingDownload(blob: Blob, fileName: string): boolean 
       } catch {
         // Ignore revoke failure
       }
-    }, 5_000);
+    }, 60_000);
   }
 }
 
@@ -173,6 +187,7 @@ export class SessionRecorder {
   private durationTimer: ReturnType<typeof setInterval> | null = null;
   private stopPromise: Promise<RecordingResult | null> | null = null;
   private onDurationCb: ((durationSec: number) => void) | null = null;
+  private trackCleanupFns: Array<() => void> = [];
 
   constructor(options: SessionRecorderOptions = {}) {
     this.mediaRecorderFactory =
@@ -226,42 +241,86 @@ export class SessionRecorder {
       throw new Error("当前暂无可录制的实时音视频流");
     }
 
-    const chosenMime = pickSupportedRecordingMimeType(this.isTypeSupportedFn);
-    const recOptions: MediaRecorderOptions | undefined = chosenMime
+    const hasAudio =
+      typeof stream.getAudioTracks === "function"
+        ? stream.getAudioTracks().length > 0
+        : tracks.some((track) => track?.kind === "audio");
+    const chosenMime = pickSupportedRecordingMimeType(this.isTypeSupportedFn, hasAudio);
+    const initialOptions: MediaRecorderOptions | undefined = chosenMime
       ? { mimeType: chosenMime }
       : undefined;
 
-    const recorder = this.mediaRecorderFactory(stream, recOptions);
-    const effectiveMime = recorder.mimeType || chosenMime || "video/webm";
+    const createAndStart = (
+      recOptions: MediaRecorderOptions | undefined,
+    ): { recorder: MediaRecorderLike; effectiveMime: string } => {
+      let rec: MediaRecorderLike | null = null;
+      try {
+        rec = this.mediaRecorderFactory(stream, recOptions);
+        const effectiveMime = rec.mimeType || recOptions?.mimeType || "video/webm";
 
-    this.recorder = recorder;
-    this.chunks = [];
-    this.deviceName = deviceName || "Device";
-    this.mimeType = effectiveMime;
-    this.startedAtMs = this.now();
-    this.durationSec = 0;
-    this.stopPromise = null;
-    this.onDurationCb = hooks.onDuration ?? null;
+        this.recorder = rec;
+        this.chunks = [];
+        this.deviceName = deviceName || "Device";
+        this.mimeType = effectiveMime;
+        this.startedAtMs = this.now();
+        this.durationSec = 0;
+        this.stopPromise = null;
+        this.onDurationCb = hooks.onDuration ?? null;
 
-    recorder.ondataavailable = (event) => {
-      if (event.data && event.data.size > 0) {
-        this.chunks.push(event.data);
+        const boundRecorder = rec;
+        rec.ondataavailable = (event) => {
+          if (this.recorder !== boundRecorder) return;
+          if (event.data && event.data.size > 0) {
+            this.chunks.push(event.data);
+          }
+        };
+
+        rec.onerror = (event) => {
+          if (this.recorder !== boundRecorder) return;
+          this.clearDurationTimer();
+          const err =
+            event.error instanceof Error
+              ? event.error
+              : new Error("本地录屏过程中发生编码错误");
+          hooks.onError?.(err);
+        };
+
+        rec.start(this.timesliceMs);
+        return { recorder: rec, effectiveMime };
+      } catch (err) {
+        if (rec) {
+          rec.ondataavailable = null;
+          rec.onerror = null;
+          rec.onstop = null;
+        }
+        this.rollbackFailedStart();
+        throw err;
       }
     };
 
-    recorder.onerror = (event) => {
-      const err =
-        event.error instanceof Error
-          ? event.error
-          : new Error("本地录屏过程中发生编码错误");
-      hooks.onError?.(err);
-    };
+    let started: { recorder: MediaRecorderLike; effectiveMime: string };
+    try {
+      started = createAndStart(initialOptions);
+    } catch (firstErr) {
+      if (initialOptions !== undefined) {
+        try {
+          started = createAndStart(undefined);
+        } catch (retryErr) {
+          this.rollbackFailedStart();
+          throw retryErr;
+        }
+      } else {
+        this.rollbackFailedStart();
+        throw firstErr;
+      }
+    }
 
-    recorder.start(this.timesliceMs);
+    const activeRecorder = started.recorder;
+    this.attachVideoTrackEndedListeners(stream, activeRecorder, hooks.onStreamEnded);
     this.onDurationCb?.(0);
 
     this.durationTimer = this.setIntervalFn(() => {
-      if (!this.recorder) return;
+      if (this.recorder !== activeRecorder) return;
       const nextSec = Math.max(0, Math.floor((this.now() - this.startedAtMs) / 1000));
       if (nextSec !== this.durationSec) {
         this.durationSec = nextSec;
@@ -269,7 +328,7 @@ export class SessionRecorder {
       }
     }, 500);
 
-    return { mimeType: effectiveMime };
+    return { mimeType: started.effectiveMime };
   }
 
   stop(): Promise<RecordingResult | null> {
@@ -290,6 +349,11 @@ export class SessionRecorder {
     const capturedMimeType = activeRecorder.mimeType || this.mimeType || "video/webm";
 
     const finalize = (): RecordingResult => {
+      activeRecorder.ondataavailable = null;
+      activeRecorder.onerror = null;
+      activeRecorder.onstop = null;
+      this.detachTrackListeners();
+
       const collected = this.chunks.slice();
       this.recorder = null;
       this.chunks = [];
@@ -341,6 +405,65 @@ export class SessionRecorder {
     });
 
     return this.stopPromise;
+  }
+
+  private rollbackFailedStart(): void {
+    this.clearDurationTimer();
+    this.detachTrackListeners();
+    this.recorder = null;
+    this.chunks = [];
+    this.durationSec = 0;
+    this.stopPromise = null;
+    this.onDurationCb = null;
+  }
+
+  private attachVideoTrackEndedListeners(
+    stream: MediaStream,
+    boundRecorder: MediaRecorderLike,
+    onStreamEnded?: () => void,
+  ): void {
+    this.detachTrackListeners();
+    if (!onStreamEnded) return;
+
+    const videoTracks =
+      typeof stream.getVideoTracks === "function"
+        ? stream.getVideoTracks()
+        : (typeof stream.getTracks === "function" ? stream.getTracks() : []).filter(
+            (track) => track?.kind === "video",
+          );
+
+    let fired = false;
+    const handleEnded = () => {
+      if (fired || this.recorder !== boundRecorder) return;
+      fired = true;
+      this.detachTrackListeners();
+      onStreamEnded();
+    };
+
+    for (const track of videoTracks) {
+      if (
+        track &&
+        typeof track.addEventListener === "function" &&
+        typeof track.removeEventListener === "function"
+      ) {
+        track.addEventListener("ended", handleEnded);
+        this.trackCleanupFns.push(() => {
+          try {
+            track.removeEventListener("ended", handleEnded);
+          } catch {
+            // Ignore detach failure
+          }
+        });
+      }
+    }
+  }
+
+  private detachTrackListeners(): void {
+    if (this.trackCleanupFns.length === 0) return;
+    const cleanups = this.trackCleanupFns.splice(0, this.trackCleanupFns.length);
+    for (const cleanup of cleanups) {
+      cleanup();
+    }
   }
 
   private clearDurationTimer(): void {

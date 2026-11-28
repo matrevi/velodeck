@@ -12,6 +12,7 @@ import {
   type ClipboardSyncMessage,
   type ControlAckMessage,
   type ControlCmdMessage,
+  type ControlCommand,
   type ControllerAuthMessage,
   type ControllerAuthedMessage,
   type CursorShape,
@@ -73,13 +74,21 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
 const HOUR_WINDOW_MS = 3_600_000;
 const MAX_NEW_DEVICES_PER_IP_PER_HOUR = 5;
 const MAX_REGISTERS_PER_IP_PER_HOUR = 5;
+const MAX_WOL_PER_CONTROLLER_PER_MIN = 10;
+const MAX_WOL_PER_IP_PER_MIN = 20;
+const MAX_SESSIONLESS_CMD_PER_CONTROLLER_PER_MIN = 20;
 const MAX_TRACKED_MAP_ENTRIES = 10_000;
 const MAX_PRE_AUTH_TEXT_BYTES = 8 * 1024;
 const MAX_POST_AUTH_TEXT_BYTES = 64 * 1024;
 const MAX_CLIPBOARD_TEXT_BYTES = 64 * 1024;
 const MAX_CHAT_TEXT_BYTES = 4096;
+const MIN_VALID_CHAT_TS_MS = 1_577_836_800_000; // 2020-01-01T00:00:00.000Z
+const MAX_CHAT_TS_FUTURE_SKEW_MS = 86_400_000; // +24h clock skew
 const MAX_MAC_ADDRESSES = 8;
 const MAX_WHITEBOARD_STROKE_POINTS = 256;
+const WHITEBOARD_MIN_COORD = -1;
+const WHITEBOARD_MAX_COORD = 2;
+const MAX_RELATIVE_MOUSE_DELTA = 32_768;
 const MAX_SESSIONS_PER_DEVICE = 2;
 const MAX_SESSIONS_PER_CONTROLLER = 5;
 const MAX_OUT_OF_BAND_PER_CONTROLLER = 10;
@@ -95,6 +104,15 @@ const SESSION_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
 const CONTROL_CODE_REGEX = /^\d{9}$/;
 const IPV4_REGEX = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
 const MAC_ADDRESS_REGEX = /^[0-9a-fA-F]{2}([:\-][0-9a-fA-F]{2}){5}$/;
+const ZERO_MAC_ADDRESS = "00:00:00:00:00:00";
+const BROADCAST_MAC_ADDRESS = "FF:FF:FF:FF:FF:FF";
+const WHITEBOARD_STROKE_ID_REGEX = /^[A-Za-z0-9_-]{1,64}$/;
+const WHITEBOARD_HEX_COLOR_REGEX =
+  /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+const WHITEBOARD_RGB_COLOR_REGEX =
+  /^rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$/;
+const WHITEBOARD_RGBA_COLOR_REGEX =
+  /^rgba\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(0(?:\.\d{1,4})?|1(?:\.0{1,4})?|\.\d{1,4})\s*\)$/;
 
 export interface HubStats {
   devicesOnline: number;
@@ -149,6 +167,7 @@ interface SessionRecord {
   createdAt: number;
   ready: boolean;
   approvalPending?: boolean;
+  permissions?: SessionPermissions;
 }
 
 interface OutOfBandEntry {
@@ -345,6 +364,12 @@ function parseIpv4Octets(ip: string): [number, number, number, number] | null {
   if (!match) {
     return null;
   }
+  for (let i = 1; i <= 4; i += 1) {
+    const part = match[i] ?? "";
+    if (part.length > 1 && part.startsWith("0")) {
+      return null;
+    }
+  }
   const a = Number.parseInt(match[1] ?? "", 10);
   const b = Number.parseInt(match[2] ?? "", 10);
   const c = Number.parseInt(match[3] ?? "", 10);
@@ -355,17 +380,24 @@ function parseIpv4Octets(ip: string): [number, number, number, number] | null {
   return [a, b, c, d];
 }
 
-function isRfc1918OrCgnatIpv4(ip: string): boolean {
-  const octets = parseIpv4Octets(ip);
-  if (!octets) {
-    return false;
-  }
+function isRfc1918Octets(octets: [number, number, number, number]): boolean {
   const [a, b] = octets;
   if (a === 10) return true; // 10.0.0.0/8
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
   if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  return false;
+}
+
+function isRfc1918OrCgnatOctets(octets: [number, number, number, number]): boolean {
+  if (isRfc1918Octets(octets)) return true;
+  const [a, b] = octets;
   if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 (CGNAT / Tailscale)
   return false;
+}
+
+function isRfc1918OrCgnatIpv4(ip: string): boolean {
+  const octets = parseIpv4Octets(ip);
+  return octets !== null && isRfc1918OrCgnatOctets(octets);
 }
 
 const VALID_CURSOR_SHAPES = new Set<CursorShape>([
@@ -400,7 +432,11 @@ function normalizeMacAddress(value: unknown): string | undefined {
   if (!MAC_ADDRESS_REGEX.test(trimmed)) {
     return undefined;
   }
-  return trimmed.replace(/-/g, ":").toUpperCase();
+  const normalized = trimmed.replace(/-/g, ":").toUpperCase();
+  if (normalized === ZERO_MAC_ADDRESS || normalized === BROADCAST_MAC_ADDRESS) {
+    return undefined;
+  }
+  return normalized;
 }
 
 function sanitizeMacAddresses(value: unknown): string[] | undefined {
@@ -432,68 +468,178 @@ function sanitizeLanIp(value: unknown): string | undefined {
   if (trimmed.length === 0 || trimmed.length > 15) {
     return undefined;
   }
-  if (!isRfc1918OrCgnatIpv4(trimmed)) {
+  const octets = parseIpv4Octets(trimmed);
+  if (!octets || !isRfc1918OrCgnatOctets(octets)) {
     return undefined;
   }
-  return trimmed;
+  return `${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}`;
 }
 
-function isValidWolBroadcastIp(value: unknown): boolean {
+function sanitizeWolBroadcastIp(value: unknown): string | undefined {
   if (typeof value !== "string") {
-    return false;
+    return undefined;
   }
-  if (value === "255.255.255.255") {
-    return true;
+  if (value.length === 0 || value.length > 15) {
+    return undefined;
   }
-  return isRfc1918OrCgnatIpv4(value);
+  const octets = parseIpv4Octets(value);
+  if (!octets) {
+    return undefined;
+  }
+  const [a, b, c, d] = octets;
+  const isGlobalBroadcast = a === 255 && b === 255 && c === 255 && d === 255;
+  if (!isGlobalBroadcast && !isRfc1918Octets(octets)) {
+    return undefined;
+  }
+  return `${a}.${b}.${c}.${d}`;
+}
+
+export function isValidWolBroadcastIp(value: unknown): boolean {
+  return sanitizeWolBroadcastIp(value) !== undefined;
 }
 
 function isValidCursorShape(value: unknown): value is CursorShape {
   return typeof value === "string" && VALID_CURSOR_SHAPES.has(value as CursorShape);
 }
 
-function isValidWhiteboardStroke(value: unknown): value is WhiteboardStroke {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+function isValidRgbChannel(raw: string): boolean {
+  if (raw.length > 1 && raw.startsWith("0")) {
     return false;
+  }
+  const n = Number.parseInt(raw, 10);
+  return Number.isInteger(n) && n >= 0 && n <= 255;
+}
+
+function isValidWhiteboardColor(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 48) {
+    return false;
+  }
+  if (WHITEBOARD_HEX_COLOR_REGEX.test(value)) {
+    return true;
+  }
+  const rgbMatch = WHITEBOARD_RGB_COLOR_REGEX.exec(value);
+  if (rgbMatch) {
+    return (
+      isValidRgbChannel(rgbMatch[1] ?? "") &&
+      isValidRgbChannel(rgbMatch[2] ?? "") &&
+      isValidRgbChannel(rgbMatch[3] ?? "")
+    );
+  }
+  const rgbaMatch = WHITEBOARD_RGBA_COLOR_REGEX.exec(value);
+  if (rgbaMatch) {
+    const alpha = Number.parseFloat(rgbaMatch[4] ?? "");
+    return (
+      isValidRgbChannel(rgbaMatch[1] ?? "") &&
+      isValidRgbChannel(rgbaMatch[2] ?? "") &&
+      isValidRgbChannel(rgbaMatch[3] ?? "") &&
+      Number.isFinite(alpha) &&
+      alpha >= 0 &&
+      alpha <= 1
+    );
+  }
+  return false;
+}
+
+function sanitizeWhiteboardStroke(value: unknown): WhiteboardStroke | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
   }
   const stroke = value as Record<string, unknown>;
-  if (
-    typeof stroke.id !== "string" ||
-    stroke.id.trim().length === 0 ||
-    stroke.id.length > 64 ||
-    /[\x00-\x1f\x7f]/.test(stroke.id)
-  ) {
-    return false;
+  if (typeof stroke.id !== "string" || !WHITEBOARD_STROKE_ID_REGEX.test(stroke.id)) {
+    return null;
   }
-  if (
-    typeof stroke.color !== "string" ||
-    stroke.color.trim().length === 0 ||
-    stroke.color.length > 24 ||
-    /[\x00-\x1f\x7f]/.test(stroke.color)
-  ) {
-    return false;
+  if (!isValidWhiteboardColor(stroke.color)) {
+    return null;
   }
   if (!isFiniteNumber(stroke.width) || stroke.width < 1 || stroke.width > 32) {
-    return false;
+    return null;
   }
   if (
     !Array.isArray(stroke.points) ||
     stroke.points.length === 0 ||
     stroke.points.length > MAX_WHITEBOARD_STROKE_POINTS
   ) {
-    return false;
+    return null;
   }
+  const points: Array<{ x: number; y: number }> = [];
   for (let i = 0; i < stroke.points.length; i += 1) {
     const pt = stroke.points[i];
     if (typeof pt !== "object" || pt === null || Array.isArray(pt)) {
-      return false;
+      return null;
     }
     const rawPt = pt as Record<string, unknown>;
-    if (!isFiniteNumber(rawPt.x) || !isFiniteNumber(rawPt.y)) {
-      return false;
+    if (
+      !isFiniteNumber(rawPt.x) ||
+      !isFiniteNumber(rawPt.y) ||
+      rawPt.x < WHITEBOARD_MIN_COORD ||
+      rawPt.x > WHITEBOARD_MAX_COORD ||
+      rawPt.y < WHITEBOARD_MIN_COORD ||
+      rawPt.y > WHITEBOARD_MAX_COORD
+    ) {
+      return null;
     }
+    points.push({ x: rawPt.x, y: rawPt.y });
   }
-  return true;
+  return {
+    id: stroke.id,
+    color: stroke.color,
+    width: stroke.width,
+    points,
+  };
+}
+
+function checkControlCommandPermission(
+  cmd: ControlCommand,
+  permissions: SessionPermissions | undefined,
+): string | null {
+  if (!permissions) {
+    return null;
+  }
+  switch (cmd.action) {
+    case "mouse_move":
+    case "mouse_move_relative":
+    case "mouse_down":
+    case "mouse_up":
+    case "mouse_wheel":
+    case "tap":
+    case "long_press":
+    case "swipe":
+    case "touch_down":
+    case "touch_move":
+    case "touch_up":
+    case "pinch":
+      if (permissions.mouse === false) {
+        return "Mouse/touch input permission denied for this session";
+      }
+      return null;
+    case "key_event":
+    case "key":
+    case "text":
+      if (permissions.keyboard === false) {
+        return "Keyboard input permission denied for this session";
+      }
+      return null;
+    case "clipboard_set":
+      if (permissions.clipboard === false) {
+        return "Clipboard permission denied for this session";
+      }
+      return null;
+    case "audio_toggle":
+      if (permissions.audio === false && cmd.enabled === true) {
+        return "Audio permission denied for this session";
+      }
+      return null;
+    case "power":
+    case "block_input":
+    case "privacy_screen":
+    case "wol":
+      if (permissions.keyboard === false || permissions.mouse === false) {
+        return `Control action '${cmd.action}' denied while keyboard or mouse permission is disabled`;
+      }
+      return null;
+    default:
+      return null;
+  }
 }
 
 function sanitizeSessionPermissions(value: unknown): SessionPermissions | null {
@@ -771,6 +917,9 @@ export class VeloDeckHub {
   private readonly failedAuthByIp = new Map<string, number[]>();
   private readonly registerRateByIp = new Map<string, number[]>();
   private readonly newDeviceByIp = new Map<string, number[]>();
+  private readonly wolRateByController = new Map<ClientConn, number[]>();
+  private readonly wolRateByIp = new Map<string, number[]>();
+  private readonly sessionlessCmdRateByController = new Map<ClientConn, number[]>();
   private readonly lockoutByTarget = new Map<string, LockoutEntry>();
   private nextConnSeq = 1;
   private heartbeatTimer: NodeJS.Timeout | null = null;
@@ -1040,6 +1189,7 @@ export class VeloDeckHub {
         this.controllers.delete(ctrl);
         this.endSessionsForController(ctrl, reason);
         this.removeOutOfBandForController(ctrl);
+        this.clearControllerRateLimits(ctrl);
         this.closeReplacedConnection(ctrl, 4001, "CREDENTIALS_CHANGED");
       }
     }
@@ -1050,6 +1200,9 @@ export class VeloDeckHub {
         this.liveAgents.delete(deviceId);
         live.summary.online = false;
         live.summary.lastSeen = Date.now();
+        if (live.summary.blockInputActive === true) {
+          live.summary.blockInputActive = false;
+        }
         this.store.updateDeviceSummaryInMemory(deviceId, live.summary);
         this.removeOutOfBandForDevice(deviceId);
 
@@ -1125,11 +1278,17 @@ export class VeloDeckHub {
       }
     }
 
+    // Clean any in-flight out-of-band commands from the former owner targeting this unbound device
+    this.removeOutOfBandForDeviceOwner(deviceId, userId);
+
     // Notify the former owner's connected controllers that this device is no longer bound/online to them
     const now = Date.now();
     const offlineSnapshot = cloneDeviceSummary(live?.summary ?? existing.summary);
     offlineSnapshot.online = false;
     offlineSnapshot.lastSeen = now;
+    if (offlineSnapshot.blockInputActive === true) {
+      offlineSnapshot.blockInputActive = false;
+    }
     delete offlineSnapshot.ownerUsername;
     this.broadcastToOwnerControllers(userId, offlineSnapshot);
 
@@ -1215,6 +1374,45 @@ export class VeloDeckHub {
     const recent = existing.filter((ts) => ts >= cutoff);
     recent.push(now);
     setBounded(this.newDeviceByIp, ip, recent);
+  }
+
+  private isSlidingWindowExceeded<K>(
+    map: Map<K, number[]>,
+    key: K,
+    limit: number,
+    windowMs: number,
+    now: number,
+  ): boolean {
+    const timestamps = map.get(key);
+    if (!timestamps || timestamps.length === 0) {
+      return false;
+    }
+    const cutoff = now - windowMs;
+    const recent = timestamps.filter((ts) => ts >= cutoff);
+    if (recent.length === 0) {
+      map.delete(key);
+      return false;
+    }
+    setBounded(map, key, recent);
+    return recent.length >= limit;
+  }
+
+  private recordSlidingWindowHit<K>(
+    map: Map<K, number[]>,
+    key: K,
+    windowMs: number,
+    now: number,
+  ): void {
+    const cutoff = now - windowMs;
+    const existing = map.get(key);
+    const recent = existing ? existing.filter((ts) => ts >= cutoff) : [];
+    recent.push(now);
+    setBounded(map, key, recent);
+  }
+
+  private clearControllerRateLimits(conn: ClientConn): void {
+    this.wolRateByController.delete(conn);
+    this.sessionlessCmdRateByController.delete(conn);
   }
 
   public isTargetLockedOut(targetKey: string): boolean {
@@ -1314,6 +1512,9 @@ export class VeloDeckHub {
     this.failedAuthByIp.clear();
     this.registerRateByIp.clear();
     this.newDeviceByIp.clear();
+    this.wolRateByController.clear();
+    this.wolRateByIp.clear();
+    this.sessionlessCmdRateByController.clear();
     this.lockoutByTarget.clear();
   }
 
@@ -1402,6 +1603,30 @@ export class VeloDeckHub {
           this.newDeviceByIp.set(ip, recent);
         }
       }
+      for (const [ctrlConn, timestamps] of this.wolRateByController.entries()) {
+        const recent = timestamps.filter((ts) => ts >= minCutoff);
+        if (recent.length === 0) {
+          this.wolRateByController.delete(ctrlConn);
+        } else {
+          this.wolRateByController.set(ctrlConn, recent);
+        }
+      }
+      for (const [ip, timestamps] of this.wolRateByIp.entries()) {
+        const recent = timestamps.filter((ts) => ts >= minCutoff);
+        if (recent.length === 0) {
+          this.wolRateByIp.delete(ip);
+        } else {
+          this.wolRateByIp.set(ip, recent);
+        }
+      }
+      for (const [ctrlConn, timestamps] of this.sessionlessCmdRateByController.entries()) {
+        const recent = timestamps.filter((ts) => ts >= minCutoff);
+        if (recent.length === 0) {
+          this.sessionlessCmdRateByController.delete(ctrlConn);
+        } else {
+          this.sessionlessCmdRateByController.set(ctrlConn, recent);
+        }
+      }
       for (const [key, entry] of this.lockoutByTarget.entries()) {
         if (now >= entry.lockedUntilMs && now - entry.lastFailureMs > LOCKOUT_QUIET_RESET_MS) {
           this.lockoutByTarget.delete(key);
@@ -1442,17 +1667,17 @@ export class VeloDeckHub {
     ws: WebSocket,
     code: ErrorMessage["code"],
     message: string,
-    extra?: { sessionId?: string; deviceId?: string },
+    extra?: { sessionId?: unknown; deviceId?: unknown },
   ): void {
     const err: ErrorMessage = {
       type: "error",
       code,
       message,
     };
-    if (extra?.sessionId !== undefined) {
+    if (typeof extra?.sessionId === "string") {
       err.sessionId = extra.sessionId;
     }
-    if (extra?.deviceId !== undefined) {
+    if (typeof extra?.deviceId === "string") {
       err.deviceId = extra.deviceId;
     }
     this.sendJson(ws, err);
@@ -2035,6 +2260,9 @@ export class VeloDeckHub {
       const offlineSnapshot = cloneDeviceSummary(existingLive?.summary ?? latestStored.summary);
       offlineSnapshot.online = false;
       offlineSnapshot.lastSeen = now;
+      if (offlineSnapshot.blockInputActive === true) {
+        offlineSnapshot.blockInputActive = false;
+      }
       delete offlineSnapshot.ownerUsername;
 
       if (legacyTokenChanged && previousLegacyTokenHash) {
@@ -2053,6 +2281,7 @@ export class VeloDeckHub {
           this.controllers.delete(ctrl);
           this.endSessionsForController(ctrl, "device_access_changed");
           this.removeOutOfBandForController(ctrl);
+          this.clearControllerRateLimits(ctrl);
           this.closeReplacedConnection(ctrl, 4001, "CREDENTIALS_CHANGED");
         }
       }
@@ -2069,6 +2298,7 @@ export class VeloDeckHub {
           this.controllers.delete(ctrl);
           this.endSessionsForController(ctrl, "device_access_changed");
           this.removeOutOfBandForController(ctrl);
+          this.clearControllerRateLimits(ctrl);
           this.closeReplacedConnection(ctrl, 4001, "CREDENTIALS_CHANGED");
         }
       }
@@ -2199,12 +2429,8 @@ export class VeloDeckHub {
     if (audioEnabled !== undefined) {
       summary.audioEnabled = audioEnabled;
     }
-    const blockInputActive =
-      typeof msg.blockInputActive === "boolean"
-        ? msg.blockInputActive
-        : prev?.blockInputActive;
-    if (blockInputActive !== undefined) {
-      summary.blockInputActive = blockInputActive;
+    if (typeof msg.blockInputActive === "boolean") {
+      summary.blockInputActive = msg.blockInputActive;
     }
     const accessMode =
       sanitizeAccessMode(msg.accessMode) ?? sanitizeAccessMode(prev?.accessMode);
@@ -2212,16 +2438,11 @@ export class VeloDeckHub {
       summary.accessMode = accessMode;
     }
     const macAddresses =
-      msg.macAddresses !== undefined
-        ? sanitizeMacAddresses(msg.macAddresses)
-        : sanitizeMacAddresses(prev?.macAddresses);
+      sanitizeMacAddresses(msg.macAddresses) ?? sanitizeMacAddresses(prev?.macAddresses);
     if (macAddresses !== undefined) {
       summary.macAddresses = macAddresses;
     }
-    const lanIp =
-      msg.lanIp !== undefined
-        ? sanitizeLanIp(msg.lanIp)
-        : sanitizeLanIp(prev?.lanIp);
+    const lanIp = sanitizeLanIp(msg.lanIp) ?? sanitizeLanIp(prev?.lanIp);
     if (lanIp !== undefined) {
       summary.lanIp = lanIp;
     }
@@ -2281,6 +2502,9 @@ export class VeloDeckHub {
     }
 
     const s = live.summary;
+    const prevAccessMode = s.accessMode;
+    const prevMacAddresses = s.macAddresses;
+    const prevLanIp = s.lanIp;
     if (typeof msg.screenWidth === "number") {
       s.screenWidth = clampNumber(msg.screenWidth, s.screenWidth, 0, 16_384);
     }
@@ -2350,7 +2574,13 @@ export class VeloDeckHub {
     }
     s.lastSeen = Date.now();
 
-    this.store.updateDeviceSummaryInMemory(conn.deviceId, s);
+    const macAddressesChanged =
+      (prevMacAddresses?.length ?? 0) !== (s.macAddresses?.length ?? 0) ||
+      Boolean(s.macAddresses?.some((mac, idx) => prevMacAddresses?.[idx] !== mac));
+    const durableChanged =
+      s.accessMode !== prevAccessMode || s.lanIp !== prevLanIp || macAddressesChanged;
+
+    this.store.updateDeviceSummary(conn.deviceId, s, durableChanged);
     this.broadcastDeviceStatus(stored, s);
   }
 
@@ -2390,6 +2620,7 @@ export class VeloDeckHub {
         this.controllers.delete(existingCtrl);
         this.endSessionsForController(existingCtrl, "controller_replaced");
         this.removeOutOfBandForController(existingCtrl);
+        this.clearControllerRateLimits(existingCtrl);
         this.closeReplacedConnection(existingCtrl, 4000, "Replaced by new controller connection");
       }
     }
@@ -2748,38 +2979,40 @@ export class VeloDeckHub {
     }
 
     const existingSession = this.sessions.get(msg.sessionId);
-    if (
-      existingSession &&
-      (existingSession.controllerConn !== conn || existingSession.deviceId !== msg.deviceId)
-    ) {
-      this.sendError(conn.ws, "UNAUTHORIZED", "Session ID already belongs to another peer", {
+    if (existingSession) {
+      if (existingSession.controllerConn !== conn || existingSession.deviceId !== msg.deviceId) {
+        this.sendError(conn.ws, "UNAUTHORIZED", "Session ID already belongs to another peer", {
+          sessionId: msg.sessionId,
+          deviceId: msg.deviceId,
+        });
+        return;
+      }
+      this.sendError(conn.ws, "INVALID_MESSAGE", "Session ID already active", {
         sessionId: msg.sessionId,
         deviceId: msg.deviceId,
       });
       return;
     }
 
-    if (!existingSession) {
-      let deviceSessions = 0;
-      let controllerSessions = 0;
-      for (const s of this.sessions.values()) {
-        if (s.deviceId === msg.deviceId) deviceSessions += 1;
-        if (s.controllerConn === conn) controllerSessions += 1;
-      }
-      if (deviceSessions >= MAX_SESSIONS_PER_DEVICE) {
-        this.sendError(conn.ws, "RATE_LIMITED", "Maximum active sessions per device reached", {
-          sessionId: msg.sessionId,
-          deviceId: msg.deviceId,
-        });
-        return;
-      }
-      if (controllerSessions >= MAX_SESSIONS_PER_CONTROLLER) {
-        this.sendError(conn.ws, "RATE_LIMITED", "Maximum active sessions per controller reached", {
-          sessionId: msg.sessionId,
-          deviceId: msg.deviceId,
-        });
-        return;
-      }
+    let deviceSessions = 0;
+    let controllerSessions = 0;
+    for (const s of this.sessions.values()) {
+      if (s.deviceId === msg.deviceId) deviceSessions += 1;
+      if (s.controllerConn === conn) controllerSessions += 1;
+    }
+    if (deviceSessions >= MAX_SESSIONS_PER_DEVICE) {
+      this.sendError(conn.ws, "RATE_LIMITED", "Maximum active sessions per device reached", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+    if (controllerSessions >= MAX_SESSIONS_PER_CONTROLLER) {
+      this.sendError(conn.ws, "RATE_LIMITED", "Maximum active sessions per controller reached", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
     }
 
     const now = Date.now();
@@ -2845,7 +3078,13 @@ export class VeloDeckHub {
   }
 
   private handleSessionReady(conn: ClientConn, msg: SessionReadyMessage): void {
-    const session = this.sessions.get(msg.sessionId);
+    if (msg.sessionId !== undefined && typeof msg.sessionId !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "sessionId must be a string", {
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+    const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
     if (!session) {
       this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
         sessionId: msg.sessionId,
@@ -2868,6 +3107,7 @@ export class VeloDeckHub {
       return;
     }
     session.ready = true;
+    session.approvalPending = false;
     const forwarded: SessionReadyMessage = {
       ...msg,
       iceServers: buildIceServers(this.config, `ctrl-${session.controllerId}`),
@@ -2909,13 +3149,45 @@ export class VeloDeckHub {
     }
   }
 
+  private removeOutOfBandForDeviceOwner(deviceId: string, userId: string): void {
+    for (const [key, entries] of Array.from(this.outOfBandCmds.entries())) {
+      const remaining = entries.filter(
+        (entry) =>
+          !(
+            entry.deviceId === deviceId &&
+            entry.controllerConn.authType === "account" &&
+            entry.controllerConn.userId === userId
+          ),
+      );
+      if (remaining.length === 0) {
+        this.outOfBandCmds.delete(key);
+      } else if (remaining.length !== entries.length) {
+        this.outOfBandCmds.set(key, remaining);
+      }
+    }
+  }
+
   private handleControlCmd(conn: ClientConn, msg: ControlCmdMessage): void {
-    // Validate text / clipboard payload sizes before forwarding
-    const cmd = msg.command;
-    if (!cmd || typeof cmd !== "object" || typeof cmd.action !== "string") {
-      this.sendError(conn.ws, "INVALID_MESSAGE", "Invalid control command");
+    if (msg.sessionId !== undefined && typeof msg.sessionId !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "sessionId must be a string", {
+        deviceId: msg.deviceId,
+      });
       return;
     }
+
+    // Validate text / clipboard payload sizes and command shapes before forwarding
+    const cmd = msg.command;
+    if (!cmd || typeof cmd !== "object" || Array.isArray(cmd) || typeof cmd.action !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "Invalid control command", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+
+    let sanitizedCmd: ControlCommand = cmd;
+    let wolAuditTarget: string | undefined;
+
     if (cmd.action === "text" || cmd.action === "clipboard_set") {
       if (
         typeof cmd.text !== "string" ||
@@ -2991,43 +3263,57 @@ export class VeloDeckHub {
     }
 
     if (cmd.action === "mouse_down" || cmd.action === "mouse_up") {
+      const hasX = cmd.x !== undefined;
+      const hasY = cmd.y !== undefined;
+      const coordsValid =
+        (!hasX && !hasY) || (isFiniteNumber(cmd.x) && isFiniteNumber(cmd.y));
       const clickCount = (cmd as { clickCount?: unknown }).clickCount;
       const clickCountValid =
-        clickCount === undefined ||
-        (isFiniteNumber(clickCount) &&
-          Number.isInteger(clickCount) &&
-          clickCount >= 1 &&
-          clickCount <= 5);
-      if (
-        !isFiniteNumber(cmd.x) ||
-        !isFiniteNumber(cmd.y) ||
-        !isValidMouseButton(cmd.button) ||
-        !clickCountValid
-      ) {
+        cmd.action === "mouse_down"
+          ? clickCount === undefined ||
+            (isFiniteNumber(clickCount) &&
+              Number.isInteger(clickCount) &&
+              clickCount >= 1 &&
+              clickCount <= 5)
+          : clickCount === undefined;
+      if (!coordsValid || !isValidMouseButton(cmd.button) || !clickCountValid) {
         this.sendError(
           conn.ws,
           "INVALID_MESSAGE",
-          `${cmd.action} requires finite x, y, valid button, and optional clickCount (1..5)`,
+          `${cmd.action} requires optional finite x & y pair, valid button, and optional clickCount (1..5)`,
           {
             sessionId: msg.sessionId,
             deviceId: msg.deviceId,
           },
         );
         return;
+      }
+      if (cmd.action === "mouse_down") {
+        sanitizedCmd = {
+          action: "mouse_down",
+          ...(hasX && hasY ? { x: cmd.x!, y: cmd.y! } : {}),
+          button: cmd.button,
+          ...(typeof clickCount === "number" ? { clickCount } : {}),
+        };
+      } else {
+        sanitizedCmd = {
+          action: "mouse_up",
+          ...(hasX && hasY ? { x: cmd.x!, y: cmd.y! } : {}),
+          button: cmd.button,
+        };
       }
     }
 
     if (cmd.action === "mouse_wheel") {
-      if (
-        !isFiniteNumber(cmd.x) ||
-        !isFiniteNumber(cmd.y) ||
-        !isFiniteNumber(cmd.deltaX) ||
-        !isFiniteNumber(cmd.deltaY)
-      ) {
+      const hasX = cmd.x !== undefined;
+      const hasY = cmd.y !== undefined;
+      const coordsValid =
+        (!hasX && !hasY) || (isFiniteNumber(cmd.x) && isFiniteNumber(cmd.y));
+      if (!coordsValid || !isFiniteNumber(cmd.deltaX) || !isFiniteNumber(cmd.deltaY)) {
         this.sendError(
           conn.ws,
           "INVALID_MESSAGE",
-          "mouse_wheel requires finite x, y, deltaX, and deltaY",
+          "mouse_wheel requires optional finite x & y pair and finite deltaX and deltaY",
           {
             sessionId: msg.sessionId,
             deviceId: msg.deviceId,
@@ -3035,6 +3321,12 @@ export class VeloDeckHub {
         );
         return;
       }
+      sanitizedCmd = {
+        action: "mouse_wheel",
+        ...(hasX && hasY ? { x: cmd.x!, y: cmd.y! } : {}),
+        deltaX: cmd.deltaX,
+        deltaY: cmd.deltaY,
+      };
     }
 
     if (cmd.action === "key_event") {
@@ -3078,11 +3370,16 @@ export class VeloDeckHub {
     }
 
     if (cmd.action === "mouse_move_relative") {
-      if (!isFiniteNumber(cmd.dx) || !isFiniteNumber(cmd.dy)) {
+      if (
+        !isFiniteNumber(cmd.dx) ||
+        !isFiniteNumber(cmd.dy) ||
+        Math.abs(cmd.dx) > MAX_RELATIVE_MOUSE_DELTA ||
+        Math.abs(cmd.dy) > MAX_RELATIVE_MOUSE_DELTA
+      ) {
         this.sendError(
           conn.ws,
           "INVALID_MESSAGE",
-          "mouse_move_relative requires finite dx and dy",
+          "mouse_move_relative requires finite dx and dy within [-32768, 32768]",
           {
             sessionId: msg.sessionId,
             deviceId: msg.deviceId,
@@ -3090,16 +3387,40 @@ export class VeloDeckHub {
         );
         return;
       }
+      sanitizedCmd = {
+        action: "mouse_move_relative",
+        dx: cmd.dx,
+        dy: cmd.dy,
+      };
     }
 
     if (cmd.action === "whiteboard") {
-      const validClear = cmd.op === "clear" && cmd.stroke === undefined;
-      const validStroke = cmd.op === "stroke" && isValidWhiteboardStroke(cmd.stroke);
-      if (!validClear && !validStroke) {
+      if (cmd.op === "clear" && cmd.stroke === undefined) {
+        sanitizedCmd = { action: "whiteboard", op: "clear" };
+      } else if (cmd.op === "stroke") {
+        const cleanStroke = sanitizeWhiteboardStroke(cmd.stroke);
+        if (!cleanStroke) {
+          this.sendError(
+            conn.ws,
+            "INVALID_MESSAGE",
+            "whiteboard requires op 'clear' or 'stroke' with valid id, hex/rgb(a) color, width 1..32, and <= 256 bounded points",
+            {
+              sessionId: msg.sessionId,
+              deviceId: msg.deviceId,
+            },
+          );
+          return;
+        }
+        sanitizedCmd = {
+          action: "whiteboard",
+          op: "stroke",
+          stroke: cleanStroke,
+        };
+      } else {
         this.sendError(
           conn.ws,
           "INVALID_MESSAGE",
-          "whiteboard requires op 'clear' or 'stroke' with valid stroke (<= 256 points, color <= 24 chars, width 1..32)",
+          "whiteboard requires op 'clear' or 'stroke' with valid id, hex/rgb(a) color, width 1..32, and <= 256 bounded points",
           {
             sessionId: msg.sessionId,
             deviceId: msg.deviceId,
@@ -3110,15 +3431,17 @@ export class VeloDeckHub {
     }
 
     if (cmd.action === "wol") {
-      const macValid =
-        typeof cmd.macAddress === "string" && MAC_ADDRESS_REGEX.test(cmd.macAddress);
-      const broadcastValid =
-        cmd.broadcastIp === undefined || isValidWolBroadcastIp(cmd.broadcastIp);
-      if (!macValid || !broadcastValid) {
+      const normalizedMac = normalizeMacAddress(cmd.macAddress);
+      const normalizedBroadcastIp =
+        cmd.broadcastIp !== undefined ? sanitizeWolBroadcastIp(cmd.broadcastIp) : undefined;
+      if (
+        !normalizedMac ||
+        (cmd.broadcastIp !== undefined && normalizedBroadcastIp === undefined)
+      ) {
         this.sendError(
           conn.ws,
           "INVALID_MESSAGE",
-          "wol requires a valid MAC address and optional RFC1918/CGNAT or 255.255.255.255 broadcastIp",
+          "wol requires a valid non-zero/non-broadcast MAC address and optional RFC1918 or 255.255.255.255 broadcastIp",
           {
             sessionId: msg.sessionId,
             deviceId: msg.deviceId,
@@ -3126,7 +3449,18 @@ export class VeloDeckHub {
         );
         return;
       }
+      wolAuditTarget =
+        normalizedBroadcastIp !== undefined
+          ? `${normalizedMac}@${normalizedBroadcastIp}`
+          : normalizedMac;
+      sanitizedCmd = {
+        action: "wol",
+        macAddress: normalizedMac,
+        ...(normalizedBroadcastIp !== undefined ? { broadcastIp: normalizedBroadcastIp } : {}),
+      };
     }
+
+    const hasFiniteSeq = typeof msg.seq === "number" && Number.isFinite(msg.seq);
 
     // Allow sessionless wake / unlock / black_screen / force_portrait / wol commands from an authorized controller
     if (!isNonEmptyString(msg.sessionId)) {
@@ -3136,7 +3470,7 @@ export class VeloDeckHub {
         });
         return;
       }
-      const action = cmd.action;
+      const action = sanitizedCmd.action;
       if (
         action !== "wake" &&
         action !== "unlock" &&
@@ -3165,29 +3499,91 @@ export class VeloDeckHub {
         });
         return;
       }
-      if (typeof msg.seq === "number" && Number.isFinite(msg.seq)) {
-        const key = `${msg.deviceId}:${msg.seq}`;
-        const existingQueue = this.outOfBandCmds.get(key) ?? [];
-        const existingForCtrl = existingQueue.find((entry) => entry.controllerConn === conn);
-        if (
-          !existingForCtrl &&
-          this.countOutOfBandForController(conn) >= MAX_OUT_OF_BAND_PER_CONTROLLER
-        ) {
+
+      const now = Date.now();
+      if (
+        this.isSlidingWindowExceeded(
+          this.sessionlessCmdRateByController,
+          conn,
+          MAX_SESSIONLESS_CMD_PER_CONTROLLER_PER_MIN,
+          RATE_LIMIT_WINDOW_MS,
+          now,
+        )
+      ) {
+        this.audit.log({
+          event: "rate_limit.hit",
+          ip: conn.ip,
+          ok: false,
+          userId: conn.userId,
+          deviceId: msg.deviceId,
+          detail: "sessionless_control_rate_limit",
+        });
+        this.sendError(conn.ws, "RATE_LIMITED", "Too many sessionless control commands", {
+          deviceId: msg.deviceId,
+        });
+        return;
+      }
+
+      if (action === "wol") {
+        const wolCtrlExceeded = this.isSlidingWindowExceeded(
+          this.wolRateByController,
+          conn,
+          MAX_WOL_PER_CONTROLLER_PER_MIN,
+          RATE_LIMIT_WINDOW_MS,
+          now,
+        );
+        const wolIpExceeded = this.isSlidingWindowExceeded(
+          this.wolRateByIp,
+          conn.ip,
+          MAX_WOL_PER_IP_PER_MIN,
+          RATE_LIMIT_WINDOW_MS,
+          now,
+        );
+        if (wolCtrlExceeded || wolIpExceeded) {
+          this.audit.log({
+            event: "rate_limit.hit",
+            ip: conn.ip,
+            ok: false,
+            userId: conn.userId,
+            deviceId: msg.deviceId,
+            detail: wolCtrlExceeded ? "wol_controller_rate_limit" : "wol_ip_rate_limit",
+          });
+          this.sendError(conn.ws, "RATE_LIMITED", "Too many Wake-on-LAN requests", {
+            deviceId: msg.deviceId,
+          });
+          return;
+        }
+      }
+
+      if (hasFiniteSeq) {
+        if (this.countOutOfBandForController(conn) >= MAX_OUT_OF_BAND_PER_CONTROLLER) {
           this.sendError(conn.ws, "RATE_LIMITED", "Too many pending out-of-band control commands", {
             deviceId: msg.deviceId,
           });
           return;
         }
-        if (existingForCtrl) {
-          existingForCtrl.createdAt = Date.now();
-        } else {
-          existingQueue.push({
-            controllerConn: conn,
-            deviceId: msg.deviceId,
-            createdAt: Date.now(),
-          });
-          this.outOfBandCmds.set(key, existingQueue);
-        }
+      }
+
+      this.recordSlidingWindowHit(
+        this.sessionlessCmdRateByController,
+        conn,
+        RATE_LIMIT_WINDOW_MS,
+        now,
+      );
+      if (action === "wol") {
+        this.recordSlidingWindowHit(this.wolRateByController, conn, RATE_LIMIT_WINDOW_MS, now);
+        this.recordSlidingWindowHit(this.wolRateByIp, conn.ip, RATE_LIMIT_WINDOW_MS, now);
+      }
+
+      if (hasFiniteSeq) {
+        const key = `${msg.deviceId}:${msg.seq}`;
+        const existingQueue = this.outOfBandCmds.get(key) ?? [];
+        existingQueue.push({
+          controllerConn: conn,
+          deviceId: msg.deviceId,
+          createdAt: now,
+        });
+        setBounded(this.outOfBandCmds, key, existingQueue);
       }
 
       // Audit sessionless control actions explicitly (strictly NEVER log PIN!)
@@ -3215,10 +3611,17 @@ export class VeloDeckHub {
         ok: true,
         userId: conn.userId,
         deviceId: msg.deviceId,
-        detail: "sessionless",
+        detail: action === "wol" && wolAuditTarget ? `sessionless:${wolAuditTarget}` : "sessionless",
       });
 
-      this.sendJson(live.conn.ws, msg);
+      const forwarded: ControlCmdMessage = {
+        type: "control.cmd",
+        sessionId: "",
+        deviceId: msg.deviceId,
+        ...(hasFiniteSeq ? { seq: msg.seq } : {}),
+        command: sanitizedCmd,
+      };
+      this.sendJson(live.conn.ws, forwarded);
       return;
     }
 
@@ -3244,6 +3647,21 @@ export class VeloDeckHub {
       });
       return;
     }
+    if (session.approvalPending === true && !session.ready) {
+      this.sendError(conn.ws, "UNAUTHORIZED", "Session is awaiting host approval", {
+        sessionId: session.sessionId,
+        deviceId: session.deviceId,
+      });
+      return;
+    }
+    const permDenial = checkControlCommandPermission(sanitizedCmd, session.permissions);
+    if (permDenial) {
+      this.sendError(conn.ws, "UNAUTHORIZED", permDenial, {
+        sessionId: session.sessionId,
+        deviceId: session.deviceId,
+      });
+      return;
+    }
     const agentConn = this.getAgentForSession(session);
     if (!agentConn) {
       this.sendError(conn.ws, "DEVICE_OFFLINE", "Target device is offline", {
@@ -3253,9 +3671,45 @@ export class VeloDeckHub {
       return;
     }
 
+    if (sanitizedCmd.action === "wol") {
+      const now = Date.now();
+      const wolCtrlExceeded = this.isSlidingWindowExceeded(
+        this.wolRateByController,
+        conn,
+        MAX_WOL_PER_CONTROLLER_PER_MIN,
+        RATE_LIMIT_WINDOW_MS,
+        now,
+      );
+      const wolIpExceeded = this.isSlidingWindowExceeded(
+        this.wolRateByIp,
+        conn.ip,
+        MAX_WOL_PER_IP_PER_MIN,
+        RATE_LIMIT_WINDOW_MS,
+        now,
+      );
+      if (wolCtrlExceeded || wolIpExceeded) {
+        this.audit.log({
+          event: "rate_limit.hit",
+          ip: conn.ip,
+          ok: false,
+          userId: conn.userId,
+          deviceId: session.deviceId,
+          sessionId: session.sessionId,
+          detail: wolCtrlExceeded ? "wol_controller_rate_limit" : "wol_ip_rate_limit",
+        });
+        this.sendError(conn.ws, "RATE_LIMITED", "Too many Wake-on-LAN requests", {
+          sessionId: session.sessionId,
+          deviceId: session.deviceId,
+        });
+        return;
+      }
+      this.recordSlidingWindowHit(this.wolRateByController, conn, RATE_LIMIT_WINDOW_MS, now);
+      this.recordSlidingWindowHit(this.wolRateByIp, conn.ip, RATE_LIMIT_WINDOW_MS, now);
+    }
+
     let inSessionAuditEvent: AuditEvent | null = null;
     let inSessionAuditDetail: string | undefined;
-    switch (cmd.action) {
+    switch (sanitizedCmd.action) {
       case "wake":
         inSessionAuditEvent = "control.wake";
         break;
@@ -3270,19 +3724,19 @@ export class VeloDeckHub {
         break;
       case "privacy_screen":
         inSessionAuditEvent = "control.privacy_screen";
-        inSessionAuditDetail = cmd.enabled ? "on" : "off";
+        inSessionAuditDetail = sanitizedCmd.enabled ? "on" : "off";
         break;
       case "power":
         inSessionAuditEvent = "control.power";
-        inSessionAuditDetail = cmd.operation;
+        inSessionAuditDetail = sanitizedCmd.operation;
         break;
       case "block_input":
         inSessionAuditEvent = "control.block_input";
-        inSessionAuditDetail = cmd.enabled ? "on" : "off";
+        inSessionAuditDetail = sanitizedCmd.enabled ? "on" : "off";
         break;
       case "wol":
         inSessionAuditEvent = "control.wol";
-        inSessionAuditDetail = normalizeMacAddress(cmd.macAddress);
+        inSessionAuditDetail = wolAuditTarget;
         break;
       default:
         break;
@@ -3299,10 +3753,23 @@ export class VeloDeckHub {
       });
     }
 
-    this.sendJson(agentConn.ws, msg);
+    const forwarded: ControlCmdMessage = {
+      type: "control.cmd",
+      sessionId: session.sessionId,
+      deviceId: session.deviceId,
+      ...(hasFiniteSeq ? { seq: msg.seq } : {}),
+      command: sanitizedCmd,
+    };
+    this.sendJson(agentConn.ws, forwarded);
   }
 
   private handleControlAck(conn: ClientConn, msg: ControlAckMessage): void {
+    if (msg.sessionId !== undefined && typeof msg.sessionId !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "sessionId must be a string", {
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
     if (!isNonEmptyString(msg.sessionId)) {
       if (conn.role !== "agent" || !conn.deviceId) {
         return;
@@ -3323,7 +3790,15 @@ export class VeloDeckHub {
             this.outOfBandCmds.delete(key);
           }
           if (pending) {
-            this.sendJson(pending.controllerConn.ws, msg);
+            const forwarded: ControlAckMessage = {
+              type: "control.ack",
+              sessionId: "",
+              deviceId: conn.deviceId,
+              seq: msg.seq,
+              ok: Boolean(msg.ok),
+              ...(typeof msg.message === "string" ? { message: msg.message } : {}),
+            };
+            this.sendJson(pending.controllerConn.ws, forwarded);
           }
         }
       }
@@ -3359,6 +3834,12 @@ export class VeloDeckHub {
     conn: ClientConn,
     msg: RtcOfferMessage | RtcAnswerMessage | RtcIceMessage | ClipboardSyncMessage,
   ): void {
+    if (msg.sessionId !== undefined && typeof msg.sessionId !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "sessionId must be a string", {
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
     if (msg.type === "clipboard.sync") {
       if (
         typeof msg.text !== "string" ||
@@ -3372,7 +3853,7 @@ export class VeloDeckHub {
       }
     }
 
-    const session = this.sessions.get(msg.sessionId);
+    const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
     if (!session) {
       this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
         sessionId: msg.sessionId,
@@ -3390,6 +3871,20 @@ export class VeloDeckHub {
     }
 
     if (session.controllerConn === conn) {
+      if (session.approvalPending === true && !session.ready) {
+        this.sendError(conn.ws, "UNAUTHORIZED", "Session is awaiting host approval", {
+          sessionId: session.sessionId,
+          deviceId: session.deviceId,
+        });
+        return;
+      }
+      if (msg.type === "clipboard.sync" && session.permissions?.clipboard === false) {
+        this.sendError(conn.ws, "UNAUTHORIZED", "Clipboard permission denied for this session", {
+          sessionId: session.sessionId,
+          deviceId: session.deviceId,
+        });
+        return;
+      }
       const agentConn = this.getAgentForSession(session);
       if (!agentConn) {
         this.sendError(conn.ws, "DEVICE_OFFLINE", "Target device is offline", {
@@ -3414,6 +3909,12 @@ export class VeloDeckHub {
   }
 
   private handleCursorUpdate(conn: ClientConn, msg: CursorUpdateMessage): void {
+    if (msg.sessionId !== undefined && typeof msg.sessionId !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "sessionId must be a string", {
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
     const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
     if (!session) {
       this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
@@ -3462,11 +3963,17 @@ export class VeloDeckHub {
   }
 
   private handleChatMessage(conn: ClientConn, msg: ChatMessage): void {
+    if (msg.sessionId !== undefined && typeof msg.sessionId !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "sessionId must be a string", {
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
     const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
     if (!session) {
       this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
-        sessionId: typeof msg.sessionId === "string" ? msg.sessionId : undefined,
-        deviceId: typeof msg.deviceId === "string" ? msg.deviceId : undefined,
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
       });
       return;
     }
@@ -3489,11 +3996,32 @@ export class VeloDeckHub {
       return;
     }
 
+    if (fromController && session.approvalPending === true && !session.ready) {
+      this.sendError(conn.ws, "UNAUTHORIZED", "Session is awaiting host approval", {
+        sessionId: session.sessionId,
+        deviceId: session.deviceId,
+      });
+      return;
+    }
+
     if (
       typeof msg.text !== "string" ||
-      msg.text.trim().length === 0 ||
       Buffer.byteLength(msg.text, "utf8") > MAX_CHAT_TEXT_BYTES
     ) {
+      this.sendError(
+        conn.ws,
+        "INVALID_MESSAGE",
+        "Chat message text must be non-empty and at most 4096 bytes",
+        {
+          sessionId: msg.sessionId,
+          deviceId: msg.deviceId,
+        },
+      );
+      return;
+    }
+
+    const cleanText = msg.text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+    if (cleanText.trim().length === 0) {
       this.sendError(
         conn.ws,
         "INVALID_MESSAGE",
@@ -3527,8 +4055,14 @@ export class VeloDeckHub {
 
     // Enforce sender strictly from authenticated connection role so neither peer can spoof sender.
     const enforcedSender: ChatMessage["sender"] = conn.role === "agent" ? "host" : "controller";
+    const now = Date.now();
     const ts =
-      typeof msg.ts === "number" && Number.isFinite(msg.ts) && msg.ts > 0 ? msg.ts : Date.now();
+      typeof msg.ts === "number" &&
+      Number.isFinite(msg.ts) &&
+      msg.ts >= MIN_VALID_CHAT_TS_MS &&
+      msg.ts <= now + MAX_CHAT_TS_FUTURE_SKEW_MS
+        ? Math.trunc(msg.ts)
+        : now;
 
     const forwarded: ChatMessage = {
       type: "chat.msg",
@@ -3537,7 +4071,7 @@ export class VeloDeckHub {
       id: cleanId,
       sender: enforcedSender,
       ...(cleanSenderName ? { senderName: cleanSenderName } : {}),
-      text: msg.text,
+      text: cleanText,
       ts,
     };
 
@@ -3558,11 +4092,17 @@ export class VeloDeckHub {
   }
 
   private handleSessionPending(conn: ClientConn, msg: SessionPendingMessage): void {
+    if (msg.sessionId !== undefined && typeof msg.sessionId !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "sessionId must be a string", {
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
     const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
     if (!session) {
       this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
-        sessionId: typeof msg.sessionId === "string" ? msg.sessionId : undefined,
-        deviceId: typeof msg.deviceId === "string" ? msg.deviceId : undefined,
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
       });
       return;
     }
@@ -3587,6 +4127,16 @@ export class VeloDeckHub {
       });
       return;
     }
+    if (session.ready) {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "Cannot mark an already ready session as pending", {
+        sessionId: session.sessionId,
+        deviceId: session.deviceId,
+      });
+      return;
+    }
+    if (session.approvalPending) {
+      return;
+    }
 
     session.approvalPending = true;
     const cleanMessage =
@@ -3601,11 +4151,17 @@ export class VeloDeckHub {
   }
 
   private handleSessionPermissions(conn: ClientConn, msg: SessionPermissionsMessage): void {
+    if (msg.sessionId !== undefined && typeof msg.sessionId !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "sessionId must be a string", {
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
     const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
     if (!session) {
       this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
-        sessionId: typeof msg.sessionId === "string" ? msg.sessionId : undefined,
-        deviceId: typeof msg.deviceId === "string" ? msg.deviceId : undefined,
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
       });
       return;
     }
@@ -3641,6 +4197,7 @@ export class VeloDeckHub {
       );
       return;
     }
+    session.permissions = { ...permissions };
     const forwarded: SessionPermissionsMessage = {
       type: "session.permissions",
       sessionId: session.sessionId,
@@ -3651,7 +4208,13 @@ export class VeloDeckHub {
   }
 
   private handleSessionEnd(conn: ClientConn, msg: SessionEndMessage): void {
-    const session = this.sessions.get(msg.sessionId);
+    if (msg.sessionId !== undefined && typeof msg.sessionId !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "sessionId must be a string", {
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+    const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
     if (!session) {
       this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
         sessionId: msg.sessionId,
@@ -3879,6 +4442,9 @@ export class VeloDeckHub {
         this.liveAgents.delete(conn.deviceId);
         live.summary.online = false;
         live.summary.lastSeen = Date.now();
+        if (live.summary.blockInputActive === true) {
+          live.summary.blockInputActive = false;
+        }
         // Avoid immediate disk persistence on transient disconnect lastSeen updates;
         // startup loadFromDisk() resets online=false for all persisted devices anyway.
         this.store.updateDeviceSummaryInMemory(conn.deviceId, live.summary);
@@ -3916,6 +4482,7 @@ export class VeloDeckHub {
     if (conn.role === "controller") {
       this.controllers.delete(conn);
       this.removeOutOfBandForController(conn);
+      this.clearControllerRateLimits(conn);
       this.endSessionsForController(conn, "controller_disconnected");
     }
   }

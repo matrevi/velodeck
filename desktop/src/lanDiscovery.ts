@@ -38,10 +38,39 @@ const MAC_STRICT_REGEX =
 const ZERO_MAC = "00:00:00:00:00:00";
 const MAX_MAC_ADDRESSES = 16;
 const MAX_UDP_PACKET_BYTES = 4096;
+const VIRTUAL_INTERFACE_PREFIXES = [
+  "utun",
+  "docker",
+  "br-",
+  "veth",
+  "vmnet",
+  "vboxnet",
+  "tailscale",
+  "wg",
+  "lo",
+  "virbr",
+  "tun",
+  "tap",
+  "awdl",
+  "llw",
+  "bridge",
+  "vethernet",
+];
+
+function isVirtualInterfaceName(name: string): boolean {
+  const lower = name.trim().toLowerCase();
+  return VIRTUAL_INTERFACE_PREFIXES.some((prefix) => lower.startsWith(prefix));
+}
 
 function parseIpv4Octets(ip: string): [number, number, number, number] | null {
   const match = IPV4_REGEX.exec(ip.trim());
   if (!match) return null;
+  for (let i = 1; i <= 4; i += 1) {
+    const rawOctet = match[i]!;
+    if (rawOctet.length > 1 && rawOctet.startsWith("0")) {
+      return null;
+    }
+  }
   const a = Number(match[1]);
   const b = Number(match[2]);
   const c = Number(match[3]);
@@ -77,6 +106,13 @@ export function isRfc1918Ipv4(ip: string): boolean {
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
   return false;
+}
+
+export function isAllowedWolBroadcastIp(ip: string): boolean {
+  if (typeof ip !== "string") return false;
+  const clean = ip.trim();
+  if (clean === "255.255.255.255") return true;
+  return isRfc1918Ipv4(clean);
 }
 
 export function isPrivateOrCgnatIpv4(ip: string): boolean {
@@ -146,13 +182,16 @@ export function buildWolMagicPacket(macAddress: string): Buffer {
 export function collectLocalNetworkInfo(
   interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
 ): LocalNetworkInfo {
-  const rfc1918Ips: string[] = [];
-  const cgnatIps: string[] = [];
+  const physicalRfc1918Ips: string[] = [];
+  const virtualRfc1918Ips: string[] = [];
+  const physicalCgnatIps: string[] = [];
+  const virtualCgnatIps: string[] = [];
   const macSet = new Set<string>();
   const broadcastSet = new Set<string>();
 
-  for (const entries of Object.values(interfaces)) {
+  for (const [ifaceName, entries] of Object.entries(interfaces)) {
     if (!Array.isArray(entries)) continue;
+    const isVirtual = isVirtualInterfaceName(ifaceName);
     for (const entry of entries) {
       if (!entry || entry.internal) continue;
       const fam = entry.family as string | number;
@@ -162,9 +201,11 @@ export function collectLocalNetworkInfo(
       if (!isPrivateOrCgnatIpv4(ip)) continue;
 
       if (isRfc1918Ipv4(ip)) {
-        if (!rfc1918Ips.includes(ip)) rfc1918Ips.push(ip);
-      } else if (!cgnatIps.includes(ip)) {
-        cgnatIps.push(ip);
+        const bucket = isVirtual ? virtualRfc1918Ips : physicalRfc1918Ips;
+        if (!bucket.includes(ip)) bucket.push(ip);
+      } else {
+        const bucket = isVirtual ? virtualCgnatIps : physicalCgnatIps;
+        if (!bucket.includes(ip)) bucket.push(ip);
       }
 
       if (typeof entry.mac === "string") {
@@ -184,7 +225,12 @@ export function collectLocalNetworkInfo(
   }
 
   return {
-    lanIp: rfc1918Ips[0] ?? cgnatIps[0] ?? "",
+    lanIp:
+      physicalRfc1918Ips[0] ??
+      virtualRfc1918Ips[0] ??
+      physicalCgnatIps[0] ??
+      virtualCgnatIps[0] ??
+      "",
     macAddresses: Array.from(macSet),
     broadcastAddresses: Array.from(broadcastSet),
   };
@@ -229,8 +275,11 @@ export async function sendWakeOnLan(
   const targets: string[] = [];
   if (typeof broadcastIp === "string" && broadcastIp.trim().length > 0) {
     const cleanIp = broadcastIp.trim();
-    if (!isValidIpv4(cleanIp)) {
-      return { ok: false, error: `无效的广播 IP 地址: ${cleanIp}` };
+    if (!isAllowedWolBroadcastIp(cleanIp)) {
+      return {
+        ok: false,
+        error: `无效的局域网广播 IP 地址（仅允许 255.255.255.255 或私有 IPv4）: ${cleanIp}`,
+      };
     }
     targets.push(cleanIp);
   } else {
@@ -367,7 +416,9 @@ export class LanDiscoveryService {
 
       const payload = Buffer.from(response, "utf8");
       try {
-        sock.send(payload, 0, payload.length, rinfo.port, rinfo.address);
+        sock.send(payload, 0, payload.length, rinfo.port, rinfo.address, () => {
+          // Swallow transient per-interface send errors so the listener remains active
+        });
       } catch {
         // Ignore transient send errors
       }
@@ -497,7 +548,9 @@ export class LanDiscoveryService {
       const sendProbes = (): void => {
         for (const target of targets) {
           try {
-            sock.send(probe, 0, probe.length, this.port, target);
+            sock.send(probe, 0, probe.length, this.port, target, () => {
+              // Swallow per-interface broadcast errors (e.g. EHOSTUNREACH/ENETUNREACH)
+            });
           } catch {
             // Ignore per-interface broadcast errors
           }

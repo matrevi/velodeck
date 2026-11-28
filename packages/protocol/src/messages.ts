@@ -202,9 +202,9 @@ export type ControlCommand =
   | { action: "quality"; quality: StreamQuality }
   | { action: "request_keyframe" }
   | { action: "mouse_move"; x: number; y: number }
-  | { action: "mouse_down"; x: number; y: number; button: MouseButton; clickCount?: number }
-  | { action: "mouse_up"; x: number; y: number; button: MouseButton }
-  | { action: "mouse_wheel"; x: number; y: number; deltaX: number; deltaY: number }
+  | { action: "mouse_down"; x?: number; y?: number; button: MouseButton; clickCount?: number }
+  | { action: "mouse_up"; x?: number; y?: number; button: MouseButton }
+  | { action: "mouse_wheel"; x?: number; y?: number; deltaX: number; deltaY: number }
   | { action: "key_event"; phase: "down" | "up" | "press"; code: string; key: string; modifiers?: KeyModifiers }
   | { action: "select_display"; displayId: string }
   | { action: "privacy_screen"; enabled: boolean }

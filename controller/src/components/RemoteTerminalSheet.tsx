@@ -20,6 +20,7 @@ export interface RemoteTerminalSheetProps {
   deviceName: string;
   disabled?: boolean;
   disabledReason?: string;
+  isActiveTab?: boolean;
   onShowToast?: (level: "info" | "warn" | "error", text: string) => void;
   onClose: () => void;
 }
@@ -44,6 +45,7 @@ interface TerminalLine {
 }
 
 const MAX_TERMINAL_LINES = 2000;
+const MAX_PENDING_ESCAPE_LEN = 512;
 
 const EMPTY_STYLE: AnsiStyle = {
   color: null,
@@ -164,6 +166,13 @@ function applySgrCodes(current: AnsiStyle, rawParams: string): AnsiStyle {
         next.color = `rgb(${r}, ${g}, ${b})`;
         i += 4;
       }
+    } else if (code === 48 || code === 58) {
+      const mode = parts[i + 1];
+      if (mode === 5 && i + 2 < parts.length) {
+        i += 2;
+      } else if (mode === 2 && i + 4 < parts.length) {
+        i += 4;
+      }
     }
   }
   return next;
@@ -200,8 +209,8 @@ class TerminalBuffer {
     return this.lines.map((l) => l.plain).join("\n");
   }
 
-  public appendText(chunk: string): TerminalLine[] {
-    if (!chunk) return this.getSnapshot();
+  public appendText(chunk: string): void {
+    if (!chunk) return;
     const text = this.pendingEscape + chunk;
     this.pendingEscape = "";
 
@@ -210,7 +219,7 @@ class TerminalBuffer {
     while (i < len) {
       const ch = text[i]!;
 
-      // Escape sequence (CSI / OSC / single-char)
+      // Escape sequence (CSI / OSC / VT100 charset / single-char)
       if (ch === "\x1b") {
         if (i + 1 >= len) {
           this.pendingEscape = text.slice(i);
@@ -218,16 +227,34 @@ class TerminalBuffer {
         }
         const nextCh = text[i + 1]!;
         if (nextCh === "[") {
-          // CSI: \x1b[ params finalByte (0x40..0x7E)
+          // CSI: \x1b[ params (0x20..0x3F) finalByte (0x40..0x7E)
           let j = i + 2;
+          let found = false;
+          let aborted = false;
           while (j < len) {
             const code = text.charCodeAt(j);
-            if (code >= 0x40 && code <= 0x7e) break;
+            if (code >= 0x40 && code <= 0x7e) {
+              found = true;
+              break;
+            }
+            if (code < 0x20 || code > 0x3f || j - i >= MAX_PENDING_ESCAPE_LEN) {
+              aborted = true;
+              break;
+            }
             j += 1;
           }
-          if (j >= len) {
-            this.pendingEscape = text.slice(i);
-            break;
+          if (aborted) {
+            // Abort malformed/unterminated CSI and resume at the unexpected byte
+            i = j;
+            continue;
+          }
+          if (!found) {
+            if (len - i <= MAX_PENDING_ESCAPE_LEN) {
+              this.pendingEscape = text.slice(i);
+              break;
+            }
+            i += 2;
+            continue;
           }
           const finalByte = text[j]!;
           const params = text.slice(i + 2, j);
@@ -237,8 +264,13 @@ class TerminalBuffer {
             this.lines = [{ id: this.nextLineId++, spans: [], plain: "" }];
             this.lineOverwritable = false;
           } else if (finalByte === "K") {
-            if (params === "2") {
+            if (
+              params === "2" ||
+              params === "1" ||
+              ((params === "" || params === "0") && this.lineOverwritable)
+            ) {
               this.resetCurrentLine();
+              this.lineOverwritable = false;
             }
           }
           i = j + 1;
@@ -248,6 +280,7 @@ class TerminalBuffer {
           // OSC: ends with BEL (\x07) or ST (\x1b\\)
           let j = i + 2;
           let found = false;
+          let aborted = false;
           while (j < len) {
             if (text[j] === "\x07") {
               j += 1;
@@ -259,13 +292,34 @@ class TerminalBuffer {
               found = true;
               break;
             }
+            if (j - i >= MAX_PENDING_ESCAPE_LEN) {
+              aborted = true;
+              break;
+            }
             j += 1;
           }
+          if (aborted) {
+            i = j;
+            continue;
+          }
           if (!found) {
-            this.pendingEscape = text.slice(i);
+            if (len - i <= MAX_PENDING_ESCAPE_LEN) {
+              this.pendingEscape = text.slice(i);
+              break;
+            }
+            i = len;
             break;
           }
           i = j;
+          continue;
+        }
+        // 3-byte VT100 charset designation sequences (e.g. \x1b(B, \x1b)0)
+        if (nextCh === "(" || nextCh === ")" || nextCh === "*" || nextCh === "+") {
+          if (i + 2 >= len) {
+            this.pendingEscape = text.slice(i);
+            break;
+          }
+          i += 3;
           continue;
         }
         // Skip 2-byte escape
@@ -308,11 +362,19 @@ class TerminalBuffer {
         this.lineOverwritable = false;
       }
 
+      // Preserve UTF-16 surrogate pairs (emoji / supplementary CJK) intact
+      if (code >= 0xd800 && code <= 0xdbff && i + 1 < len) {
+        const nextCode = text.charCodeAt(i + 1);
+        if (nextCode >= 0xdc00 && nextCode <= 0xdfff) {
+          this.appendChar(text.slice(i, i + 2));
+          i += 2;
+          continue;
+        }
+      }
+
       this.appendChar(ch === "\t" ? "    " : ch);
       i += 1;
     }
-
-    return this.getSnapshot();
   }
 
   private currentLine(): TerminalLine {
@@ -339,15 +401,16 @@ class TerminalBuffer {
   private backspaceChar(): void {
     const line = this.currentLine();
     if (line.plain.length === 0) return;
-    line.plain = line.plain.slice(0, -1);
+    line.plain = Array.from(line.plain).slice(0, -1).join("");
     while (line.spans.length > 0) {
       const last = line.spans[line.spans.length - 1]!;
-      if (last.text.length > 1) {
-        last.text = last.text.slice(0, -1);
+      const chars = Array.from(last.text);
+      if (chars.length > 1) {
+        last.text = chars.slice(0, -1).join("");
         break;
       }
       line.spans.pop();
-      if (last.text.length === 1) break;
+      if (chars.length === 1) break;
     }
   }
 
@@ -369,6 +432,7 @@ export function RemoteTerminalSheet({
   deviceName,
   disabled = false,
   disabledReason,
+  isActiveTab = true,
   onShowToast,
   onClose,
 }: RemoteTerminalSheetProps) {
@@ -378,6 +442,12 @@ export function RemoteTerminalSheet({
   const termIdRef = useRef<string | null>(null);
   const historyRef = useRef<string[]>([]);
   const historyIdxRef = useRef<number>(-1);
+  const isActiveTabRef = useRef(isActiveTab);
+  isActiveTabRef.current = isActiveTab;
+  const isComposingRef = useRef(false);
+  const flushRafRef = useRef<number | null>(null);
+  const focusTimerRef = useRef<number | null>(null);
+  const copiedTimerRef = useRef<number | null>(null);
 
   const [lines, setLines] = useState<TerminalLine[]>(() =>
     bufferRef.current.getSnapshot(),
@@ -390,13 +460,60 @@ export function RemoteTerminalSheet({
   const [errorText, setErrorText] = useState<string | null>(null);
   const [exitCode, setExitCode] = useState<number | null>(null);
   const [commandDraft, setCommandDraft] = useState("");
+  const [rawInputDraft, setRawInputDraft] = useState("");
   const [rawKeyMode, setRawKeyMode] = useState(false);
   const [copiedOutput, setCopiedOutput] = useState(false);
+
+  const scheduleFocusInput = useCallback((delayMs: number) => {
+    if (focusTimerRef.current !== null) {
+      window.clearTimeout(focusTimerRef.current);
+    }
+    focusTimerRef.current = window.setTimeout(() => {
+      focusTimerRef.current = null;
+      if (isActiveTabRef.current) {
+        inputRef.current?.focus();
+      }
+    }, delayMs);
+  }, []);
+
+  const scheduleFlushLines = useCallback(() => {
+    if (flushRafRef.current !== null) return;
+    flushRafRef.current = window.requestAnimationFrame(() => {
+      flushRafRef.current = null;
+      setLines(bufferRef.current.getSnapshot());
+    });
+  }, []);
+
+  const clearTerminalBuffer = useCallback(() => {
+    if (flushRafRef.current !== null) {
+      window.cancelAnimationFrame(flushRafRef.current);
+      flushRafRef.current = null;
+    }
+    setLines(bufferRef.current.clear());
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (flushRafRef.current !== null) {
+        window.cancelAnimationFrame(flushRafRef.current);
+        flushRafRef.current = null;
+      }
+      if (focusTimerRef.current !== null) {
+        window.clearTimeout(focusTimerRef.current);
+        focusTimerRef.current = null;
+      }
+      if (copiedTimerRef.current !== null) {
+        window.clearTimeout(copiedTimerRef.current);
+        copiedTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const estimateTerminalSize = useCallback((): { cols: number; rows: number } => {
     const el = outputRef.current;
     if (!el) return { cols: 100, rows: 28 };
     const rect = el.getBoundingClientRect();
+    if (rect.width < 40 || rect.height < 40) return { cols: 100, rows: 28 };
     const cols = Math.max(40, Math.min(240, Math.floor((rect.width - 24) / 7.4)));
     const rows = Math.max(10, Math.min(80, Math.floor((rect.height - 16) / 18)));
     return { cols, rows };
@@ -449,40 +566,47 @@ export function RemoteTerminalSheet({
         setCwd(ev.cwd || "");
         setStatus("ready");
         setErrorText(null);
-        window.setTimeout(() => inputRef.current?.focus(), 30);
+        scheduleFocusInput(30);
       } else if (ev.type === "term_data") {
-        setLines(bufferRef.current.appendText(ev.data));
+        bufferRef.current.appendText(ev.data);
+        scheduleFlushLines();
       } else if (ev.type === "term_exit") {
         setStatus("exited");
         setExitCode(ev.exitCode);
-        setLines(
-          bufferRef.current.appendText(
-            `\r\n\x1b[90m[远程终端进程已退出，退出码 ${ev.exitCode}]\x1b[0m\r\n`,
-          ),
+        bufferRef.current.appendText(
+          `\r\n\x1b[90m[远程终端进程已退出，退出码 ${ev.exitCode}]\x1b[0m\r\n`,
         );
+        scheduleFlushLines();
       } else if (ev.type === "term_error") {
         setErrorText(ev.error);
         setStatus((prev) => (prev === "ready" ? prev : "error"));
       }
     });
-  }, [client]);
+  }, [client, scheduleFlushLines, scheduleFocusInput]);
 
-  // Auto-scroll to bottom when output updates
+  // Auto-scroll to bottom when output updates or tab becomes visible again
   useEffect(() => {
+    if (!isActiveTab) return;
     const el = outputRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [lines]);
+  }, [lines, isActiveTab]);
 
-  // Sync terminal dimensions on container resize
+  // Sync terminal dimensions on container resize (ignore hidden 0x0 size when tab is inactive)
   useEffect(() => {
     const el = outputRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
     let timer: number | null = null;
     const observer = new ResizeObserver(() => {
+      if (!isActiveTabRef.current) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 40 || rect.height < 40) return;
       if (timer !== null) window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         timer = null;
+        if (!isActiveTabRef.current) return;
+        const currentRect = el.getBoundingClientRect();
+        if (currentRect.width < 40 || currentRect.height < 40) return;
         if (termIdRef.current && status === "ready") {
           const { cols, rows } = estimateTerminalSize();
           client.resizeTerminal(termIdRef.current, cols, rows);
@@ -496,9 +620,11 @@ export function RemoteTerminalSheet({
     };
   }, [client, status, estimateTerminalSize]);
 
-  // Escape closes when input is empty or not focused; keep keystrokes isolated from viewport
+  // Escape closes when active tab is focused; suspend listener when hidden in background tab
   useEffect(() => {
+    if (!isActiveTab) return;
     const handleEsc = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Escape" && !rawKeyMode) {
         e.preventDefault();
         e.stopPropagation();
@@ -507,7 +633,7 @@ export function RemoteTerminalSheet({
     };
     window.addEventListener("keydown", handleEsc);
     return () => window.removeEventListener("keydown", handleEsc);
-  }, [onClose, rawKeyMode]);
+  }, [isActiveTab, onClose, rawKeyMode]);
 
   const sendRaw = useCallback(
     (data: string) => {
@@ -520,6 +646,7 @@ export function RemoteTerminalSheet({
 
   function handleSubmitCommand(e?: React.FormEvent) {
     if (e) e.preventDefault();
+    if (isComposingRef.current) return;
     const id = termIdRef.current;
     if (!id || status !== "ready") return;
     const cmd = commandDraft;
@@ -537,8 +664,14 @@ export function RemoteTerminalSheet({
   function handleInputKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     e.stopPropagation();
 
+    if (e.nativeEvent.isComposing || e.keyCode === 229 || isComposingRef.current) {
+      if (e.key === "Enter") {
+        e.preventDefault();
+      }
+      return;
+    }
+
     if (rawKeyMode && status === "ready") {
-      if (e.nativeEvent.isComposing) return;
       if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
         const code = e.key.toLowerCase().charCodeAt(0) - 96;
         if (code >= 1 && code <= 26) {
@@ -585,7 +718,7 @@ export function RemoteTerminalSheet({
       }
       if (lower === "l") {
         e.preventDefault();
-        setLines(bufferRef.current.clear());
+        clearTerminalBuffer();
         return;
       }
     }
@@ -638,7 +771,13 @@ export function RemoteTerminalSheet({
       await navigator.clipboard.writeText(plain);
       setCopiedOutput(true);
       onShowToast?.("info", "已复制终端输出到剪贴板");
-      window.setTimeout(() => setCopiedOutput(false), 1400);
+      if (copiedTimerRef.current !== null) {
+        window.clearTimeout(copiedTimerRef.current);
+      }
+      copiedTimerRef.current = window.setTimeout(() => {
+        copiedTimerRef.current = null;
+        setCopiedOutput(false);
+      }, 1400);
     } catch {
       onShowToast?.("warn", "复制终端输出失败");
     }
@@ -678,7 +817,9 @@ export function RemoteTerminalSheet({
 
   return (
     <div
-      className="fixed inset-0 z-[60] flex items-end justify-center bg-black/75 sm:items-center sm:p-4"
+      className={`${
+        isActiveTab ? "flex" : "hidden"
+      } fixed inset-0 z-[60] items-end justify-center bg-black/75 sm:items-center sm:p-4`}
       onClick={onClose}
       onKeyDown={(e) => e.stopPropagation()}
       onKeyUp={(e) => e.stopPropagation()}
@@ -788,8 +929,10 @@ export function RemoteTerminalSheet({
               type="button"
               disabled={status !== "ready"}
               onClick={() => {
+                isComposingRef.current = false;
+                setRawInputDraft("");
                 setRawKeyMode((prev) => !prev);
-                window.setTimeout(() => inputRef.current?.focus(), 20);
+                scheduleFocusInput(20);
               }}
               title="切换命令行输入模式与逐键直通模式（适合 vim/top 等全屏交互）"
               className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition disabled:opacity-40 ${
@@ -802,7 +945,7 @@ export function RemoteTerminalSheet({
             </button>
             <button
               type="button"
-              onClick={() => setLines(bufferRef.current.clear())}
+              onClick={clearTerminalBuffer}
               className="inline-flex h-7 items-center gap-1 rounded-md border border-[#262A34] bg-[#191D26] px-2 text-[11px] font-medium text-zinc-300 transition hover:bg-[#232836] hover:text-white"
               title="清空当前终端输出缓冲区"
             >
@@ -901,10 +1044,27 @@ export function RemoteTerminalSheet({
             ref={inputRef}
             type="text"
             disabled={status !== "ready"}
-            value={rawKeyMode ? "" : commandDraft}
+            value={rawKeyMode ? rawInputDraft : commandDraft}
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={(e) => {
+              isComposingRef.current = false;
+              if (rawKeyMode && status === "ready") {
+                const committed = e.data || e.currentTarget.value;
+                if (committed) {
+                  sendRaw(committed);
+                }
+                setRawInputDraft("");
+              }
+            }}
             onChange={(e) => {
               if (!rawKeyMode) {
                 setCommandDraft(e.target.value);
+              } else if (isComposingRef.current) {
+                setRawInputDraft(e.target.value);
+              } else {
+                setRawInputDraft("");
               }
             }}
             onKeyDown={handleInputKeyDown}

@@ -170,7 +170,7 @@ function broadcastHostState(state: DesktopHostState): void {
       win.webContents.send("velodeck:host-state-changed", state);
     }
   }
-  refreshMenus();
+  refreshTrayMenu();
 }
 
 function isValidPreset(value: unknown): value is WindowPreset {
@@ -261,7 +261,10 @@ function setWindowAlwaysOnTop(
 ): DesktopWindowState {
   if (process.platform === "darwin") {
     win.setAlwaysOnTop(enabled, "floating");
-    win.setVisibleOnAllWorkspaces(enabled, { visibleOnFullScreen: false });
+    win.setVisibleOnAllWorkspaces(enabled, {
+      visibleOnFullScreen: false,
+      skipTransformProcessType: true,
+    });
   } else {
     win.setAlwaysOnTop(enabled);
   }
@@ -624,8 +627,12 @@ function buildTrayContextMenu(): Menu {
       },
     },
     {
-      label: "锁定本机键鼠输入",
+      label:
+        process.platform === "darwin"
+          ? "锁定本机键鼠输入 (⌃⌥Esc 解锁)"
+          : "锁定本机键鼠输入 (Ctrl+Alt+Esc 解锁)",
       type: "checkbox",
+      enabled: Boolean(hostState?.activeSessionId),
       checked: Boolean(hostState?.blockInputActive),
       click: (item) => {
         void hostManager?.setHostBlockInput(item.checked);
@@ -904,14 +911,21 @@ function buildApplicationMenu(): Menu {
   return Menu.buildFromTemplate(template);
 }
 
+function refreshTrayMenu(): void {
+  if (!app.isReady()) {
+    return;
+  }
+  if (tray && !tray.isDestroyed()) {
+    tray.setContextMenu(buildTrayContextMenu());
+  }
+}
+
 function refreshMenus(): void {
   if (!app.isReady()) {
     return;
   }
   Menu.setApplicationMenu(buildApplicationMenu());
-  if (tray && !tray.isDestroyed()) {
-    tray.setContextMenu(buildTrayContextMenu());
-  }
+  refreshTrayMenu();
 }
 
 function createSystemTray(): void {

@@ -13,8 +13,10 @@ import {
 import {
   buildWolMagicPacket,
   collectLocalNetworkInfo,
+  isAllowedWolBroadcastIp,
   LanDiscoveryService,
   normalizeMacAddress,
+  sendWakeOnLan,
 } from "./lanDiscovery.ts";
 import {
   executePowerAction,
@@ -42,6 +44,8 @@ import {
 import {
   RemoteTerminalManager,
   sanitizeTerminalSize,
+  splitUtf8Chunks,
+  truncateUtf8Safe,
   type RemoteTerminalEvent,
 } from "./remoteTerminal.ts";
 import {
@@ -1353,6 +1357,231 @@ describe("Wave 2+3: Remote terminal, relative mouse, block input, whiteboard, an
     } finally {
       client.close();
       service.stop();
+    }
+  });
+});
+
+describe("Audit fixes: coordinate-less clicks, WOL broadcast validation, physical NIC preference, whiteboard stroke ID, UTF-8 chunking, and macOS real PTY bridge", () => {
+  const primaryDisplay: DisplayBounds = { x: 0, y: 0, width: 1920, height: 1080 };
+
+  it("preserves omitted x/y on mouse_down, mouse_up, and mouse_wheel without warping to (0,0)", () => {
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "mouse_down", button: "left", clickCount: 1 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "mouse_down", button: "left", clickCount: 1 }],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "mouse_up", button: "right" },
+        primaryDisplay,
+        "win32",
+      ),
+      [{ action: "mouse_up", button: "right", clickCount: 1 }],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "mouse_wheel", deltaX: 0, deltaY: 120 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "mouse_wheel", deltaX: 0, deltaY: 120 }],
+    );
+    // Non-finite coords also omit x/y rather than coercing to (0, 0)
+    const downNaN = translateControlCommandToNativeEvents(
+      { action: "mouse_down", x: Number.NaN, y: undefined, button: "middle" },
+      primaryDisplay,
+      "darwin",
+    );
+    assert.equal(downNaN.length, 1);
+    assert.equal("x" in downNaN[0]!, false);
+    assert.equal("y" in downNaN[0]!, false);
+    assert.equal(downNaN[0]?.button, "middle");
+  });
+
+  it("validates WOL broadcast IPv4 strictly (private RFC1918 + 255.255.255.255 only, rejects public/leading-zero IPs) and prefers physical NICs over virtual interfaces", async () => {
+    assert.equal(isAllowedWolBroadcastIp("255.255.255.255"), true);
+    assert.equal(isAllowedWolBroadcastIp("192.168.1.255"), true);
+    assert.equal(isAllowedWolBroadcastIp("10.0.0.255"), true);
+    assert.equal(isAllowedWolBroadcastIp("172.16.255.255"), true);
+
+    assert.equal(isAllowedWolBroadcastIp("8.8.8.8"), false);
+    assert.equal(isAllowedWolBroadcastIp("1.1.1.255"), false);
+    assert.equal(isAllowedWolBroadcastIp("172.32.0.1"), false);
+    assert.equal(isAllowedWolBroadcastIp("010.0.0.1"), false);
+    assert.equal(isAllowedWolBroadcastIp("192.168.001.255"), false);
+    assert.equal(isAllowedWolBroadcastIp("not-an-ip"), false);
+
+    const rejectedPublic = await sendWakeOnLan("AA:BB:CC:11:22:33", "8.8.8.8");
+    assert.equal(rejectedPublic.ok, false);
+    const rejectedLeadingZero = await sendWakeOnLan("AA:BB:CC:11:22:33", "010.0.0.255");
+    assert.equal(rejectedLeadingZero.ok, false);
+
+    // Virtual RFC1918 interfaces (docker0 / vmnet8) must not shadow physical en0
+    const mockIfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = {
+      docker0: [
+        {
+          address: "172.17.0.1",
+          netmask: "255.255.0.0",
+          family: "IPv4",
+          mac: "02:42:ac:11:00:01",
+          internal: false,
+          cidr: "172.17.0.1/16",
+        },
+      ],
+      vmnet8: [
+        {
+          address: "192.168.99.1",
+          netmask: "255.255.255.0",
+          family: "IPv4",
+          mac: "00:50:56:c0:00:08",
+          internal: false,
+          cidr: "192.168.99.1/24",
+        },
+      ],
+      en0: [
+        {
+          address: "192.168.1.42",
+          netmask: "255.255.255.0",
+          family: "IPv4",
+          mac: "aa:bb:cc:dd:ee:ff",
+          internal: false,
+          cidr: "192.168.1.42/24",
+        },
+      ],
+    };
+    const netInfo = collectLocalNetworkInfo(mockIfaces);
+    assert.equal(netInfo.lanIp, "192.168.1.42");
+  });
+
+  it("sanitizes whiteboard stroke IDs strictly against injection/invalid characters", () => {
+    const valid = sanitizeWhiteboardStroke({
+      id: "stroke_ABC-123",
+      color: "#ff0000",
+      width: 3,
+      points: [{ x: 0.2, y: 0.3 }],
+    });
+    assert.ok(valid);
+    assert.equal(valid.id, "stroke_ABC-123");
+
+    const malicious = sanitizeWhiteboardStroke({
+      id: "evil');alert(1);//",
+      color: "#ff0000",
+      width: 3,
+      points: [{ x: 0.2, y: 0.3 }],
+    });
+    assert.ok(malicious);
+    assert.match(malicious.id, /^[A-Za-z0-9_-]{1,64}$/);
+    assert.notEqual(malicious.id, "evil');alert(1);//");
+
+    const tooLong = sanitizeWhiteboardStroke({
+      id: "a".repeat(80),
+      color: "#ff0000",
+      width: 3,
+      points: [{ x: 0.5, y: 0.5 }],
+    });
+    assert.ok(tooLong);
+    assert.match(tooLong.id, /^[A-Za-z0-9_-]{1,64}$/);
+    assert.notEqual(tooLong.id, "a".repeat(80));
+  });
+
+  it("truncates and chunks multi-byte UTF-8 and emoji strings without splitting surrogate pairs", () => {
+    const emojiStr = "🚀你好世界🚀".repeat(20);
+    const truncated = truncateUtf8Safe(emojiStr, 15);
+    assert.ok(Buffer.byteLength(truncated, "utf8") <= 15);
+    // Must not end on a lone surrogate
+    assert.equal(Buffer.from(truncated, "utf8").toString("utf8"), truncated);
+
+    const chunks = splitUtf8Chunks(emojiStr, 32);
+    assert.ok(chunks.length > 1);
+    for (const chunk of chunks) {
+      assert.ok(Buffer.byteLength(chunk, "utf8") <= 32);
+      assert.equal(Buffer.from(chunk, "utf8").toString("utf8"), chunk);
+    }
+    assert.equal(chunks.join(""), emojiStr);
+  });
+
+  it("runs real macOS --pty-bridge supporting echo, TIOCSWINSZ resize, Ctrl+C SIGINT, and clean exit", async (t) => {
+    if (process.platform !== "darwin") {
+      t.skip("macOS-only native PTY bridge test");
+      return;
+    }
+
+    const events: RemoteTerminalEvent[] = [];
+    const manager = new RemoteTerminalManager({
+      platform: "darwin",
+      onEvent: (ev) => {
+        events.push(ev);
+      },
+    });
+    const helperPath = manager.resolveDarwinPtyHelperPath();
+    assert.ok(helperPath && fs.existsSync(helperPath), "Compiled darwin helper binary must exist");
+
+    const getOutput = (): string =>
+      events
+        .filter((e): e is Extract<RemoteTerminalEvent, { type: "term_data" }> => e.type === "term_data")
+        .map((e) => e.data)
+        .join("");
+
+    const waitFor = async (predicate: () => boolean, timeoutMs = 4000): Promise<boolean> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return true;
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      return predicate();
+    };
+
+    try {
+      assert.equal(manager.open("pty-real-1", 90, 28), true);
+
+      // 1) Verify real echo & PTY tty device
+      manager.write("pty-real-1", "echo VELODECK_NATIVE_PTY_ECHO\r");
+      assert.equal(
+        await waitFor(() => getOutput().includes("VELODECK_NATIVE_PTY_ECHO")),
+        true,
+        "Expected echo output from native PTY bridge",
+      );
+
+      // 2) Verify real TIOCSWINSZ resize updates stty size
+      manager.resize("pty-real-1", 132, 41);
+      await new Promise((r) => setTimeout(r, 80));
+      manager.write("pty-real-1", "stty size\r");
+      assert.equal(
+        await waitFor(() => getOutput().includes("41 132")),
+        true,
+        `Expected resized stty size '41 132' in PTY output, got: ${getOutput().slice(-300)}`,
+      );
+
+      // 3) Verify real Ctrl+C (\x03) interrupts sleep 30 via SIGINT
+      manager.write("pty-real-1", "sleep 30; echo AFTER_SLEEP_CHECK\r");
+      await new Promise((r) => setTimeout(r, 250));
+      manager.write("pty-real-1", "\x03");
+      await new Promise((r) => setTimeout(r, 150));
+      manager.write("pty-real-1", "echo SIGINT_RECOVERED\r");
+      assert.equal(
+        await waitFor(() => getOutput().includes("SIGINT_RECOVERED")),
+        true,
+        "Expected Ctrl+C to interrupt sleep 30 and return to shell prompt",
+      );
+
+      // 4) Verify clean exit emits term_exit
+      manager.write("pty-real-1", "exit 0\r");
+      assert.equal(
+        await waitFor(() => events.some((e) => e.type === "term_exit" && e.termId === "pty-real-1")),
+        true,
+        "Expected clean term_exit event",
+      );
+      const exitEv = events.find(
+        (e): e is Extract<RemoteTerminalEvent, { type: "term_exit" }> =>
+          e.type === "term_exit" && e.termId === "pty-real-1",
+      );
+      assert.equal(exitEv?.exitCode, 0);
+      assert.equal(manager.activeCount, 0);
+    } finally {
+      manager.closeAll();
     }
   });
 });

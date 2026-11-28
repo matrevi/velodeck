@@ -286,6 +286,7 @@ describe("desktop bridge detection", () => {
           width: 2560,
           height: 1600,
           primary: true,
+          scaleFactor: 2,
         },
         {
           id: "disp-2",
@@ -318,7 +319,7 @@ describe("desktop bridge detection", () => {
       lanIp: "192.168.1.88",
       macAddresses: ["11:22:33:44:55:66"],
       controlCode: "123456789",
-      lastSeen: 1700000000000,
+      seenAt: 1700000000000,
     };
     const samplePending: DesktopHostPendingApproval = {
       sessionId: "sess-approve-1",
@@ -463,7 +464,7 @@ describe("desktop bridge detection", () => {
     const rejected = await bridge.rejectHostSession?.(samplePending.sessionId);
     expect(rejected?.pendingApproval).toBeNull();
     const chatRes = await bridge.sendHostChatMessage?.("收到");
-    expect(chatRes).toBeDefined();
+    expect(chatRes?.chatMessages?.[0]?.text).toBe("收到");
     expect(await bridge.writeClipboardText?.("hello")).toBe(true);
     expect(await bridge.readClipboardText?.()).toBe("copied from host");
 

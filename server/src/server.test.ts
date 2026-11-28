@@ -16,6 +16,7 @@ import {
   type AgentRegisterMessage,
   type AgentRegisteredMessage,
   type ChatMessage,
+  type ClipboardSyncMessage,
   type ControlAckMessage,
   type ControlCmdMessage,
   type ControllerAuthedMessage,
@@ -4563,29 +4564,78 @@ test("Wave 2+3 metadata (macAddresses, lanIp, accessMode, blockInputActive) and 
   assert.equal(cloned.accessMode, "auto");
   assert.equal(cloned.blockInputActive, false);
 
-  // 6. Persisted disk reload preserves registered Wave 2+3 fields and capabilities
+  // 6. Persisted disk reload preserves durable telemetry updates (macAddresses, lanIp, accessMode)
+  //    while keeping high-frequency transient telemetry in-memory only and resetting blockInputActive.
+  await server.hub.store.flush();
+  desktopAgent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "desk-wave23-01",
+    battery: 42,
+    blockInputActive: true,
+  });
+  const telemetry3 = await ctrl.nextJson<DeviceStatusMessage>();
+  assert.equal(telemetry3.device.battery, 42);
+  assert.equal(telemetry3.device.blockInputActive, true);
+
   await server.hub.store.flush();
   const reloadedStore = new VeloDeckStore(dataDir);
   const persisted = reloadedStore.getDevice("desk-wave23-01");
   assert.ok(persisted);
-  assert.equal(persisted.summary.blockInputActive, true);
-  assert.equal(persisted.summary.accessMode, "confirm");
-  assert.equal(persisted.summary.lanIp, "192.168.10.42");
-  assert.equal(persisted.summary.macAddresses?.length, 8);
-  assert.equal(persisted.summary.macAddresses?.[0], "AA:BB:CC:DD:EE:01");
-  assert.equal(persisted.summary.capabilities.remoteTerminal, true);
-  assert.equal(persisted.summary.capabilities.relativeMouse, true);
-  assert.equal(persisted.summary.capabilities.cursorSync, true);
-  assert.equal(persisted.summary.capabilities.blockInput, true);
+  assert.equal(persisted.summary.online, false);
+  assert.equal(persisted.summary.blockInputActive, false);
+  assert.equal(persisted.summary.accessMode, "auto");
+  assert.equal(persisted.summary.lanIp, "100.64.12.34");
+  assert.deepEqual(persisted.summary.macAddresses, ["DE:AD:BE:EF:00:01"]);
+  // Transient battery-only telemetry did NOT overwrite disk snapshot
+  assert.notEqual(persisted.summary.battery, 42);
+  assert.equal(persisted.summary.capabilities.remoteTerminal, false);
+  assert.equal(persisted.summary.capabilities.chat, false);
   assert.equal(persisted.summary.capabilities.wolRelay, true);
   assert.equal(persisted.summary.capabilities.whiteboard, true);
-  assert.equal(persisted.summary.capabilities.chat, true);
+
+  // Also verify loadFromDisk resets persisted blockInputActive: true -> false
+  const persistedWithBlock = cloneDeviceSummary(persisted.summary);
+  persistedWithBlock.blockInputActive = true;
+  server.hub.store.updateDeviceSummary("desk-wave23-01", persistedWithBlock, true);
+  await server.hub.store.flush();
+  const reloadedAfterBlock = new VeloDeckStore(dataDir);
+  assert.equal(reloadedAfterBlock.getDevice("desk-wave23-01")?.summary.blockInputActive, false);
 
   const persistedBad = reloadedStore.getDevice("desk-badmeta-02");
   assert.ok(persistedBad);
   assert.equal(Object.hasOwn(persistedBad.summary, "lanIp"), false);
   assert.equal(Object.hasOwn(persistedBad.summary, "macAddresses"), false);
   assert.equal(Object.hasOwn(persistedBad.summary, "accessMode"), false);
+
+  // 7. Disconnect resets blockInputActive to false, and reconnecting with transient empty macAddresses: []
+  //    preserves previously persisted WOL MACs and does NOT inherit blockInputActive.
+  await desktopAgent.close();
+  const offlineStatus = await ctrl.nextJson<DeviceStatusMessage>();
+  assert.equal(offlineStatus.device.deviceId, "desk-wave23-01");
+  assert.equal(offlineStatus.device.online, false);
+  assert.equal(offlineStatus.device.blockInputActive, false);
+  assert.deepEqual(offlineStatus.device.macAddresses, ["DE:AD:BE:EF:00:01"]);
+
+  const reconnectedAgent = await TestWsClient.connect(wsUrl);
+  t.after(() => reconnectedAgent.close());
+  reconnectedAgent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-wave23-01",
+      deviceSecret: "desk-wave23-secret-01",
+      authToken: token,
+      deviceType: "desktop",
+      osPlatform: "win32",
+      macAddresses: [],
+    }),
+  );
+  await reconnectedAgent.nextJson<AgentRegisteredMessage>();
+  const onlineAgain = await ctrl.nextJson<DeviceStatusMessage>();
+  assert.equal(onlineAgain.device.deviceId, "desk-wave23-01");
+  assert.equal(onlineAgain.device.online, true);
+  assert.deepEqual(onlineAgain.device.macAddresses, ["DE:AD:BE:EF:00:01"]);
+  assert.equal(onlineAgain.device.lanIp, "100.64.12.34");
+  assert.equal(onlineAgain.device.accessMode, "auto");
+  assert.equal(Object.hasOwn(onlineAgain.device, "blockInputActive"), false);
 });
 
 test("Wave 2+3 control commands: mouse_move_relative, block_input (session-only + audit), whiteboard validation, and sessionless wol auth + audit", async (t) => {
@@ -4725,7 +4775,7 @@ test("Wave 2+3 control commands: mouse_move_relative, block_input (session-only 
   const wolBroadcast255 = await alicePeer.nextJson<ControlCmdMessage>();
   assert.deepEqual(wolBroadcast255.command, {
     action: "wol",
-    macAddress: "aa-bb-cc-dd-ee-00",
+    macAddress: "AA:BB:CC:DD:EE:00",
     broadcastIp: "255.255.255.255",
   });
 
@@ -4904,7 +4954,14 @@ test("Wave 2+3 control commands: mouse_move_relative, block_input (session-only 
 
   const wolAudit = auditEntries.filter((e) => e.event === "control.wol");
   assert.equal(wolAudit.length, 2);
-  assert.ok(wolAudit.every((e) => e.deviceId === "alice-mac-relay" && e.detail === "sessionless"));
+  assert.ok(wolAudit.every((e) => e.deviceId === "alice-mac-relay"));
+  assert.deepEqual(
+    wolAudit.map((e) => e.detail),
+    [
+      "sessionless:AA:BB:CC:DD:EE:FF@192.168.1.255",
+      "sessionless:AA:BB:CC:DD:EE:00@255.255.255.255",
+    ],
+  );
 });
 
 test("Wave 2+3 in-session wire messages: cursor.update, chat.msg (bidirectional + sender role enforcement + >4KB rejection), session.pending, and session.permissions", async (t) => {
@@ -5195,4 +5252,910 @@ test("Wave 2+3 in-session wire messages: cursor.update, chat.msg (bidirectional 
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(agent.drainJson().length, 0);
   assert.equal(ctrl.drainJson().length, 0);
+});
+
+test("[P0-1 & P1-3 & P1-4] Pre-approval gating blocks controller session traffic, deduplicates session.pending, rejects duplicate session.request and post-ready session.pending, and preserves Android v1.0.9 compatibility", async (t) => {
+  const { server, baseUrl, wsUrl } = await startServer({
+    registrationInviteCode: "HARDEN-P01-INVITE",
+  });
+  t.after(() => server.close());
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "harden_p01",
+      password: "harden-p01-password",
+      inviteCode: "HARDEN-P01-INVITE",
+    }),
+  });
+  assert.equal(regRes.status, 201);
+  const { token } = (await regRes.json()) as { token: string };
+
+  const desktopAgent = await TestWsClient.connect(wsUrl);
+  const androidAgent = await TestWsClient.connect(wsUrl);
+  const ctrl = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([desktopAgent.close(), androidAgent.close(), ctrl.close()]);
+  });
+
+  desktopAgent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-approval-01",
+      deviceSecret: "desk-approval-secret-01",
+      authToken: token,
+      deviceType: "desktop",
+      osPlatform: "darwin",
+      accessMode: "confirm",
+    }),
+  );
+  await desktopAgent.nextJson<AgentRegisteredMessage>();
+
+  androidAgent.sendJson(
+    makeAgentRegister({
+      deviceId: "android-legacy-01",
+      deviceSecret: "android-legacy-secret-01",
+      authToken: token,
+    }),
+  );
+  await androidAgent.nextJson<AgentRegisteredMessage>();
+
+  ctrl.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-approval-01",
+  });
+  await ctrl.nextJson<ControllerAuthedMessage>();
+
+  // 1. Desktop session enters approvalPending via session.pending
+  ctrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-approve-01",
+    deviceId: "desk-approval-01",
+    preferredTransport: "webrtc",
+    quality: DESKTOP_QUALITY_PRESETS.balanced,
+  } satisfies SessionRequestMessage);
+  await desktopAgent.nextJson<SessionRequestMessage>();
+
+  desktopAgent.sendJson({
+    type: "session.pending",
+    sessionId: "sess-approve-01",
+    deviceId: "desk-approval-01",
+    message: "Awaiting local host confirmation",
+  } satisfies SessionPendingMessage);
+  const pending1 = await ctrl.nextJson<SessionPendingMessage>();
+  assert.equal(pending1.type, "session.pending");
+  assert.equal(pending1.sessionId, "sess-approve-01");
+
+  // 2. Repeated session.pending while already pending is ignored/deduplicated (no controller spam)
+  desktopAgent.sendJson({
+    type: "session.pending",
+    sessionId: "sess-approve-01",
+    deviceId: "desk-approval-01",
+    message: "Awaiting local host confirmation",
+  } satisfies SessionPendingMessage);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(ctrl.drainJson().length, 0);
+
+  // 3. Duplicate session.request for the same sessionId MUST be rejected with INVALID_MESSAGE
+  //    and MUST NOT reset approvalPending!
+  ctrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-approve-01",
+    deviceId: "desk-approval-01",
+    preferredTransport: "webrtc",
+    quality: DESKTOP_QUALITY_PRESETS.balanced,
+  } satisfies SessionRequestMessage);
+  const dupReqErr = await ctrl.nextJson<ErrorMessage>();
+  assert.equal(dupReqErr.type, "error");
+  assert.equal(dupReqErr.code, "INVALID_MESSAGE");
+  assert.equal(dupReqErr.message, "Session ID already active");
+
+  // 4. While approvalPending && !ready, controller control.cmd, clipboard.sync, rtc.*, and chat.msg are ALL blocked
+  const blockedMessages: WireMessage[] = [
+    {
+      type: "control.cmd",
+      sessionId: "sess-approve-01",
+      deviceId: "desk-approval-01",
+      seq: 1,
+      command: { action: "mouse_move", x: 0.5, y: 0.5 },
+    },
+    {
+      type: "clipboard.sync",
+      sessionId: "sess-approve-01",
+      deviceId: "desk-approval-01",
+      text: "injected before approval",
+    },
+    {
+      type: "rtc.offer",
+      sessionId: "sess-approve-01",
+      deviceId: "desk-approval-01",
+      sdp: "v=0...",
+    },
+    {
+      type: "rtc.answer",
+      sessionId: "sess-approve-01",
+      deviceId: "desk-approval-01",
+      sdp: "v=0...",
+    },
+    {
+      type: "rtc.ice",
+      sessionId: "sess-approve-01",
+      deviceId: "desk-approval-01",
+      candidate: { candidate: "candidate:1 1 udp 1 127.0.0.1 1234 typ host" },
+    },
+    {
+      type: "chat.msg",
+      sessionId: "sess-approve-01",
+      deviceId: "desk-approval-01",
+      id: "chat-pre-approve",
+      sender: "controller",
+      text: "hello before approval",
+      ts: Date.now(),
+    },
+  ];
+
+  for (const msg of blockedMessages) {
+    ctrl.sendJson(msg);
+    const err = await ctrl.nextJson<ErrorMessage>();
+    assert.equal(err.type, "error");
+    assert.equal(err.code, "UNAUTHORIZED");
+    assert.equal(err.message, "Session is awaiting host approval");
+  }
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(desktopAgent.drainJson().length, 0);
+
+  // 5. Once agent sends session.ready, approvalPending clears and controller traffic flows normally
+  desktopAgent.sendJson({
+    type: "session.ready",
+    sessionId: "sess-approve-01",
+    deviceId: "desk-approval-01",
+    transport: "webrtc",
+    screenWidth: 1920,
+    screenHeight: 1080,
+    rotation: 0,
+  } satisfies SessionReadyMessage);
+  await ctrl.nextJson<SessionReadyMessage>();
+
+  // session.pending AFTER session.ready MUST be rejected with INVALID_MESSAGE
+  desktopAgent.sendJson({
+    type: "session.pending",
+    sessionId: "sess-approve-01",
+    deviceId: "desk-approval-01",
+    message: "Too late",
+  } satisfies SessionPendingMessage);
+  const latePendingErr = await desktopAgent.nextJson<ErrorMessage>();
+  assert.equal(latePendingErr.type, "error");
+  assert.equal(latePendingErr.code, "INVALID_MESSAGE");
+
+  // Controller control.cmd and chat.msg now succeed
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-approve-01",
+    deviceId: "desk-approval-01",
+    seq: 2,
+    command: { action: "mouse_move", x: 0.25, y: 0.75 },
+  } satisfies ControlCmdMessage);
+  const okMove = await desktopAgent.nextJson<ControlCmdMessage>();
+  assert.equal(okMove.command.action, "mouse_move");
+
+  // 6. Legacy Android v1.0.9 compatibility: without session.pending, controller can send rtc.offer before session.ready
+  ctrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-android-01",
+    deviceId: "android-legacy-01",
+    preferredTransport: "webrtc",
+    quality: QUALITY_PRESETS.balanced,
+  } satisfies SessionRequestMessage);
+  await androidAgent.nextJson<SessionRequestMessage>();
+
+  ctrl.sendJson({
+    type: "rtc.offer",
+    sessionId: "sess-android-01",
+    deviceId: "android-legacy-01",
+    sdp: "v=0-legacy-android",
+  } satisfies RtcOfferMessage);
+  const forwardedOffer = await androidAgent.nextJson<RtcOfferMessage>();
+  assert.equal(forwardedOffer.type, "rtc.offer");
+  assert.equal(forwardedOffer.sdp, "v=0-legacy-android");
+});
+
+test("[P0-1 & P2-2] Server-side session.permissions enforcement blocks disallowed mouse/keyboard/clipboard/audio/privileged commands and audits in-session WOL target", async (t) => {
+  const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "velodeck-perms-test-"));
+  const { server, baseUrl, wsUrl } = await startServer({
+    dataDir,
+    registrationInviteCode: "HARDEN-PERMS-INVITE",
+  });
+  t.after(async () => {
+    await server.close();
+    await fsp.rm(dataDir, { recursive: true, force: true });
+  });
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "harden_perms",
+      password: "harden-perms-password",
+      inviteCode: "HARDEN-PERMS-INVITE",
+    }),
+  });
+  assert.equal(regRes.status, 201);
+  const { token } = (await regRes.json()) as { token: string };
+
+  const agent = await TestWsClient.connect(wsUrl);
+  const ctrl = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent.close(), ctrl.close()]);
+  });
+
+  agent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-perms-01",
+      deviceSecret: "desk-perms-secret-01",
+      authToken: token,
+      deviceType: "desktop",
+      osPlatform: "win32",
+    }),
+  );
+  await agent.nextJson<AgentRegisteredMessage>();
+
+  ctrl.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-perms-01",
+  });
+  await ctrl.nextJson<ControllerAuthedMessage>();
+
+  ctrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    preferredTransport: "webrtc",
+    quality: DESKTOP_QUALITY_PRESETS.balanced,
+  } satisfies SessionRequestMessage);
+  await agent.nextJson<SessionRequestMessage>();
+
+  // 1. Disable mouse only -> blocks all mouse/touch actions AND power/block_input/privacy_screen/wol
+  agent.sendJson({
+    type: "session.permissions",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    permissions: {
+      mouse: false,
+      keyboard: true,
+      clipboard: true,
+      audio: true,
+    },
+  } satisfies SessionPermissionsMessage);
+  await ctrl.nextJson<SessionPermissionsMessage>();
+
+  agent.sendJson({
+    type: "session.ready",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    transport: "webrtc",
+    screenWidth: 1920,
+    screenHeight: 1080,
+    rotation: 0,
+  } satisfies SessionReadyMessage);
+  await ctrl.nextJson<SessionReadyMessage>();
+
+  const mouseDeniedCmds: ControlCmdMessage["command"][] = [
+    { action: "mouse_move", x: 0.5, y: 0.5 },
+    { action: "mouse_move_relative", dx: 4, dy: -2 },
+    { action: "mouse_down", button: "left" },
+    { action: "mouse_up", button: "left" },
+    { action: "mouse_wheel", deltaX: 0, deltaY: -120 },
+    { action: "tap", x: 0.5, y: 0.5 },
+    { action: "long_press", x: 0.5, y: 0.5 },
+    { action: "swipe", x1: 0.1, y1: 0.1, x2: 0.9, y2: 0.9 },
+    { action: "touch_down", pointerId: 1, x: 0.2, y: 0.2 },
+    { action: "touch_move", pointerId: 1, x: 0.3, y: 0.3 },
+    { action: "touch_up", pointerId: 1, x: 0.3, y: 0.3 },
+    { action: "pinch", cx: 0.5, cy: 0.5, startDist: 0.1, endDist: 0.2 },
+    { action: "power", operation: "lock" },
+    { action: "block_input", enabled: true },
+    { action: "privacy_screen", enabled: true },
+    { action: "wol", macAddress: "AA:BB:CC:DD:EE:11", broadcastIp: "192.168.1.255" },
+  ];
+
+  for (const command of mouseDeniedCmds) {
+    ctrl.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-perms-01",
+      deviceId: "desk-perms-01",
+      command,
+    } satisfies ControlCmdMessage);
+    const err = await ctrl.nextJson<ErrorMessage>();
+    assert.equal(err.type, "error");
+    assert.equal(err.code, "UNAUTHORIZED");
+  }
+
+  // Keyboard still works while mouse is disabled
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    command: { action: "key_event", phase: "press", code: "KeyA", key: "a" },
+  } satisfies ControlCmdMessage);
+  const okKey = await agent.nextJson<ControlCmdMessage>();
+  assert.equal(okKey.command.action, "key_event");
+
+  // 2. Disable keyboard, clipboard, audio (re-enable mouse)
+  agent.sendJson({
+    type: "session.permissions",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    permissions: {
+      mouse: true,
+      keyboard: false,
+      clipboard: false,
+      audio: false,
+    },
+  } satisfies SessionPermissionsMessage);
+  await ctrl.nextJson<SessionPermissionsMessage>();
+
+  const kbClipAudioDenied: ControlCmdMessage["command"][] = [
+    { action: "key_event", phase: "down", code: "KeyB", key: "b" },
+    { action: "key", key: "enter" },
+    { action: "text", text: "blocked" },
+    { action: "clipboard_set", text: "blocked clip" },
+    { action: "audio_toggle", enabled: true },
+    { action: "power", operation: "sleep" },
+    { action: "block_input", enabled: true },
+    { action: "privacy_screen", enabled: true },
+    { action: "wol", macAddress: "AA:BB:CC:DD:EE:11" },
+  ];
+
+  for (const command of kbClipAudioDenied) {
+    ctrl.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-perms-01",
+      deviceId: "desk-perms-01",
+      command,
+    } satisfies ControlCmdMessage);
+    const err = await ctrl.nextJson<ErrorMessage>();
+    assert.equal(err.code, "UNAUTHORIZED");
+  }
+
+  // Controller->agent clipboard.sync blocked when clipboard === false
+  ctrl.sendJson({
+    type: "clipboard.sync",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    text: "blocked sync",
+  } satisfies ClipboardSyncMessage);
+  const clipSyncErr = await ctrl.nextJson<ErrorMessage>();
+  assert.equal(clipSyncErr.code, "UNAUTHORIZED");
+
+  // audio_toggle with enabled: false is still allowed (muting)
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    command: { action: "audio_toggle", enabled: false },
+  } satisfies ControlCmdMessage);
+  const okAudioOff = await agent.nextJson<ControlCmdMessage>();
+  assert.deepEqual(okAudioOff.command, { action: "audio_toggle", enabled: false });
+
+  // Agent->controller clipboard.sync is still permitted even when controller clipboard === false
+  agent.sendJson({
+    type: "clipboard.sync",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    text: "from host",
+  } satisfies ClipboardSyncMessage);
+  const hostClip = await ctrl.nextJson<ClipboardSyncMessage>();
+  assert.equal(hostClip.text, "from host");
+
+  // 3. Re-enable all permissions -> in-session WOL succeeds and logs MAC@broadcastIp + MAC in audit
+  agent.sendJson({
+    type: "session.permissions",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    permissions: {
+      mouse: true,
+      keyboard: true,
+      clipboard: true,
+      audio: true,
+    },
+  } satisfies SessionPermissionsMessage);
+  await ctrl.nextJson<SessionPermissionsMessage>();
+
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    command: {
+      action: "wol",
+      macAddress: "12-34-56-78-9a-bc",
+      broadcastIp: "10.0.0.255",
+      extraInjected: "drop-me",
+    } as unknown as ControlCmdMessage["command"],
+  });
+  const wol1 = await agent.nextJson<ControlCmdMessage>();
+  assert.deepEqual(wol1.command, {
+    action: "wol",
+    macAddress: "12:34:56:78:9A:BC",
+    broadcastIp: "10.0.0.255",
+  });
+
+  ctrl.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-perms-01",
+    deviceId: "desk-perms-01",
+    command: {
+      action: "wol",
+      macAddress: "12:34:56:78:9a:bd",
+    },
+  } satisfies ControlCmdMessage);
+  const wol2 = await agent.nextJson<ControlCmdMessage>();
+  assert.deepEqual(wol2.command, {
+    action: "wol",
+    macAddress: "12:34:56:78:9A:BD",
+  });
+
+  await server.hub.audit.flush();
+  const auditEntries = (await fsp.readFile(path.join(dataDir, "audit.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { event: string; detail?: string; sessionId?: string });
+  const wolAudit = auditEntries.filter((e) => e.event === "control.wol");
+  assert.deepEqual(
+    wolAudit.map((e) => e.detail),
+    ["12:34:56:78:9A:BC@10.0.0.255", "12:34:56:78:9A:BD"],
+  );
+  assert.ok(wolAudit.every((e) => e.sessionId === "sess-perms-01"));
+});
+
+test("[P0-2 & P0-3] Rejects octal/leading-zero IPv4, CGNAT WOL broadcastIp, zero/broadcast MAC, and enforces WOL + sessionless rate limits without seq", async (t) => {
+  const { server, baseUrl, wsUrl } = await startServer({
+    registrationInviteCode: "HARDEN-RATE-INVITE",
+  });
+  t.after(() => server.close());
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "harden_rate",
+      password: "harden-rate-password",
+      inviteCode: "HARDEN-RATE-INVITE",
+    }),
+  });
+  assert.equal(regRes.status, 201);
+  const { token } = (await regRes.json()) as { token: string };
+
+  const agent = await TestWsClient.connect(wsUrl);
+  const ctrl1 = await TestWsClient.connect(wsUrl);
+  const ctrl2 = await TestWsClient.connect(wsUrl);
+  const ctrl3 = await TestWsClient.connect(wsUrl);
+  const ctrlWake = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent.close(), ctrl1.close(), ctrl2.close(), ctrl3.close(), ctrlWake.close()]);
+  });
+
+  // Octal/leading-zero lanIp and zero/broadcast MACs sanitized out on register
+  agent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-octal-01",
+      deviceSecret: "desk-octal-secret-01",
+      authToken: token,
+      lanIp: "010.8.8.8",
+      macAddresses: ["00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF", "ff-ff-ff-ff-ff-ff"],
+    }),
+  );
+  await agent.nextJson<AgentRegisteredMessage>();
+
+  for (const [client, id] of [
+    [ctrl1, "ctrl-wol-1"],
+    [ctrl2, "ctrl-wol-2"],
+    [ctrl3, "ctrl-wol-3"],
+    [ctrlWake, "ctrl-wake-1"],
+  ] as const) {
+    client.sendJson({ type: "controller.auth", authToken: token, clientId: id });
+  }
+  const authed1 = await ctrl1.nextJson<ControllerAuthedMessage>();
+  await Promise.all([
+    ctrl2.nextJson<ControllerAuthedMessage>(),
+    ctrl3.nextJson<ControllerAuthedMessage>(),
+    ctrlWake.nextJson<ControllerAuthedMessage>(),
+  ]);
+
+  const dev = authed1.devices.find((d) => d.deviceId === "desk-octal-01");
+  assert.ok(dev);
+  assert.equal(Object.hasOwn(dev, "lanIp"), false);
+  assert.equal(Object.hasOwn(dev, "macAddresses"), false);
+
+  // Octal lanIp in telemetry also rejected
+  agent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "desk-octal-01",
+    lanIp: "172.016.0.1",
+  });
+  const telStatus = await ctrl1.nextJson<DeviceStatusMessage>();
+  assert.equal(Object.hasOwn(telStatus.device, "lanIp"), false);
+  await Promise.all([
+    ctrl2.nextJson<DeviceStatusMessage>(),
+    ctrl3.nextJson<DeviceStatusMessage>(),
+    ctrlWake.nextJson<DeviceStatusMessage>(),
+  ]);
+
+  // Reject octal/leading-zero broadcastIp, CGNAT broadcastIp, and zero/broadcast MACs in WOL
+  const rejectedWolCmds = [
+    { action: "wol", macAddress: "AA:BB:CC:DD:EE:01", broadcastIp: "010.8.8.8" },
+    { action: "wol", macAddress: "AA:BB:CC:DD:EE:01", broadcastIp: "172.016.0.1" },
+    { action: "wol", macAddress: "AA:BB:CC:DD:EE:01", broadcastIp: "192.168.01.255" },
+    { action: "wol", macAddress: "AA:BB:CC:DD:EE:01", broadcastIp: "100.64.1.255" },
+    { action: "wol", macAddress: "00:00:00:00:00:00", broadcastIp: "192.168.1.255" },
+    { action: "wol", macAddress: "FF:FF:FF:FF:FF:FF", broadcastIp: "192.168.1.255" },
+    { action: "wol", macAddress: "ff-ff-ff-ff-ff-ff" },
+  ] as const;
+
+  for (const command of rejectedWolCmds) {
+    ctrl1.sendJson({
+      type: "control.cmd",
+      sessionId: "",
+      deviceId: "desk-octal-01",
+      command,
+    });
+    const err = await ctrl1.nextJson<ErrorMessage>();
+    assert.equal(err.code, "INVALID_MESSAGE");
+  }
+
+  // Per-controller WOL rate limit: 10 allowed WITHOUT seq, 11th returns RATE_LIMITED
+  for (let i = 0; i < 10; i += 1) {
+    ctrl1.sendJson({
+      type: "control.cmd",
+      sessionId: "",
+      deviceId: "desk-octal-01",
+      command: { action: "wol", macAddress: "AA:BB:CC:DD:EE:01", broadcastIp: "192.168.1.255" },
+    });
+    const fwd = await agent.nextJson<ControlCmdMessage>();
+    assert.equal(fwd.command.action, "wol");
+  }
+  ctrl1.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "desk-octal-01",
+    command: { action: "wol", macAddress: "AA:BB:CC:DD:EE:01", broadcastIp: "192.168.1.255" },
+  });
+  const wolCtrlRateErr = await ctrl1.nextJson<ErrorMessage>();
+  assert.equal(wolCtrlRateErr.code, "RATE_LIMITED");
+
+  // Second controller from same IP can send 10 more (total 20 per IP), then 3rd controller hits IP limit (20/60s)
+  for (let i = 0; i < 10; i += 1) {
+    ctrl2.sendJson({
+      type: "control.cmd",
+      sessionId: "",
+      deviceId: "desk-octal-01",
+      command: { action: "wol", macAddress: "AA:BB:CC:DD:EE:02", broadcastIp: "10.0.0.255" },
+    });
+    await agent.nextJson<ControlCmdMessage>();
+  }
+  ctrl3.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "desk-octal-01",
+    command: { action: "wol", macAddress: "AA:BB:CC:DD:EE:03" },
+  });
+  const wolIpRateErr = await ctrl3.nextJson<ErrorMessage>();
+  assert.equal(wolIpRateErr.code, "RATE_LIMITED");
+
+  // Sessionless control command rate limit (without seq): 20 allowed, 21st rejected with RATE_LIMITED
+  for (let i = 0; i < 20; i += 1) {
+    ctrlWake.sendJson({
+      type: "control.cmd",
+      sessionId: "",
+      deviceId: "desk-octal-01",
+      command: { action: "wake" },
+    });
+    const fwd = await agent.nextJson<ControlCmdMessage>();
+    assert.equal(fwd.command.action, "wake");
+    assert.equal(fwd.sessionId, "");
+  }
+  ctrlWake.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "desk-octal-01",
+    command: { action: "wake" },
+  });
+  const wakeRateErr = await ctrlWake.nextJson<ErrorMessage>();
+  assert.equal(wakeRateErr.code, "RATE_LIMITED");
+});
+
+test("[P1-5 & P3-2 & P2-3..P3-1] Hardened whiteboard, coordinate-less mouse commands, mouse_move_relative bounds, chat sanitization, non-string sessionId, and OOB ACK routing/unbind cleanup", async (t) => {
+  const { server, baseUrl, wsUrl } = await startServer({
+    registrationInviteCode: "HARDEN-INPUT-INVITE",
+  });
+  t.after(() => server.close());
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "harden_input",
+      password: "harden-input-password",
+      inviteCode: "HARDEN-INPUT-INVITE",
+    }),
+  });
+  assert.equal(regRes.status, 201);
+  const { token, user } = (await regRes.json()) as { token: string; user: UserProfile };
+
+  const agent = await TestWsClient.connect(wsUrl);
+  const ctrl1 = await TestWsClient.connect(wsUrl);
+  const ctrl2 = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent.close(), ctrl1.close(), ctrl2.close()]);
+  });
+
+  agent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-input-01",
+      deviceSecret: "desk-input-secret-01",
+      authToken: token,
+      deviceType: "desktop",
+      osPlatform: "linux",
+      blockInputActive: true,
+    }),
+  );
+  await agent.nextJson<AgentRegisteredMessage>();
+
+  ctrl1.sendJson({ type: "controller.auth", authToken: token, clientId: "ctrl-in-1" });
+  ctrl2.sendJson({ type: "controller.auth", authToken: token, clientId: "ctrl-in-2" });
+  await Promise.all([
+    ctrl1.nextJson<ControllerAuthedMessage>(),
+    ctrl2.nextJson<ControllerAuthedMessage>(),
+  ]);
+
+  // 1. Non-string sessionId rejected cleanly (and sendError omits non-string sessionId/deviceId)
+  ctrl1.sendJson({
+    type: "control.cmd",
+    sessionId: { bad: true },
+    deviceId: 12345,
+    command: { action: "wake" },
+  });
+  const nonStrErr = await ctrl1.nextJson<ErrorMessage>();
+  assert.equal(nonStrErr.code, "INVALID_MESSAGE");
+  assert.equal(Object.hasOwn(nonStrErr, "sessionId"), false);
+  assert.equal(Object.hasOwn(nonStrErr, "deviceId"), false);
+
+  // Whitespace-only sessionId on sessionless command is normalized to ""
+  ctrl1.sendJson({
+    type: "control.cmd",
+    sessionId: "   ",
+    deviceId: "desk-input-01",
+    command: { action: "wake" },
+  });
+  const normWake = await agent.nextJson<ControlCmdMessage>();
+  assert.equal(normWake.sessionId, "");
+
+  // 2. Duplicate in-flight (conn, deviceId, seq) from ctrl1 does NOT misroute ctrl1's 2nd ACK to ctrl2
+  ctrl1.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "desk-input-01",
+    seq: 7,
+    command: { action: "wake" },
+  });
+  ctrl1.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "desk-input-01",
+    seq: 7,
+    command: { action: "wake" },
+  });
+  ctrl2.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "desk-input-01",
+    seq: 7,
+    command: { action: "wake" },
+  });
+  await agent.nextJson<ControlCmdMessage>();
+  await agent.nextJson<ControlCmdMessage>();
+  await agent.nextJson<ControlCmdMessage>();
+
+  agent.sendJson({ type: "control.ack", sessionId: "", deviceId: "desk-input-01", seq: 7, ok: true, message: "ack-c1-1" });
+  agent.sendJson({ type: "control.ack", sessionId: "", deviceId: "desk-input-01", seq: 7, ok: true, message: "ack-c1-2" });
+  agent.sendJson({ type: "control.ack", sessionId: "", deviceId: "desk-input-01", seq: 7, ok: true, message: "ack-c2-1" });
+
+  const ackC1First = await ctrl1.nextJson<ControlAckMessage>();
+  const ackC1Second = await ctrl1.nextJson<ControlAckMessage>();
+  const ackC2First = await ctrl2.nextJson<ControlAckMessage>();
+  assert.equal(ackC1First.message, "ack-c1-1");
+  assert.equal(ackC1Second.message, "ack-c1-2");
+  assert.equal(ackC2First.message, "ack-c2-1");
+
+  // 3. Open session to test whiteboard, coordinate-less mouse_down/up/wheel, mouse_move_relative, and chat.msg
+  ctrl1.sendJson({
+    type: "session.request",
+    sessionId: "sess-input-01",
+    deviceId: "desk-input-01",
+    preferredTransport: "webrtc",
+    quality: DESKTOP_QUALITY_PRESETS.balanced,
+  } satisfies SessionRequestMessage);
+  await agent.nextJson<SessionRequestMessage>();
+  agent.sendJson({
+    type: "session.ready",
+    sessionId: "sess-input-01",
+    deviceId: "desk-input-01",
+    transport: "webrtc",
+    screenWidth: 1920,
+    screenHeight: 1080,
+    rotation: 0,
+  } satisfies SessionReadyMessage);
+  await ctrl1.nextJson<SessionReadyMessage>();
+
+  // Coordinate-less mouse_down / mouse_up / mouse_wheel (Pointer Lock) succeed & forward cleanly
+  const pointerLockCmds: ControlCmdMessage["command"][] = [
+    { action: "mouse_down", button: "left", clickCount: 1 },
+    { action: "mouse_up", button: "left" },
+    { action: "mouse_wheel", deltaX: 0, deltaY: -120 },
+    { action: "mouse_move_relative", dx: 32768, dy: -32768 },
+  ];
+  for (const command of pointerLockCmds) {
+    ctrl1.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-input-01",
+      deviceId: "desk-input-01",
+      command,
+    } satisfies ControlCmdMessage);
+    const fwd = await agent.nextJson<ControlCmdMessage>();
+    assert.deepEqual(fwd.command, command);
+  }
+
+  // Valid whiteboard with rgb/rgba and extra injected fields -> extra fields stripped!
+  ctrl1.sendJson({
+    type: "control.cmd",
+    sessionId: "sess-input-01",
+    deviceId: "desk-input-01",
+    command: {
+      action: "whiteboard",
+      op: "stroke",
+      evilTop: true,
+      stroke: {
+        id: "stroke_ok-1",
+        color: "rgba(255, 59, 48, 0.75)",
+        width: 5,
+        evilStroke: "xss",
+        points: [
+          { x: 0.1, y: 0.2, evilPt: 1 },
+          { x: 1.0, y: 1.5 },
+        ],
+      },
+    } as unknown as ControlCmdMessage["command"],
+  });
+  const wbFwd = await agent.nextJson<ControlCmdMessage>();
+  assert.deepEqual(wbFwd.command, {
+    action: "whiteboard",
+    op: "stroke",
+    stroke: {
+      id: "stroke_ok-1",
+      color: "rgba(255, 59, 48, 0.75)",
+      width: 5,
+      points: [
+        { x: 0.1, y: 0.2 },
+        { x: 1.0, y: 1.5 },
+      ],
+    },
+  });
+
+  // Invalid whiteboard (CSS color injection, bad stroke id, out-of-range coords), mismatched x/y, and oversized relative mouse
+  const invalidHardenedCmds: unknown[] = [
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s1", color: "red; background:url(evil)", width: 4, points: [{ x: 0.5, y: 0.5 }] },
+    },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s2", color: "rgb(300, 0, 0)", width: 4, points: [{ x: 0.5, y: 0.5 }] },
+    },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s3", color: "rgba(1, 2, 3, 1.5)", width: 4, points: [{ x: 0.5, y: 0.5 }] },
+    },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s4", color: "#12345", width: 4, points: [{ x: 0.5, y: 0.5 }] },
+    },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "bad id!", color: "#fff", width: 4, points: [{ x: 0.5, y: 0.5 }] },
+    },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s5", color: "#fff", width: 4, points: [{ x: 5, y: 0.5 }] },
+    },
+    { action: "mouse_down", x: 0.5, button: "left" },
+    { action: "mouse_up", y: 0.5, button: "left" },
+    { action: "mouse_wheel", x: 0.5, deltaX: 0, deltaY: 10 },
+    { action: "mouse_move_relative", dx: 32769, dy: 0 },
+    { action: "mouse_move_relative", dx: 0, dy: -40000 },
+  ];
+  for (const badCmd of invalidHardenedCmds) {
+    ctrl1.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-input-01",
+      deviceId: "desk-input-01",
+      command: badCmd,
+    });
+    const err = await ctrl1.nextJson<ErrorMessage>();
+    assert.equal(err.code, "INVALID_MESSAGE");
+  }
+
+  // 4. chat.msg timestamp clamping and C0 control char stripping (keeping \t, \n, \r)
+  const beforeChat = Date.now();
+  ctrl1.sendJson({
+    type: "chat.msg",
+    sessionId: "sess-input-01",
+    deviceId: "desk-input-01",
+    id: "chat-clean-1",
+    sender: "controller",
+    text: "Line1\n\tLine2\r\n\x00\x07\x1b[31mSafe\x7f",
+    ts: 42, // out-of-range past epoch -> replaced with Date.now()
+  } satisfies ChatMessage);
+  const cleanChat1 = await agent.nextJson<ChatMessage>();
+  assert.equal(cleanChat1.text, "Line1\n\tLine2\r\n[31mSafe");
+  assert.ok(cleanChat1.ts >= beforeChat && cleanChat1.ts <= Date.now() + 1000);
+
+  ctrl1.sendJson({
+    type: "chat.msg",
+    sessionId: "sess-input-01",
+    deviceId: "desk-input-01",
+    id: "chat-clean-2",
+    sender: "controller",
+    text: "Future ts test",
+    ts: Date.now() + 365 * 86_400_000, // far future -> replaced with Date.now()
+  } satisfies ChatMessage);
+  const cleanChat2 = await agent.nextJson<ChatMessage>();
+  assert.ok(cleanChat2.ts >= beforeChat && cleanChat2.ts <= Date.now() + 1000);
+
+  // Text containing only stripped control chars is rejected
+  ctrl1.sendJson({
+    type: "chat.msg",
+    sessionId: "sess-input-01",
+    deviceId: "desk-input-01",
+    id: "chat-only-ctrl",
+    sender: "controller",
+    text: "\x00\x01\x07\x1b\x7f",
+    ts: Date.now(),
+  } satisfies ChatMessage);
+  const ctrlCharErr = await ctrl1.nextJson<ErrorMessage>();
+  assert.equal(ctrlCharErr.code, "INVALID_MESSAGE");
+
+  // 5. unbindDevice cleans outOfBandCmds so former owner never receives late ACK
+  ctrl1.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "desk-input-01",
+    seq: 88,
+    command: { action: "wake" },
+  });
+  await agent.nextJson<ControlCmdMessage>();
+
+  assert.equal(server.hub.unbindDevice(user.userId, "desk-input-01"), true);
+  // Drain session.end and offline device.status sent to ctrl1 during unbind
+  await ctrl1.nextJson<SessionEndMessage>();
+  const unboundStatus = await ctrl1.nextJson<DeviceStatusMessage>();
+  assert.equal(unboundStatus.device.online, false);
+  assert.equal(unboundStatus.device.blockInputActive, false);
+
+  agent.sendJson({
+    type: "control.ack",
+    sessionId: "",
+    deviceId: "desk-input-01",
+    seq: 88,
+    ok: true,
+    message: "late-after-unbind",
+  } satisfies ControlAckMessage);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(ctrl1.drainJson().length, 0);
 });

@@ -165,6 +165,7 @@ export interface VeloDeckHostWorkerBridge {
   sendWol(
     macAddress: string,
     broadcastIp?: string,
+    sessionId?: string,
   ): Promise<{ ok: boolean; error?: string }>;
   whiteboardCommand(
     op: "stroke" | "clear",
@@ -267,10 +268,12 @@ const workerBridge: VeloDeckHostWorkerBridge = Object.freeze({
   sendWol(
     macAddress: string,
     broadcastIp?: string,
+    sessionId?: string,
   ): Promise<{ ok: boolean; error?: string }> {
     return ipcRenderer.invoke("velodeck-host:wol", {
       macAddress,
       broadcastIp: broadcastIp ?? "",
+      sessionId: sessionId ?? "",
     });
   },
 

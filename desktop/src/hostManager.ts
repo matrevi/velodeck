@@ -189,7 +189,7 @@ const CLIPBOARD_ECHO_GUARD_MS = 4000;
 const CURSOR_POLL_INTERVAL_MS = 140;
 const APPROVAL_TIMEOUT_MS = 60_000;
 const MAX_CHAT_MESSAGES = 50;
-const MAX_CHAT_TEXT_LENGTH = 2000;
+const MAX_CHAT_TEXT_LENGTH = 1000;
 
 const FULL_SESSION_PERMISSIONS: Readonly<Required<HostSessionPermissions>> = {
   keyboard: true,
@@ -371,6 +371,7 @@ export class HostManager {
   private workerWindow: BrowserWindow | null = null;
   private workerReady = false;
   private workerReadyResolvers: Array<() => void> = [];
+  private workerRestartTimer: NodeJS.Timeout | null = null;
   private disposed = false;
   private pendingUnbindOwner = false;
   private ipcRegistered = false;
@@ -445,6 +446,9 @@ export class HostManager {
 
     this.remoteTerminal = new RemoteTerminalManager({
       platform: this.platform,
+      resourcesPath: process.resourcesPath,
+      desktopRootDir: deps.desktopRootDir,
+      isPackaged: app.isPackaged,
       onEvent: (event: RemoteTerminalEvent) => {
         if (this.disposed) return;
         if (this.workerWindow && !this.workerWindow.isDestroyed() && this.workerReady) {
@@ -585,8 +589,8 @@ export class HostManager {
       return this.getHostState();
     }
     const target = Boolean(enabled);
-    const ok = this.injector.setBlockInput(target);
-    const active = target ? ok : false;
+    const res = await this.injector.setBlockInput(target);
+    const active = target ? res.ok && res.active : false;
     if (this.state.blockInputActive !== active) {
       this.patchState({ blockInputActive: active });
     }
@@ -729,22 +733,12 @@ export class HostManager {
   }
 
   public async stopHost(): Promise<DesktopHostState> {
+    this.clearWorkerRestartTimer();
     this.deps.updateSettings((draft) => {
       draft.hostEnabled = false;
     });
     this.lanDiscovery.stop();
-    this.resolvePendingApprovalAsRejected("host_stopped");
-    this.privacyCurtain.hide();
-    this.whiteboardOverlay.clear();
-    this.remoteTerminal.closeAll();
-    this.stopClipboardWatcher();
-    this.stopCursorWatcher();
-    this.cleanupActiveFileTransfer();
-    this.cleanupAllDownloads();
-    this.injector.setBlockInput(false);
-    this.injector.releaseAll();
-    this.activeSessionPermissions = { ...FULL_SESSION_PERMISSIONS };
-    this.lastApprovedSessionId = null;
+    this.cleanupActiveSessionState("host_stopped");
     if (this.workerWindow && !this.workerWindow.isDestroyed() && this.workerReady) {
       this.sendWorkerCommand({ type: "stop" });
     }
@@ -925,18 +919,7 @@ export class HostManager {
   }
 
   public async disconnectHostSession(): Promise<DesktopHostState> {
-    this.resolvePendingApprovalAsRejected("host_owner_disconnected");
-    this.privacyCurtain.hide();
-    this.whiteboardOverlay.clear();
-    this.remoteTerminal.closeAll();
-    this.stopClipboardWatcher();
-    this.stopCursorWatcher();
-    this.cleanupActiveFileTransfer();
-    this.cleanupAllDownloads();
-    this.injector.setBlockInput(false);
-    this.injector.releaseAll();
-    this.activeSessionPermissions = { ...FULL_SESSION_PERMISSIONS };
-    this.lastApprovedSessionId = null;
+    this.cleanupActiveSessionState("host_owner_disconnected");
     if (this.workerWindow && !this.workerWindow.isDestroyed() && this.workerReady) {
       this.sendWorkerCommand({
         type: "disconnect-session",
@@ -986,15 +969,10 @@ export class HostManager {
     if (!this.state.enabled || this.disposed) {
       return;
     }
+    this.clearWorkerRestartTimer();
     const cfg = this.buildWorkerConfig();
     if (!cfg.wsUrl) {
-      this.resolvePendingApprovalAsRejected("server_url_cleared");
-      this.privacyCurtain.hide();
-      this.whiteboardOverlay.clear();
-      this.remoteTerminal.closeAll();
-      this.stopClipboardWatcher();
-      this.stopCursorWatcher();
-      this.injector.setBlockInput(false);
+      this.cleanupActiveSessionState("server_url_cleared");
       if (this.workerWindow && !this.workerWindow.isDestroyed() && this.workerReady) {
         this.sendWorkerCommand({ type: "stop" });
       }
@@ -1010,24 +988,32 @@ export class HostManager {
       });
       return;
     }
+    this.cleanupActiveSessionState("server_url_changed");
+    this.patchState({
+      status: "connecting",
+      activeSessionId: null,
+      activeTransport: null,
+      privacyScreenActive: false,
+      blockInputActive: false,
+      pendingApproval: null,
+      chatMessages: [],
+      lastError: null,
+    });
     await this.ensureWorkerReady();
-    this.sendWorkerCommand({ type: "start", config: cfg });
+    if (!this.disposed && this.state.enabled) {
+      this.sendWorkerCommand({ type: "start", config: cfg });
+    }
   }
 
   public dispose(): void {
     this.disposed = true;
+    this.clearWorkerRestartTimer();
     this.lanDiscovery.stop();
-    this.resolvePendingApprovalAsRejected("app_quit");
+    this.cleanupActiveSessionState("app_quit");
     this.privacyCurtain.dispose();
     this.whiteboardOverlay.dispose();
-    this.remoteTerminal.closeAll();
-    this.stopClipboardWatcher();
-    this.stopCursorWatcher();
     this.stopPowerSaveBlocker();
-    this.cleanupActiveFileTransfer();
-    this.cleanupAllDownloads();
     this.detachScreenListeners();
-    this.injector.setBlockInput(false);
     this.injector.dispose();
     if (this.workerWindow && !this.workerWindow.isDestroyed()) {
       try {
@@ -1038,6 +1024,108 @@ export class HostManager {
     }
     this.workerWindow = null;
     this.workerReady = false;
+  }
+
+  private hasActiveFullControlPermission(): boolean {
+    return (
+      this.state.activeSessionId !== null &&
+      this.activeSessionPermissions.keyboard !== false &&
+      this.activeSessionPermissions.mouse !== false
+    );
+  }
+
+  private cleanupActiveSessionState(
+    reason: string,
+    options: { preservePermissions?: boolean } = {},
+  ): void {
+    this.resolvePendingApprovalAsRejected(reason);
+    void this.injector.setBlockInput(false);
+    this.injector.releaseAll();
+    this.privacyCurtain.hide();
+    this.whiteboardOverlay.clear();
+    this.remoteTerminal.closeAll();
+    this.stopClipboardWatcher();
+    this.stopCursorWatcher();
+    this.cleanupActiveFileTransfer();
+    this.cleanupAllDownloads();
+    this.pendingDisplayMediaCapture = null;
+    if (!options.preservePermissions) {
+      this.activeSessionPermissions = { ...FULL_SESSION_PERMISSIONS };
+      this.lastApprovedSessionId = null;
+    }
+  }
+
+  private clearWorkerRestartTimer(): void {
+    if (this.workerRestartTimer !== null) {
+      clearTimeout(this.workerRestartTimer);
+      this.workerRestartTimer = null;
+    }
+  }
+
+  private handleWorkerUnexpectedExit(win: BrowserWindow, reason: string): void {
+    if (this.workerWindow !== win) {
+      return;
+    }
+    this.workerWindow = null;
+    this.workerReady = false;
+
+    const resolvers = this.workerReadyResolvers.splice(
+      0,
+      this.workerReadyResolvers.length,
+    );
+    resolvers.forEach((fn) => fn());
+
+    if (!win.isDestroyed()) {
+      try {
+        win.destroy();
+      } catch {
+        // Ignore destroy errors during crash cleanup
+      }
+    }
+
+    this.cleanupActiveSessionState(reason);
+    if (this.disposed) {
+      return;
+    }
+
+    this.patchState({
+      status: this.state.enabled ? "connecting" : "stopped",
+      activeSessionId: null,
+      activeTransport: null,
+      privacyScreenActive: false,
+      blockInputActive: false,
+      pendingApproval: null,
+      chatMessages: [],
+      lastError: this.state.enabled
+        ? "被控端工作进程异常退出，正在自动恢复连接..."
+        : null,
+    });
+
+    if (this.state.enabled) {
+      this.scheduleWorkerRestart();
+    }
+  }
+
+  private scheduleWorkerRestart(): void {
+    this.clearWorkerRestartTimer();
+    this.workerRestartTimer = setTimeout(() => {
+      this.workerRestartTimer = null;
+      if (this.disposed || !this.state.enabled) {
+        return;
+      }
+      const cfg = this.buildWorkerConfig();
+      if (!cfg.wsUrl) {
+        return;
+      }
+      void this.ensureWorkerReady()
+        .then(() => {
+          if (!this.disposed && this.state.enabled) {
+            this.sendWorkerCommand({ type: "start", config: cfg });
+          }
+        })
+        .catch(() => undefined);
+    }, 500);
+    this.workerRestartTimer.unref?.();
   }
 
   private applyAutoLaunchSetting(enabled: boolean): void {
@@ -1379,6 +1467,7 @@ export class HostManager {
       displays,
     );
     const activeChanged = nextActiveId !== this.state.activeDisplayId;
+    this.whiteboardOverlay.updateBounds(this.resolveDisplayBounds(nextActiveId));
     this.patchState({
       displays,
       activeDisplayId: nextActiveId,
@@ -1472,16 +1561,15 @@ export class HostManager {
         const pending = this.pendingDisplayMediaCapture;
         const now = Date.now();
         let source: DesktopCapturerSource | undefined;
-        let wantAudio = Boolean(
-          request.audioRequested && this.state.audioCaptureEnabled,
-        );
+        const audioAllowed =
+          this.state.audioCaptureEnabled &&
+          this.activeSessionPermissions.audio !== false;
+        let wantAudio = Boolean(request.audioRequested && audioAllowed);
 
         if (pending && pending.expiresAt >= now) {
           source = pending.source;
           wantAudio = Boolean(
-            request.audioRequested &&
-              pending.wantAudio &&
-              this.state.audioCaptureEnabled,
+            request.audioRequested && pending.wantAudio && audioAllowed,
           );
           this.pendingDisplayMediaCapture = null;
         } else {
@@ -1560,10 +1648,21 @@ export class HostManager {
         }
       });
 
+      win.webContents.on("render-process-gone", (_event, details) => {
+        console.warn(
+          `[velodeck-host] Worker render process gone (reason=${details.reason}, exitCode=${details.exitCode})`,
+        );
+        this.handleWorkerUnexpectedExit(win, `worker_${details.reason}`);
+      });
+
       win.on("closed", () => {
         if (this.workerWindow === win) {
-          this.workerWindow = null;
-          this.workerReady = false;
+          if (this.disposed) {
+            this.workerWindow = null;
+            this.workerReady = false;
+          } else {
+            this.handleWorkerUnexpectedExit(win, "worker_closed");
+          }
         }
       });
 
@@ -1642,29 +1741,30 @@ export class HostManager {
           }
         }
         if (rawReport.activeSessionId !== undefined) {
-          if (this.state.activeSessionId !== rawReport.activeSessionId) {
+          const prevSessionId = this.state.activeSessionId;
+          const nextSessionId = rawReport.activeSessionId;
+          if (prevSessionId !== nextSessionId) {
             sessionChanged = true;
-            if (rawReport.activeSessionId) {
-              if (rawReport.activeSessionId !== this.lastApprovedSessionId) {
+            if (prevSessionId) {
+              sessionEnded = true;
+              const keepApproved = Boolean(
+                nextSessionId && nextSessionId === this.lastApprovedSessionId,
+              );
+              this.cleanupActiveSessionState("session_ended", {
+                preservePermissions: keepApproved,
+              });
+              patch.blockInputActive = false;
+              patch.privacyScreenActive = false;
+              patch.chatMessages = [];
+            }
+            if (nextSessionId) {
+              if (nextSessionId !== this.lastApprovedSessionId) {
                 this.activeSessionPermissions = { ...FULL_SESSION_PERMISSIONS };
               }
               patch.chatMessages = [];
             }
           }
-          if (this.state.activeSessionId && !rawReport.activeSessionId) {
-            sessionEnded = true;
-            this.injector.setBlockInput(false);
-            this.injector.releaseAll();
-            this.whiteboardOverlay.clear();
-            this.remoteTerminal.closeAll();
-            this.cleanupActiveFileTransfer();
-            this.cleanupAllDownloads();
-            this.activeSessionPermissions = { ...FULL_SESSION_PERMISSIONS };
-            this.lastApprovedSessionId = null;
-            patch.blockInputActive = false;
-            patch.chatMessages = [];
-          }
-          patch.activeSessionId = rawReport.activeSessionId;
+          patch.activeSessionId = nextSessionId;
         }
         if (rawReport.activeTransport !== undefined) {
           patch.activeTransport = rawReport.activeTransport;
@@ -1709,7 +1809,10 @@ export class HostManager {
           return { ok: false, error: "Untrusted worker IPC sender" };
         }
         let requestedDisplayId = "";
-        let wantAudio = this.state.audioCaptureEnabled;
+        const audioAllowed =
+          this.state.audioCaptureEnabled &&
+          this.activeSessionPermissions.audio !== false;
+        let wantAudio = audioAllowed;
         if (typeof rawArg === "string") {
           requestedDisplayId = rawArg;
         } else if (rawArg && typeof rawArg === "object") {
@@ -1718,7 +1821,7 @@ export class HostManager {
             requestedDisplayId = obj.displayId;
           }
           if (typeof obj.wantAudio === "boolean") {
-            wantAudio = obj.wantAudio && this.state.audioCaptureEnabled;
+            wantAudio = obj.wantAudio && audioAllowed;
           }
         }
 
@@ -1790,6 +1893,9 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return { ok: false, message: "Untrusted worker IPC sender" };
         }
+        if (!this.state.activeSessionId) {
+          return { ok: false, message: "当前没有活跃的远控会话" };
+        }
         if (!payload || typeof payload !== "object") {
           return { ok: false, message: "Invalid control payload" };
         }
@@ -1848,6 +1954,9 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return false;
         }
+        if (!this.state.activeSessionId) {
+          return false;
+        }
         if (typeof text !== "string") {
           return false;
         }
@@ -1872,6 +1981,13 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return { ok: false, active: false, message: "Untrusted worker IPC sender" };
         }
+        if (!this.hasActiveFullControlPermission()) {
+          return {
+            ok: false,
+            active: this.privacyCurtain.isActive(),
+            message: "被控端未授予完整键鼠控制权限，无法控制隐私黑屏",
+          };
+        }
         const target = Boolean(enabled);
         if (target) {
           const shown = this.privacyCurtain.show();
@@ -1891,6 +2007,13 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return { ok: false, active: false, message: "Untrusted worker IPC sender" };
         }
+        if (!this.hasActiveFullControlPermission()) {
+          return {
+            ok: false,
+            active: this.state.blockInputActive,
+            message: "被控端未授予完整键鼠控制权限，无法锁定本机输入",
+          };
+        }
         const target = Boolean(enabled);
         await this.setHostBlockInput(target);
         const active = this.state.blockInputActive;
@@ -1901,7 +2024,7 @@ export class HostManager {
             message:
               this.platform === "darwin"
                 ? "锁定本机键鼠失败，请确认已授予「辅助功能」权限"
-                : "无法锁定本机键鼠输入（可能需要管理员权限）",
+                : "无法锁定本机键鼠输入",
           };
         }
         return { ok: true, active };
@@ -1920,10 +2043,17 @@ export class HostManager {
         if (!rawPayload || typeof rawPayload !== "object") {
           return { ok: false, error: "无效的 Wake-on-LAN 参数" };
         }
-        const { macAddress, broadcastIp } = rawPayload as {
+        const { macAddress, broadcastIp, sessionId } = rawPayload as {
           macAddress?: unknown;
           broadcastIp?: unknown;
+          sessionId?: unknown;
         };
+        const sid = typeof sessionId === "string" ? sessionId.trim() : "";
+        if (sid) {
+          if (sid !== this.state.activeSessionId || !this.hasActiveFullControlPermission()) {
+            return { ok: false, error: "被控端未授予完整键鼠控制权限，无法发送局域网唤醒" };
+          }
+        }
         if (typeof macAddress !== "string" || !macAddress.trim()) {
           return { ok: false, error: "缺少 MAC 地址" };
         }
@@ -1944,6 +2074,9 @@ export class HostManager {
       ): { ok: boolean; message?: string } => {
         if (!this.isTrustedWorkerEvent(event)) {
           return { ok: false, message: "Untrusted worker IPC sender" };
+        }
+        if (!this.state.activeSessionId) {
+          return { ok: false, message: "当前没有活跃的远控会话" };
         }
         if (!rawPayload || typeof rawPayload !== "object") {
           return { ok: false, message: "无效的白板标注参数" };
@@ -1981,16 +2114,22 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return { ok: false, error: "Untrusted worker IPC sender" };
         }
+        if (!this.state.activeSessionId) {
+          return { ok: false, error: "当前没有活跃的远控会话" };
+        }
         if (this.activeSessionPermissions.terminal === false) {
           return { ok: false, error: "被控端未授予远程终端权限" };
         }
         if (!rawPayload || typeof rawPayload !== "object") {
           return { ok: false, error: "无效的终端命令" };
         }
-        const { cmd } = rawPayload as {
+        const { sessionId, cmd } = rawPayload as {
           sessionId?: unknown;
           cmd?: Record<string, unknown>;
         };
+        if (typeof sessionId !== "string" || sessionId !== this.state.activeSessionId) {
+          return { ok: false, error: "终端命令会话 ID 不匹配" };
+        }
         if (!cmd || typeof cmd !== "object") {
           return { ok: false, error: "缺少终端命令对象" };
         }
@@ -2093,17 +2232,14 @@ export class HostManager {
 
     ipcMain.on("velodeck-host:chat-incoming", (event, rawPayload: unknown) => {
       if (!this.isTrustedWorkerEvent(event)) return;
+      if (!this.state.activeSessionId) return;
       if (!rawPayload || typeof rawPayload !== "object") return;
       const { sessionId, message } = rawPayload as {
         sessionId?: unknown;
         message?: Record<string, unknown>;
       };
       if (!message || typeof message !== "object") return;
-      if (
-        typeof sessionId === "string" &&
-        this.state.activeSessionId &&
-        sessionId !== this.state.activeSessionId
-      ) {
+      if (typeof sessionId !== "string" || sessionId !== this.state.activeSessionId) {
         return;
       }
       const rawText = typeof message.text === "string" ? message.text.trim() : "";
@@ -2145,6 +2281,12 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return { ok: false, message: "Untrusted worker IPC sender" };
         }
+        if (!this.hasActiveFullControlPermission()) {
+          return {
+            ok: false,
+            message: "被控端未授予完整键鼠控制权限，无法执行电源操作",
+          };
+        }
         if (!isPowerOperation(operation)) {
           return { ok: false, message: "不支持的电源操作指令" };
         }
@@ -2160,6 +2302,9 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return null;
         }
+        if (!this.state.activeSessionId) {
+          return null;
+        }
         if (this.activeSessionPermissions.fileTransfer === false) {
           return JSON.stringify({
             type: "file.error",
@@ -2172,7 +2317,11 @@ export class HostManager {
           sessionId?: string;
           text?: string;
         };
-        if (typeof sessionId !== "string" || typeof text !== "string") {
+        if (
+          typeof sessionId !== "string" ||
+          sessionId !== this.state.activeSessionId ||
+          typeof text !== "string"
+        ) {
           return null;
         }
         return this.handleFileTransferText(sessionId, text);
@@ -2185,12 +2334,22 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return null;
         }
+        if (
+          !this.state.activeSessionId ||
+          this.activeSessionPermissions.fileTransfer === false
+        ) {
+          return null;
+        }
         if (!payload || typeof payload !== "object") return null;
         const { sessionId, chunk } = payload as {
           sessionId?: string;
           chunk?: Uint8Array | Buffer;
         };
-        if (typeof sessionId !== "string" || !(chunk instanceof Uint8Array)) {
+        if (
+          typeof sessionId !== "string" ||
+          sessionId !== this.state.activeSessionId ||
+          !(chunk instanceof Uint8Array)
+        ) {
           return null;
         }
         return this.handleFileTransferBinary(sessionId, chunk);
@@ -2216,6 +2375,15 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return { type: "fs_error", reqId: "", error: "Untrusted worker IPC sender" };
         }
+        if (!this.state.activeSessionId) {
+          const reqId =
+            rawRequest &&
+            typeof rawRequest === "object" &&
+            typeof (rawRequest as Record<string, unknown>).reqId === "string"
+              ? ((rawRequest as Record<string, unknown>).reqId as string)
+              : "";
+          return { type: "fs_error", reqId, error: "当前没有活跃的远控会话" };
+        }
         if (this.activeSessionPermissions.fileTransfer === false) {
           const reqId =
             rawRequest &&
@@ -2238,6 +2406,9 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return { ok: false, error: "Untrusted worker IPC sender" };
         }
+        if (!this.state.activeSessionId) {
+          return { ok: false, error: "当前没有活跃的远控会话" };
+        }
         if (this.activeSessionPermissions.fileTransfer === false) {
           return { ok: false, error: "被控端未授予文件传输权限" };
         }
@@ -2251,6 +2422,7 @@ export class HostManager {
         };
         if (
           typeof sessionId !== "string" ||
+          sessionId !== this.state.activeSessionId ||
           typeof reqId !== "string" ||
           !reqId ||
           typeof filePath !== "string"
@@ -2283,11 +2455,17 @@ export class HostManager {
         if (!this.isTrustedWorkerEvent(event)) {
           return { ok: false, error: "Untrusted worker IPC sender" };
         }
+        if (
+          !this.state.activeSessionId ||
+          this.activeSessionPermissions.fileTransfer === false
+        ) {
+          return { ok: false, error: "被控端未授予文件传输权限或会话已结束" };
+        }
         if (typeof reqId !== "string" || !reqId) {
           return { ok: false, error: "缺少下载请求 ID" };
         }
         const active = this.activeDownloads.get(reqId);
-        if (!active) {
+        if (!active || active.sessionId !== this.state.activeSessionId) {
           return { ok: false, error: "下载任务已取消或不存在" };
         }
         try {

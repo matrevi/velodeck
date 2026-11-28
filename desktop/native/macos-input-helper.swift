@@ -1,14 +1,17 @@
 import Foundation
+import Darwin
 import CoreGraphics
 import ApplicationServices
 import AppKit
 
-// VeloDeck macOS Native Input & Permission Helper
+// VeloDeck macOS Native Input, Permission & PTY Helper
 // Modes:
-//   --check-permissions      Prints {"accessibility":bool,"screenCapture":bool} and exits 0
-//   --request-accessibility  Triggers macOS Accessibility prompt, prints permission JSON, exits 0
-//   --request-screen         Triggers macOS Screen Recording prompt, prints permission JSON, exits 0
-//   (default)                Persistent NDJSON daemon reading commands from stdin
+//   --pty-bridge <cols> <rows> <shell> [cwd]  Real Darwin openpty() JSON-framed stdio PTY bridge
+//   --check-permissions                       Prints {"accessibility":bool,"screenCapture":bool} and exits 0
+//   --request-accessibility                   Triggers macOS Accessibility prompt, prints JSON, exits 0
+//   --request-screen                          Triggers macOS Screen Recording prompt, prints JSON, exits 0
+//   --check-cursors                           Initializes AppKit & verifies reference cursors, prints JSON, exits 0
+//   (default)                                 Persistent NDJSON daemon reading commands from stdin
 
 private let VELODECK_EVENT_MAGIC: Int64 = 0x56444C4B
 private let stdoutLock = NSLock()
@@ -16,9 +19,356 @@ private let stdoutLock = NSLock()
 private func writeStdoutLine(_ line: String) {
     stdoutLock.lock()
     defer { stdoutLock.unlock() }
-    print(line)
-    fflush(stdout)
+    let out = line + "\n"
+    out.withCString { ptr in
+        let len = strlen(ptr)
+        var written = 0
+        while written < len {
+            let n = Darwin.write(STDOUT_FILENO, ptr.advanced(by: written), len - written)
+            if n > 0 {
+                written += n
+            } else if n < 0 && errno == EINTR {
+                continue
+            } else {
+                break
+            }
+        }
+    }
 }
+
+// MARK: - Native macOS PTY Bridge (--pty-bridge)
+// Runs BEFORE any AppKit/CoreGraphics initialization so fork() is completely single-threaded and safe.
+
+private let DARWIN_TIOCSWINSZ: UInt = 0x80087467
+private let DARWIN_TIOCSCTTY: UInt = 0x20007461
+
+private var ptyBridgeChildPid: pid_t = 0
+
+private func ptyBridgeSignalHandler(_ sig: Int32) {
+    let pid = ptyBridgeChildPid
+    if pid > 0 {
+        Darwin.kill(-pid, SIGHUP)
+        Darwin.kill(-pid, SIGTERM)
+    }
+    Darwin._exit(0)
+}
+
+private func writeAllFd(_ fd: Int32, bytes: UnsafePointer<UInt8>, count: Int) -> Bool {
+    var written = 0
+    while written < count {
+        let n = Darwin.write(fd, bytes.advanced(by: written), count - written)
+        if n > 0 {
+            written += n
+        } else if n < 0 {
+            if errno == EINTR { continue }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                _ = Darwin.poll(&pfd, 1, 50)
+                continue
+            }
+            return false
+        } else {
+            return false
+        }
+    }
+    return true
+}
+
+private func terminatePtyChild(_ childPid: pid_t) {
+    guard childPid > 0 else { return }
+    _ = Darwin.kill(-childPid, SIGHUP)
+    _ = Darwin.kill(-childPid, SIGTERM)
+    var status: Int32 = 0
+    for _ in 0..<15 {
+        let r = Darwin.waitpid(childPid, &status, WNOHANG)
+        if r == childPid || (r < 0 && errno == ECHILD) {
+            return
+        }
+        usleep(20_000)
+    }
+    _ = Darwin.kill(-childPid, SIGKILL)
+    _ = Darwin.waitpid(childPid, &status, 0)
+}
+
+private func runPtyBridge(args: [String]) -> Never {
+    let colsRaw = args.count >= 1 ? (Int(args[0]) ?? 100) : 100
+    let rowsRaw = args.count >= 2 ? (Int(args[1]) ?? 30) : 30
+    let cols = max(20, min(300, colsRaw))
+    let rows = max(5, min(120, rowsRaw))
+
+    let requestedShell = args.count >= 3 ? args[2] : "/bin/zsh"
+    let shellPath: String
+    if !requestedShell.isEmpty && access(requestedShell, X_OK) == 0 {
+        shellPath = requestedShell
+    } else if access("/bin/zsh", X_OK) == 0 {
+        shellPath = "/bin/zsh"
+    } else if access("/bin/bash", X_OK) == 0 {
+        shellPath = "/bin/bash"
+    } else {
+        shellPath = "/bin/sh"
+    }
+
+    let requestedCwd = args.count >= 4 ? args[3] : ""
+
+    var masterFd: Int32 = -1
+    var slaveFd: Int32 = -1
+    var ws = winsize(
+        ws_row: UInt16(rows),
+        ws_col: UInt16(cols),
+        ws_xpixel: 0,
+        ws_ypixel: 0
+    )
+
+    if Darwin.openpty(&masterFd, &slaveFd, nil, nil, &ws) != 0 {
+        writeStdoutLine("{\"type\":\"error\",\"error\":\"openpty failed (errno=\(errno))\"}")
+        Darwin._exit(1)
+    }
+
+    _ = fcntl(masterFd, F_SETFD, FD_CLOEXEC)
+
+    // Resolve POSIX fork() via dlsym before any threads or AppKit exist.
+    typealias ForkFn = @convention(c) () -> pid_t
+    guard let forkSym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "fork") else {
+        Darwin.close(masterFd)
+        Darwin.close(slaveFd)
+        writeStdoutLine("{\"type\":\"error\",\"error\":\"fork symbol unavailable\"}")
+        Darwin._exit(1)
+    }
+    let cFork = unsafeBitCast(forkSym, to: ForkFn.self)
+
+    // Pre-allocate C strings before fork so the child only calls async-signal-safe POSIX functions.
+    let shellCStr = strdup(shellPath)
+    let arg0CStr = strdup(shellPath)
+    let arg1CStr = strdup("-i")
+    let cwdCStr = !requestedCwd.isEmpty ? strdup(requestedCwd) : nil
+    let argvBuf = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: 3)
+    argvBuf[0] = arg0CStr
+    argvBuf[1] = arg1CStr
+    argvBuf[2] = nil
+
+    let pid = cFork()
+    if pid < 0 {
+        Darwin.close(masterFd)
+        Darwin.close(slaveFd)
+        writeStdoutLine("{\"type\":\"error\",\"error\":\"fork failed (errno=\(errno))\"}")
+        Darwin._exit(1)
+    }
+
+    if pid == 0 {
+        // Child process: establish new session & controlling terminal
+        Darwin.close(masterFd)
+        _ = Darwin.setsid()
+        _ = Darwin.ioctl(slaveFd, DARWIN_TIOCSCTTY, 0)
+        _ = Darwin.dup2(slaveFd, STDIN_FILENO)
+        _ = Darwin.dup2(slaveFd, STDOUT_FILENO)
+        _ = Darwin.dup2(slaveFd, STDERR_FILENO)
+        if slaveFd > STDERR_FILENO {
+            Darwin.close(slaveFd)
+        }
+        if let cwdPtr = cwdCStr {
+            _ = Darwin.chdir(cwdPtr)
+        }
+        Darwin.execv(shellCStr, argvBuf)
+        Darwin._exit(127)
+    }
+
+    // Parent process
+    Darwin.close(slaveFd)
+    if let p = shellCStr { free(p) }
+    if let p = arg0CStr { free(p) }
+    if let p = arg1CStr { free(p) }
+    if let p = cwdCStr { free(p) }
+    argvBuf.deallocate()
+
+    ptyBridgeChildPid = pid
+    signal(SIGPIPE, SIG_IGN)
+    signal(SIGTERM, ptyBridgeSignalHandler)
+    signal(SIGINT, ptyBridgeSignalHandler)
+    signal(SIGHUP, ptyBridgeSignalHandler)
+
+    // Make stdin and masterFd non-blocking for multiplexed poll() loop
+    let stdinFlags = fcntl(STDIN_FILENO, F_GETFL, 0)
+    if stdinFlags >= 0 {
+        _ = fcntl(STDIN_FILENO, F_SETFL, stdinFlags | O_NONBLOCK)
+    }
+    let masterFlags = fcntl(masterFd, F_GETFL, 0)
+    if masterFlags >= 0 {
+        _ = fcntl(masterFd, F_SETFL, masterFlags | O_NONBLOCK)
+    }
+
+    var stdinBuffer = Data()
+    var stdinClosed = false
+    var masterClosed = false
+    var shouldTerminateChild = false
+    var readBuf = [UInt8](repeating: 0, count: 4096)
+
+    while !masterClosed && !shouldTerminateChild {
+        var fds: [pollfd] = [
+            pollfd(fd: masterFd, events: Int16(POLLIN), revents: 0),
+            pollfd(fd: stdinClosed ? -1 : STDIN_FILENO, events: Int16(POLLIN), revents: 0),
+        ]
+
+        let pollRes = Darwin.poll(&fds, nfds_t(fds.count), 200)
+        if pollRes < 0 {
+            if errno == EINTR { continue }
+            break
+        }
+
+        autoreleasepool {
+            // 1) Drain PTY output
+            if (fds[0].revents & Int16(POLLIN | POLLHUP | POLLERR)) != 0 {
+                while true {
+                    let n = Darwin.read(masterFd, &readBuf, readBuf.count)
+                    if n > 0 {
+                        let chunk = Data(bytes: readBuf, count: n)
+                        let b64 = chunk.base64EncodedString()
+                        writeStdoutLine("{\"type\":\"data\",\"b64\":\"\(b64)\"}")
+                    } else if n == 0 {
+                        masterClosed = true
+                        break
+                    } else {
+                        if errno == EINTR { continue }
+                        if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                        // EIO on macOS master PTY indicates slave closed
+                        masterClosed = true
+                        break
+                    }
+                }
+            }
+
+            // 2) Drain JSON commands from stdin
+            if !stdinClosed && (fds[1].revents & Int16(POLLIN | POLLHUP | POLLERR)) != 0 {
+                while true {
+                    let n = Darwin.read(STDIN_FILENO, &readBuf, readBuf.count)
+                    if n > 0 {
+                        stdinBuffer.append(contentsOf: readBuf[0..<n])
+                        // Cap malformed unbounded line buffer
+                        if stdinBuffer.count > 512 * 1024 {
+                            stdinBuffer.removeAll(keepingCapacity: false)
+                        }
+                    } else if n == 0 {
+                        stdinClosed = true
+                        shouldTerminateChild = true
+                        break
+                    } else {
+                        if errno == EINTR { continue }
+                        if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                        stdinClosed = true
+                        shouldTerminateChild = true
+                        break
+                    }
+                }
+
+                // Process newline-delimited JSON messages
+                while let nlIndex = stdinBuffer.firstIndex(of: 0x0A) {
+                    let lineData = stdinBuffer.subdata(in: stdinBuffer.startIndex..<nlIndex)
+                    stdinBuffer.removeSubrange(stdinBuffer.startIndex...nlIndex)
+                    if lineData.isEmpty { continue }
+                    guard let obj = try? JSONSerialization.jsonObject(with: lineData, options: []),
+                          let dict = obj as? [String: Any],
+                          let msgType = dict["type"] as? String else {
+                        continue
+                    }
+
+                    switch msgType {
+                    case "data":
+                        if let b64 = dict["b64"] as? String,
+                           let raw = Data(base64Encoded: b64),
+                           !raw.isEmpty {
+                            raw.withUnsafeBytes { rawBuf in
+                                if let ptr = rawBuf.bindMemory(to: UInt8.self).baseAddress {
+                                    _ = writeAllFd(masterFd, bytes: ptr, count: raw.count)
+                                }
+                            }
+                        } else if let text = dict["data"] as? String,
+                                  let raw = text.data(using: .utf8),
+                                  !raw.isEmpty {
+                            raw.withUnsafeBytes { rawBuf in
+                                if let ptr = rawBuf.bindMemory(to: UInt8.self).baseAddress {
+                                    _ = writeAllFd(masterFd, bytes: ptr, count: raw.count)
+                                }
+                            }
+                        }
+
+                    case "resize":
+                        let newCols = max(20, min(300, readInt(dict, "cols", default: cols)))
+                        let newRows = max(5, min(120, readInt(dict, "rows", default: rows)))
+                        var nextWs = winsize(
+                            ws_row: UInt16(newRows),
+                            ws_col: UInt16(newCols),
+                            ws_xpixel: 0,
+                            ws_ypixel: 0
+                        )
+                        _ = Darwin.ioctl(masterFd, DARWIN_TIOCSWINSZ, &nextWs)
+
+                    case "close":
+                        shouldTerminateChild = true
+
+                    default:
+                        break
+                    }
+                }
+            }
+
+            // 3) Check if child already exited without closing master yet
+            if !masterClosed {
+                var st: Int32 = 0
+                let waited = Darwin.waitpid(pid, &st, WNOHANG)
+                if waited == pid {
+                    // Drain any final buffered output from masterFd
+                    while true {
+                        let n = Darwin.read(masterFd, &readBuf, readBuf.count)
+                        if n > 0 {
+                            let chunk = Data(bytes: readBuf, count: n)
+                            writeStdoutLine("{\"type\":\"data\",\"b64\":\"\(chunk.base64EncodedString())\"}")
+                        } else {
+                            break
+                        }
+                    }
+                    masterClosed = true
+                    Darwin.close(masterFd)
+                    let exitCode: Int32
+                    if (st & 0x7f) == 0 {
+                        exitCode = (st >> 8) & 0xff
+                    } else {
+                        exitCode = 128 + (st & 0x7f)
+                    }
+                    ptyBridgeChildPid = 0
+                    writeStdoutLine("{\"type\":\"exit\",\"code\":\(exitCode)}")
+                    Darwin._exit(0)
+                }
+            }
+        }
+    }
+
+    Darwin.close(masterFd)
+
+    var exitCode: Int32 = 0
+    if shouldTerminateChild {
+        terminatePtyChild(pid)
+        ptyBridgeChildPid = 0
+        writeStdoutLine("{\"type\":\"exit\",\"code\":0}")
+        Darwin._exit(0)
+    }
+
+    var status: Int32 = 0
+    var reaped = Darwin.waitpid(pid, &status, 0)
+    while reaped < 0 && errno == EINTR {
+        reaped = Darwin.waitpid(pid, &status, 0)
+    }
+    if reaped == pid {
+        if (status & 0x7f) == 0 {
+            exitCode = (status >> 8) & 0xff
+        } else {
+            exitCode = 128 + (status & 0x7f)
+        }
+    }
+    ptyBridgeChildPid = 0
+    writeStdoutLine("{\"type\":\"exit\",\"code\":\(exitCode)}")
+    Darwin._exit(0)
+}
+
+// MARK: - Display & Pointer Geometry Helpers
 
 private struct ButtonState {
     var leftDown = false
@@ -33,77 +383,233 @@ private func printPermissionsJson(accessibility: Bool, screenCapture: Bool) {
     writeStdoutLine("{\"accessibility\":\(accStr),\"screenCapture\":\(scrStr)}")
 }
 
-private func activeDisplaysUnionBounds() -> CGRect {
+private func activeDisplayRects() -> [CGRect] {
     var displayCount: UInt32 = 0
     CGGetActiveDisplayList(0, nil, &displayCount)
     if displayCount == 0 {
-        return CGDisplayBounds(CGMainDisplayID())
+        return [CGDisplayBounds(CGMainDisplayID())]
     }
     var displays = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
     let err = CGGetActiveDisplayList(displayCount, &displays, &displayCount)
     if err != .success || displayCount == 0 {
-        return CGDisplayBounds(CGMainDisplayID())
+        return [CGDisplayBounds(CGMainDisplayID())]
     }
-    var unionRect = CGDisplayBounds(displays[0])
-    for i in 1..<Int(displayCount) {
-        unionRect = unionRect.union(CGDisplayBounds(displays[i]))
+    var rects: [CGRect] = []
+    rects.reserveCapacity(Int(displayCount))
+    for i in 0..<Int(displayCount) {
+        let r = CGDisplayBounds(displays[i])
+        if r.width > 0 && r.height > 0 {
+            rects.append(r)
+        }
     }
-    return unionRect
+    return rects.isEmpty ? [CGDisplayBounds(CGMainDisplayID())] : rects
+}
+
+private func clampPointToRect(_ point: CGPoint, _ rect: CGRect) -> CGPoint {
+    let maxX = max(rect.minX, rect.maxX - 1.0)
+    let maxY = max(rect.minY, rect.maxY - 1.0)
+    let cx = min(max(point.x, rect.minX), maxX)
+    let cy = min(max(point.y, rect.minY), maxY)
+    return CGPoint(x: cx, y: cy)
+}
+
+/// Clamps a point to the active display containing it, or projects onto the nearest active display
+/// rectangle so multi-monitor arrangements with unequal sizes never trap the cursor in dead-space.
+private func clampPointToActiveDisplays(_ point: CGPoint) -> CGPoint {
+    let rects = activeDisplayRects()
+    for rect in rects {
+        let maxX = max(rect.minX, rect.maxX - 1.0)
+        let maxY = max(rect.minY, rect.maxY - 1.0)
+        if point.x >= rect.minX && point.x <= maxX && point.y >= rect.minY && point.y <= maxY {
+            return point
+        }
+    }
+
+    var bestPt = clampPointToRect(point, rects[0])
+    var bestDistSq = (bestPt.x - point.x) * (bestPt.x - point.x) + (bestPt.y - point.y) * (bestPt.y - point.y)
+    for i in 1..<rects.count {
+        let cand = clampPointToRect(point, rects[i])
+        let dx = cand.x - point.x
+        let dy = cand.y - point.y
+        let distSq = dx * dx + dy * dy
+        if distSq < bestDistSq {
+            bestDistSq = distSq
+            bestPt = cand
+        }
+    }
+    return bestPt
+}
+
+// MARK: - Low-Memory Cursor Classifier
+
+private func fnv1a64(_ bytes: UnsafePointer<UInt8>, count: Int) -> UInt64 {
+    var hash: UInt64 = 14695981039346656037
+    let prime: UInt64 = 1099511628211
+    for i in 0..<count {
+        hash ^= UInt64(bytes[i])
+        hash = hash &* prime
+    }
+    return hash
+}
+
+private struct CursorImageFingerprint: Equatable {
+    let hash: UInt64
+    let width: Int
+    let height: Int
+    let hotX: Int
+    let hotY: Int
+}
+
+private func computeCursorFingerprint(_ cursor: NSCursor) -> CursorImageFingerprint? {
+    return autoreleasepool {
+        let image = cursor.image
+        let hotX = Int(round(cursor.hotSpot.x))
+        let hotY = Int(round(cursor.hotSpot.y))
+
+        // Fast path: downsample CGImage into a tiny fixed 32x32 RGBA stack buffer (4 KB)
+        // avoiding costly multi-megabyte TIFF allocations.
+        var proposedRect = NSRect(origin: .zero, size: image.size)
+        if let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) {
+            let sampleW = 32
+            let sampleH = 32
+            var pixels = [UInt8](repeating: 0, count: sampleW * sampleH * 4)
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+            let drew: Bool = pixels.withUnsafeMutableBytes { buf in
+                guard let base = buf.baseAddress,
+                      let ctx = CGContext(
+                        data: base,
+                        width: sampleW,
+                        height: sampleH,
+                        bitsPerComponent: 8,
+                        bytesPerRow: sampleW * 4,
+                        space: colorSpace,
+                        bitmapInfo: bitmapInfo
+                      ) else {
+                    return false
+                }
+                ctx.interpolationQuality = .low
+                ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: sampleW, height: sampleH))
+                return true
+            }
+            if drew {
+                let h = pixels.withUnsafeBufferPointer { ptr -> UInt64 in
+                    guard let base = ptr.baseAddress else { return 0 }
+                    return fnv1a64(base, count: ptr.count)
+                }
+                return CursorImageFingerprint(
+                    hash: h,
+                    width: Int(round(image.size.width)),
+                    height: Int(round(image.size.height)),
+                    hotX: hotX,
+                    hotY: hotY
+                )
+            }
+        }
+
+        // Fallback: hash tiffRepresentation inside autoreleasepool without retaining Data
+        if let tiff = image.tiffRepresentation, !tiff.isEmpty {
+            let h = tiff.withUnsafeBytes { rawBuf -> UInt64 in
+                guard let base = rawBuf.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+                return fnv1a64(base, count: tiff.count)
+            }
+            return CursorImageFingerprint(
+                hash: h,
+                width: Int(round(image.size.width)),
+                height: Int(round(image.size.height)),
+                hotX: hotX,
+                hotY: hotY
+            )
+        }
+        return nil
+    }
 }
 
 private final class CursorShapeClassifier {
     private struct Entry {
         let cursor: NSCursor
-        let tiff: Data?
-        let hotSpot: NSPoint
+        let fingerprint: CursorImageFingerprint?
         let shape: String
     }
 
     private lazy var entries: [Entry] = {
-        let pairs: [(NSCursor, String)] = [
-            (NSCursor.arrow, "default"),
-            (NSCursor.iBeam, "text"),
-            (NSCursor.iBeamCursorForVerticalLayout, "text"),
-            (NSCursor.pointingHand, "pointer"),
-            (NSCursor.crosshair, "crosshair"),
-            (NSCursor.openHand, "grab"),
-            (NSCursor.closedHand, "grabbing"),
-            (NSCursor.resizeLeftRight, "ew-resize"),
-            (NSCursor.resizeLeft, "ew-resize"),
-            (NSCursor.resizeRight, "ew-resize"),
-            (NSCursor.resizeUpDown, "ns-resize"),
-            (NSCursor.resizeUp, "ns-resize"),
-            (NSCursor.resizeDown, "ns-resize"),
-            (NSCursor.operationNotAllowed, "not-allowed"),
-        ]
-        return pairs.map { (cur, shape) in
-            Entry(
-                cursor: cur,
-                tiff: cur.image.tiffRepresentation,
-                hotSpot: cur.hotSpot,
-                shape: shape
-            )
+        return autoreleasepool {
+            let pairs: [(NSCursor, String)] = [
+                (NSCursor.arrow, "default"),
+                (NSCursor.iBeam, "text"),
+                (NSCursor.iBeamCursorForVerticalLayout, "text"),
+                (NSCursor.pointingHand, "pointer"),
+                (NSCursor.crosshair, "crosshair"),
+                (NSCursor.openHand, "grab"),
+                (NSCursor.closedHand, "grabbing"),
+                (NSCursor.resizeLeftRight, "ew-resize"),
+                (NSCursor.resizeLeft, "ew-resize"),
+                (NSCursor.resizeRight, "ew-resize"),
+                (NSCursor.resizeUpDown, "ns-resize"),
+                (NSCursor.resizeUp, "ns-resize"),
+                (NSCursor.resizeDown, "ns-resize"),
+                (NSCursor.operationNotAllowed, "not-allowed"),
+            ]
+            return pairs.map { (cur, shape) in
+                Entry(
+                    cursor: cur,
+                    fingerprint: computeCursorFingerprint(cur),
+                    shape: shape
+                )
+            }
         }
     }()
 
+    func diagnostics() -> (total: Int, fingerprinted: Int, hasArrow: Bool, hasIBeam: Bool) {
+        let list = entries
+        let fingerprinted = list.filter { $0.fingerprint != nil }.count
+        let hasArrow = list.first(where: { $0.shape == "default" })?.fingerprint != nil
+        let hasIBeam = list.first(where: { $0.shape == "text" })?.fingerprint != nil
+        return (list.count, fingerprinted, hasArrow, hasIBeam)
+    }
+
     func queryCurrentShape() -> String {
-        guard let current = NSCursor.currentSystem else {
+        return autoreleasepool {
+            guard let current = NSCursor.currentSystem else {
+                return "default"
+            }
+            for entry in entries {
+                if current == entry.cursor {
+                    return entry.shape
+                }
+            }
+            if let curFp = computeCursorFingerprint(current) {
+                for entry in entries {
+                    if let refFp = entry.fingerprint, curFp == refFp {
+                        return entry.shape
+                    }
+                }
+                // Secondary match on pixel hash alone in case hotspot rounds slightly differently
+                for entry in entries {
+                    if let refFp = entry.fingerprint, curFp.hash == refFp.hash {
+                        return entry.shape
+                    }
+                }
+            }
             return "default"
         }
-        let currentTiff = current.image.tiffRepresentation
-        for entry in entries {
-            if current == entry.cursor {
-                return entry.shape
-            }
-            if let curTiff = currentTiff, let refTiff = entry.tiff, curTiff == refTiff {
-                return entry.shape
-            }
-        }
-        return "default"
     }
 }
 
-private let cursorClassifier = CursorShapeClassifier()
+private var cursorClassifier: CursorShapeClassifier? = nil
+
+private func initializeAppKitForDaemon() {
+    autoreleasepool {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        let classifier = CursorShapeClassifier()
+        // Warm reference cursor entries now that NSApplication is initialized
+        _ = classifier.diagnostics()
+        cursorClassifier = classifier
+    }
+}
+
+// MARK: - Thread-Safe InputBlocker
 
 private func inputBlockTapCallback(
     proxy: CGEventTapProxy,
@@ -130,7 +636,7 @@ private func inputBlockTapCallback(
         return Unmanaged.passUnretained(event)
     }
 
-    // Emergency local unlock: Option+Ctrl+Esc or Option+Cmd+Esc
+    // Fail-safe local unlock: Ctrl+Option+Esc (primary) or Option+Cmd+Esc (consumed to prevent macOS Force Quit dialog)
     if type == .keyDown {
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         let flags = event.flags
@@ -138,7 +644,8 @@ private func inputBlockTapCallback(
             flags.contains(.maskAlternate) &&
             (flags.contains(.maskControl) || flags.contains(.maskCommand)) {
             blocker.disableFromEmergencyUnlock()
-            return Unmanaged.passUnretained(event)
+            // Consume the unlock hotkey so Option+Cmd+Esc never leaks a Force Quit dialog
+            return nil
         }
     }
 
@@ -148,7 +655,9 @@ private func inputBlockTapCallback(
 
 private final class InputBlocker {
     private let lock = NSLock()
+    private var desiredEnabled = false
     private var enabled = false
+    private var generation: UInt64 = 0
     private var machPort: CFMachPort?
     private var runLoop: CFRunLoop?
     private var runLoopSource: CFRunLoopSource?
@@ -162,10 +671,10 @@ private final class InputBlocker {
 
     func reenableIfActive() {
         lock.lock()
-        let active = enabled
+        let active = enabled && desiredEnabled
         let port = machPort
         lock.unlock()
-        if active, let port = port {
+        if active, let port = port, CFMachPortIsValid(port) {
             CGEvent.tapEnable(tap: port, enable: true)
         }
     }
@@ -179,12 +688,22 @@ private final class InputBlocker {
     func setEnabled(_ target: Bool) -> Bool {
         if !target {
             lock.lock()
+            desiredEnabled = false
             enabled = false
+            generation &+= 1
             let port = machPort
             let rl = runLoop
+            machPort = nil
+            runLoop = nil
+            runLoopSource = nil
+            tapThread = nil
             lock.unlock()
+
             if let port = port {
-                CGEvent.tapEnable(tap: port, enable: false)
+                if CFMachPortIsValid(port) {
+                    CGEvent.tapEnable(tap: port, enable: false)
+                    CFMachPortInvalidate(port)
+                }
             }
             if let rl = rl {
                 CFRunLoopStop(rl)
@@ -193,11 +712,29 @@ private final class InputBlocker {
         }
 
         lock.lock()
-        if enabled && machPort != nil {
+        if enabled && desiredEnabled, let port = machPort, CFMachPortIsValid(port) {
             lock.unlock()
             return true
         }
+        desiredEnabled = true
+        generation &+= 1
+        let myGen = generation
+        let stalePort = machPort
+        let staleRl = runLoop
+        machPort = nil
+        runLoop = nil
+        runLoopSource = nil
+        tapThread = nil
+        enabled = false
         lock.unlock()
+
+        if let stalePort = stalePort, CFMachPortIsValid(stalePort) {
+            CGEvent.tapEnable(tap: stalePort, enable: false)
+            CFMachPortInvalidate(stalePort)
+        }
+        if let staleRl = staleRl {
+            CFRunLoopStop(staleRl)
+        }
 
         let readySem = DispatchSemaphore(value: 0)
         var created = false
@@ -232,54 +769,86 @@ private final class InputBlocker {
                 callback: inputBlockTapCallback,
                 userInfo: Unmanaged.passUnretained(self).toOpaque()
             ) else {
+                self.lock.lock()
+                if self.generation == myGen {
+                    self.desiredEnabled = false
+                    self.enabled = false
+                    self.tapThread = nil
+                }
+                self.lock.unlock()
                 readySem.signal()
                 return
             }
 
             let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
             let rl = CFRunLoopGetCurrent()
+
+            self.lock.lock()
+            // Verify caller did not disable or supersede this request while tapCreate ran
+            guard self.desiredEnabled && self.generation == myGen else {
+                self.lock.unlock()
+                if CFMachPortIsValid(tap) {
+                    CGEvent.tapEnable(tap: tap, enable: false)
+                    CFMachPortInvalidate(tap)
+                }
+                readySem.signal()
+                return
+            }
+
             if let source = source, let rl = rl {
                 CFRunLoopAddSource(rl, source, .commonModes)
             }
-            CGEvent.tapEnable(tap: tap, enable: true)
-
-            self.lock.lock()
             self.machPort = tap
             self.runLoop = rl
             self.runLoopSource = source
             self.enabled = true
+            created = true
             self.lock.unlock()
 
-            created = true
+            CGEvent.tapEnable(tap: tap, enable: true)
             readySem.signal()
 
             CFRunLoopRun()
 
             // Cleanup after run loop stops
-            CGEvent.tapEnable(tap: tap, enable: false)
-            if let source = source, let rl = rl {
-                CFRunLoopRemoveSource(rl, source, .commonModes)
-            }
-            CFMachPortInvalidate(tap)
-
             self.lock.lock()
-            if self.machPort === tap {
+            let stillOwned = (self.machPort === tap)
+            if stillOwned {
                 self.machPort = nil
                 self.runLoop = nil
                 self.runLoopSource = nil
                 self.tapThread = nil
-                self.enabled = false
+                if self.generation == myGen {
+                    self.enabled = false
+                }
             }
             self.lock.unlock()
+
+            if let source = source, let rl = rl {
+                CFRunLoopRemoveSource(rl, source, .commonModes)
+            }
+            if CFMachPortIsValid(tap) {
+                CGEvent.tapEnable(tap: tap, enable: false)
+                CFMachPortInvalidate(tap)
+            }
         }
 
         lock.lock()
-        tapThread = thread
-        lock.unlock()
-        thread.start()
+        if generation == myGen && desiredEnabled {
+            tapThread = thread
+            lock.unlock()
+            thread.start()
+        } else {
+            lock.unlock()
+            return false
+        }
 
         _ = readySem.wait(timeout: .now() + 2.0)
-        return created
+
+        lock.lock()
+        let result = created && enabled && generation == myGen
+        lock.unlock()
+        return result
     }
 }
 
@@ -540,12 +1109,16 @@ private func flagForModifierKeyCode(_ keyCode: CGKeyCode) -> CGEventFlags {
     }
 }
 
-private func readDouble(_ dict: [String: Any], _ key: String, default fallback: Double = 0.0) -> Double {
+private func readOptionalDouble(_ dict: [String: Any], _ key: String) -> Double? {
     if let n = dict[key] as? NSNumber {
         let v = n.doubleValue
-        return v.isFinite ? v : fallback
+        return v.isFinite ? v : nil
     }
-    return fallback
+    return nil
+}
+
+private func readDouble(_ dict: [String: Any], _ key: String, default fallback: Double = 0.0) -> Double {
+    return readOptionalDouble(dict, key) ?? fallback
 }
 
 private func readInt(_ dict: [String: Any], _ key: String, default fallback: Int = 0) -> Int {
@@ -656,15 +1229,16 @@ private func handleCommand(_ dict: [String: Any], state: inout ButtonState, sour
         writeStdoutLine("{\"ok\":true,\"pong\":true}")
 
     case "query_cursor":
-        let shape = cursorClassifier.queryCurrentShape()
+        let shape = cursorClassifier?.queryCurrentShape() ?? "default"
         writeStdoutLine("{\"ok\":true,\"cursor\":\"\(shape)\"}")
 
     case "block_input":
         let enabled = (dict["enabled"] as? Bool) == true
         let ok = inputBlocker.setEnabled(enabled)
-        if enabled && !ok {
-            writeStdoutLine("{\"event\":\"block_input_unlocked\"}")
-        }
+        let active = inputBlocker.isEnabled
+        writeStdoutLine(
+            "{\"event\":\"block_input_result\",\"ok\":\(ok ? "true" : "false"),\"active\":\(active ? "true" : "false")}"
+        )
 
     case "mouse_move":
         let pt = CGPoint(x: readDouble(dict, "x"), y: readDouble(dict, "y"))
@@ -683,12 +1257,8 @@ private func handleCommand(_ dict: [String: Any], state: inout ButtonState, sour
         let dx = max(-2000, min(2000, Int(round(readDouble(dict, "dx")))))
         let dy = max(-2000, min(2000, Int(round(readDouble(dict, "dy")))))
         let currentLoc = CGEvent(source: nil)?.location ?? state.lastPoint
-        let union = activeDisplaysUnionBounds()
-        let maxX = max(union.minX, union.maxX - 1.0)
-        let maxY = max(union.minY, union.maxY - 1.0)
-        let nextX = min(max(currentLoc.x + Double(dx), union.minX), maxX)
-        let nextY = min(max(currentLoc.y + Double(dy), union.minY), maxY)
-        let nextPt = CGPoint(x: nextX, y: nextY)
+        let proposedPt = CGPoint(x: currentLoc.x + Double(dx), y: currentLoc.y + Double(dy))
+        let nextPt = clampPointToActiveDisplays(proposedPt)
         state.lastPoint = nextPt
         if state.leftDown {
             postMouseEvent(
@@ -729,7 +1299,12 @@ private func handleCommand(_ dict: [String: Any], state: inout ButtonState, sour
         }
 
     case "mouse_down":
-        let pt = CGPoint(x: readDouble(dict, "x"), y: readDouble(dict, "y"))
+        let pt: CGPoint
+        if let x = readOptionalDouble(dict, "x"), let y = readOptionalDouble(dict, "y") {
+            pt = CGPoint(x: x, y: y)
+        } else {
+            pt = CGEvent(source: nil)?.location ?? state.lastPoint
+        }
         let buttonStr = (dict["button"] as? String ?? "left").lowercased()
         let clickCount = Int64(max(1, min(3, readInt(dict, "clickCount", default: 1))))
         state.lastPoint = pt
@@ -746,7 +1321,12 @@ private func handleCommand(_ dict: [String: Any], state: inout ButtonState, sour
         }
 
     case "mouse_up":
-        let pt = CGPoint(x: readDouble(dict, "x"), y: readDouble(dict, "y"))
+        let pt: CGPoint
+        if let x = readOptionalDouble(dict, "x"), let y = readOptionalDouble(dict, "y") {
+            pt = CGPoint(x: x, y: y)
+        } else {
+            pt = CGEvent(source: nil)?.location ?? state.lastPoint
+        }
         let buttonStr = (dict["button"] as? String ?? "left").lowercased()
         let clickCount = Int64(max(1, min(3, readInt(dict, "clickCount", default: 1))))
         state.lastPoint = pt
@@ -763,8 +1343,8 @@ private func handleCommand(_ dict: [String: Any], state: inout ButtonState, sour
         }
 
     case "mouse_wheel":
-        if dict["x"] != nil && dict["y"] != nil {
-            let pt = CGPoint(x: readDouble(dict, "x"), y: readDouble(dict, "y"))
+        if let x = readOptionalDouble(dict, "x"), let y = readOptionalDouble(dict, "y") {
+            let pt = CGPoint(x: x, y: y)
             if abs(pt.x - state.lastPoint.x) > 1.0 || abs(pt.y - state.lastPoint.y) > 1.0 {
                 state.lastPoint = pt
                 postMouseEvent(source: source, type: .mouseMoved, point: pt, button: .left)
@@ -861,44 +1441,72 @@ private func handleCommand(_ dict: [String: Any], state: inout ButtonState, sour
     }
 }
 
-// Entrypoint
+// MARK: - Entrypoint
+
 let args = CommandLine.arguments
+
+// MUST run before any AppKit / CoreGraphics initialization (fork safety)
+if args.count >= 2 && args[1] == "--pty-bridge" {
+    runPtyBridge(args: Array(args.dropFirst(2)))
+}
+
 if args.contains("--check-permissions") {
-    let acc = AXIsProcessTrusted()
-    let scr = CGPreflightScreenCaptureAccess()
-    printPermissionsJson(accessibility: acc, screenCapture: scr)
+    autoreleasepool {
+        let acc = AXIsProcessTrusted()
+        let scr = CGPreflightScreenCaptureAccess()
+        printPermissionsJson(accessibility: acc, screenCapture: scr)
+    }
     exit(0)
 }
 
 if args.contains("--request-accessibility") {
-    let promptKey = "AXTrustedCheckOptionPrompt" as CFString
-    let options = [promptKey: kCFBooleanTrue!] as CFDictionary
-    let acc = AXIsProcessTrustedWithOptions(options)
-    let scr = CGPreflightScreenCaptureAccess()
-    printPermissionsJson(accessibility: acc, screenCapture: scr)
+    autoreleasepool {
+        let promptKey = "AXTrustedCheckOptionPrompt" as CFString
+        let options = [promptKey: kCFBooleanTrue!] as CFDictionary
+        let acc = AXIsProcessTrustedWithOptions(options)
+        let scr = CGPreflightScreenCaptureAccess()
+        printPermissionsJson(accessibility: acc, screenCapture: scr)
+    }
     exit(0)
 }
 
 if args.contains("--request-screen") {
-    let scr = CGRequestScreenCaptureAccess()
-    let acc = AXIsProcessTrusted()
-    printPermissionsJson(accessibility: acc, screenCapture: scr)
+    autoreleasepool {
+        let scr = CGRequestScreenCaptureAccess()
+        let acc = AXIsProcessTrusted()
+        printPermissionsJson(accessibility: acc, screenCapture: scr)
+    }
+    exit(0)
+}
+
+if args.contains("--check-cursors") {
+    initializeAppKitForDaemon()
+    autoreleasepool {
+        let diag = cursorClassifier?.diagnostics() ?? (total: 0, fingerprinted: 0, hasArrow: false, hasIBeam: false)
+        writeStdoutLine(
+            "{\"ok\":true,\"total\":\(diag.total),\"fingerprinted\":\(diag.fingerprinted),\"arrow\":\(diag.hasArrow ? "true" : "false"),\"iBeam\":\(diag.hasIBeam ? "true" : "false")}"
+        )
+    }
     exit(0)
 }
 
 setbuf(stdout, nil)
+initializeAppKitForDaemon()
+
 private var buttonState = ButtonState()
 private let eventSource = makeEventSource()
 
 while let line = readLine(strippingNewline: true) {
-    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmed.isEmpty { continue }
-    guard let data = trimmed.data(using: .utf8),
-          let obj = try? JSONSerialization.jsonObject(with: data, options: []),
-          let dict = obj as? [String: Any] else {
-        continue
+    autoreleasepool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return }
+        guard let data = trimmed.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data, options: []),
+              let dict = obj as? [String: Any] else {
+            return
+        }
+        handleCommand(dict, state: &buttonState, source: eventSource)
     }
-    handleCommand(dict, state: &buttonState, source: eventSource)
 }
 
 inputBlocker.setEnabled(false)

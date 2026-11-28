@@ -201,12 +201,18 @@ export function translateControlCommandToNativeEvents(
     }
 
     case "mouse_down": {
-      const pt = mapNormalizedPointToDisplay(Number(cmd.x), Number(cmd.y), displayBounds);
+      const hasCoords =
+        typeof cmd.x === "number" &&
+        Number.isFinite(cmd.x) &&
+        typeof cmd.y === "number" &&
+        Number.isFinite(cmd.y);
+      const pt = hasCoords
+        ? mapNormalizedPointToDisplay(cmd.x as number, cmd.y as number, displayBounds)
+        : undefined;
       return [
         {
           action: "mouse_down",
-          x: pt.x,
-          y: pt.y,
+          ...(pt ? { x: pt.x, y: pt.y } : {}),
           button: sanitizeMouseButton(cmd.button),
           clickCount: sanitizeClickCount(cmd.clickCount),
         },
@@ -214,12 +220,18 @@ export function translateControlCommandToNativeEvents(
     }
 
     case "mouse_up": {
-      const pt = mapNormalizedPointToDisplay(Number(cmd.x), Number(cmd.y), displayBounds);
+      const hasCoords =
+        typeof cmd.x === "number" &&
+        Number.isFinite(cmd.x) &&
+        typeof cmd.y === "number" &&
+        Number.isFinite(cmd.y);
+      const pt = hasCoords
+        ? mapNormalizedPointToDisplay(cmd.x as number, cmd.y as number, displayBounds)
+        : undefined;
       return [
         {
           action: "mouse_up",
-          x: pt.x,
-          y: pt.y,
+          ...(pt ? { x: pt.x, y: pt.y } : {}),
           button: sanitizeMouseButton(cmd.button),
           clickCount: sanitizeClickCount(cmd.clickCount),
         },
@@ -502,6 +514,7 @@ export class NativeInputInjector {
   private lastSpawnAt = 0;
   private stdoutLineBuffer = "";
   private cursorQueryResolvers: Array<(shape: CursorShape) => void> = [];
+  private blockInputResolvers: Array<(res: { ok: boolean; active: boolean }) => void> = [];
 
   constructor(options: NativeInputInjectorOptions = {}) {
     this.platform =
@@ -690,6 +703,7 @@ export class NativeInputInjector {
           this.child = null;
           this.stdoutLineBuffer = "";
           this.flushPendingCursorQueries("default");
+          this.flushPendingBlockInputQueries({ ok: false, active: false });
           this.onBlockInputChanged?.(false);
         }
         if (this.disposed) {
@@ -795,8 +809,27 @@ export class NativeInputInjector {
       return;
     }
 
+    if (parsed.event === "block_input_result") {
+      this.flushPendingBlockInputQueries({
+        ok: Boolean(parsed.ok),
+        active: Boolean(parsed.active),
+      });
+      return;
+    }
+
     if (parsed.event === "block_input_unlocked") {
       this.onBlockInputChanged?.(false);
+    }
+  }
+
+  private flushPendingBlockInputQueries(res: { ok: boolean; active: boolean }): void {
+    if (this.blockInputResolvers.length === 0) return;
+    const resolvers = this.blockInputResolvers.splice(
+      0,
+      this.blockInputResolvers.length,
+    );
+    for (const resolve of resolvers) {
+      resolve(res);
     }
   }
 
@@ -851,11 +884,53 @@ export class NativeInputInjector {
     });
   }
 
-  public setBlockInput(enabled: boolean): boolean {
-    if (!enabled && (!this.child || this.child.killed || this.child.exitCode !== null)) {
-      return true;
+  public setBlockInput(
+    enabled: boolean,
+    timeoutMs = 1500,
+  ): Promise<{ ok: boolean; active: boolean }> {
+    const target = Boolean(enabled);
+    if (!target && (!this.child || this.child.killed || this.child.exitCode !== null)) {
+      return Promise.resolve({ ok: true, active: false });
     }
-    return this.sendPayload({ action: "block_input", enabled: Boolean(enabled) });
+    if (this.disposed || this.platform === "linux") {
+      return Promise.resolve({ ok: false, active: false });
+    }
+    if (!this.ensureStarted() || !this.child || !this.child.stdin.writable) {
+      return Promise.resolve({ ok: false, active: false });
+    }
+
+    return new Promise<{ ok: boolean; active: boolean }>((resolve) => {
+      let settled = false;
+      const done = (res: { ok: boolean; active: boolean }): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(res);
+      };
+
+      const timer = setTimeout(() => {
+        const idx = this.blockInputResolvers.indexOf(done);
+        if (idx >= 0) {
+          this.blockInputResolvers.splice(idx, 1);
+        }
+        done({ ok: false, active: false });
+      }, Math.max(100, timeoutMs));
+      timer.unref?.();
+
+      this.blockInputResolvers.push(done);
+
+      try {
+        this.child!.stdin.write(
+          `${JSON.stringify({ action: "block_input", enabled: target })}\n`,
+        );
+      } catch {
+        const idx = this.blockInputResolvers.indexOf(done);
+        if (idx >= 0) {
+          this.blockInputResolvers.splice(idx, 1);
+        }
+        done({ ok: false, active: false });
+      }
+    });
   }
 
   public releaseAll(): void {
@@ -871,6 +946,7 @@ export class NativeInputInjector {
   public dispose(): void {
     this.disposed = true;
     this.flushPendingCursorQueries("default");
+    this.flushPendingBlockInputQueries({ ok: false, active: false });
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
@@ -883,25 +959,51 @@ export class NativeInputInjector {
     try {
       if (proc.stdin.writable) {
         proc.stdin.write('{"action":"release_all"}\n');
+        proc.stdin.write('{"action":"block_input","enabled":false}\n');
         proc.stdin.end();
       }
     } catch {
       // Ignore
     }
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // Ignore
-    }
-    const forceKillTimer = setTimeout(() => {
+
+    let termTimer: NodeJS.Timeout | null = null;
+    let forceKillTimer: NodeJS.Timeout | null = null;
+    const clearTimers = (): void => {
+      if (termTimer !== null) {
+        clearTimeout(termTimer);
+        termTimer = null;
+      }
+      if (forceKillTimer !== null) {
+        clearTimeout(forceKillTimer);
+        forceKillTimer = null;
+      }
+    };
+
+    proc.once("exit", clearTimers);
+
+    termTimer = setTimeout(() => {
+      termTimer = null;
+      if (proc.exitCode !== null) {
+        clearTimers();
+        return;
+      }
       try {
-        if (proc.exitCode === null && !proc.killed) {
-          proc.kill("SIGKILL");
-        }
+        proc.kill("SIGTERM");
       } catch {
         // Ignore
       }
-    }, 1000);
-    forceKillTimer.unref?.();
+      forceKillTimer = setTimeout(() => {
+        forceKillTimer = null;
+        try {
+          if (proc.exitCode === null) {
+            proc.kill("SIGKILL");
+          }
+        } catch {
+          // Ignore
+        }
+      }, 1000);
+      forceKillTimer.unref?.();
+    }, 180);
+    termTimer.unref?.();
   }
 }

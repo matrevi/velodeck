@@ -18,8 +18,7 @@ export interface LanPeerInfo {
   lanIp: string;
   macAddresses: string[];
   controlCode?: string;
-  lastSeen?: number;
-  seenAt?: number;
+  seenAt: number;
 }
 
 export interface DesktopHostChatMessage {
@@ -52,6 +51,7 @@ export interface DesktopDisplayInfo {
   width: number;
   height: number;
   primary: boolean;
+  scaleFactor?: number;
 }
 
 export interface DesktopHostPermissions {
@@ -146,9 +146,7 @@ export interface VeloDeckDesktopBridge {
     permissions: SessionPermissions,
   ): Promise<DesktopHostState>;
   rejectHostSession?(sessionId: string): Promise<DesktopHostState>;
-  sendHostChatMessage?(
-    text: string,
-  ): Promise<{ ok: boolean; error?: string } | DesktopHostState>;
+  sendHostChatMessage?(text: string): Promise<DesktopHostState>;
   writeClipboardText?(text: string): Promise<boolean>;
   readClipboardText?(): Promise<string>;
 }

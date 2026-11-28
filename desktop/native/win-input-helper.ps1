@@ -1,4 +1,4 @@
-# VeloDeck Windows Native Input Helper (PowerShell + Inline C# SendInput)
+# VeloDeck Windows Native Input Helper (PowerShell + Inline C# SendInput & LL Hooks)
 # Modes:
 #   --check-permissions  Prints {"accessibility":true,"screenCapture":true} and exits 0
 #   (default)            Persistent NDJSON daemon reading commands from stdin
@@ -9,6 +9,8 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
+[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 
 if ($CliArgs -contains "--check-permissions" -or $CliArgs -contains "--request-accessibility") {
     [Console]::Out.WriteLine('{"accessibility":true,"screenCapture":true}')
@@ -20,8 +22,13 @@ $csharpSource = @"
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 public static class VeloDeckWinInput {
+    private static readonly IntPtr VELODECK_EVENT_MAGIC = new IntPtr(0x56444C4B);
+    private static readonly object stdoutLock = new object();
+    private static readonly object hookLock = new object();
+
     private const uint INPUT_MOUSE = 0;
     private const uint INPUT_KEYBOARD = 1;
 
@@ -44,6 +51,13 @@ public static class VeloDeckWinInput {
     private const ushort VK_MENU = 0x12;
     private const ushort VK_LWIN = 0x5B;
     private const ushort VK_RETURN = 0x0D;
+    private const uint VK_ESCAPE = 0x1B;
+
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WH_MOUSE_LL = 14;
+    private const int WM_KEYDOWN = 0x0100;
+    private const int WM_SYSKEYDOWN = 0x0104;
+    private const uint WM_QUIT = 0x0012;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct INPUT {
@@ -98,6 +112,36 @@ public static class VeloDeckWinInput {
         public POINT ptScreenPos;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KBDLLHOOKSTRUCT {
+        public uint vkCode;
+        public uint scanCode;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT {
+        public POINT pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public uint time;
+        public POINT pt;
+    }
+
+    private delegate IntPtr LowLevelHookProc(int nCode, IntPtr wParam, IntPtr lParam);
+
     private const int CURSOR_SHOWING = 0x00000001;
     private const int IDC_ARROW = 32512;
     private const int IDC_IBEAM = 32513;
@@ -128,20 +172,52 @@ public static class VeloDeckWinInput {
     private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
 
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern bool BlockInput(bool fBlockIt);
-
-    [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetCursorInfo(ref CURSORINFO pci);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr LoadCursor(IntPtr hInstance, IntPtr lpCursorName);
 
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelHookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool PostThreadMessage(uint idThread, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
     private static bool leftDown = false;
     private static bool rightDown = false;
     private static bool middleDown = false;
-    private static bool inputBlocked = false;
     private static int lastX = 0;
     private static int lastY = 0;
+
+    private static volatile bool inputBlocked = false;
+    private static int hookGeneration = 0;
+    private static IntPtr hKeyboardHook = IntPtr.Zero;
+    private static IntPtr hMouseHook = IntPtr.Zero;
+    private static uint hookThreadId = 0;
+    private static Thread hookThread = null;
+    private static readonly LowLevelHookProc kbHookDelegate = KeyboardHookCallback;
+    private static readonly LowLevelHookProc mouseHookDelegate = MouseHookCallback;
 
     private static IntPtr hArrow = IntPtr.Zero;
     private static IntPtr hIBeam = IntPtr.Zero;
@@ -155,6 +231,182 @@ public static class VeloDeckWinInput {
     private static IntPtr hSizeAll = IntPtr.Zero;
     private static IntPtr hNo = IntPtr.Zero;
     private static IntPtr hHand = IntPtr.Zero;
+
+    public static void WriteStdoutLine(string line) {
+        lock (stdoutLock) {
+            try {
+                Console.Out.WriteLine(line);
+                Console.Out.Flush();
+            } catch { }
+        }
+    }
+
+    public static bool IsInputBlocked() {
+        return inputBlocked;
+    }
+
+    private static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam) {
+        if (nCode >= 0 && inputBlocked) {
+            try {
+                KBDLLHOOKSTRUCT info = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+                // Always allow VeloDeck's own injected keyboard events
+                if (info.dwExtraInfo == VELODECK_EVENT_MAGIC) {
+                    return CallNextHookEx(hKeyboardHook, nCode, wParam, lParam);
+                }
+
+                // Fail-safe local unlock: Ctrl+Alt+Esc (with or without Shift)
+                int msg = wParam.ToInt32();
+                if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && info.vkCode == VK_ESCAPE) {
+                    bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                    bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+                    if (ctrlDown && altDown) {
+                        uint tidToStop = 0;
+                        lock (hookLock) {
+                            inputBlocked = false;
+                            hookGeneration++;
+                            tidToStop = hookThreadId;
+                            hookThreadId = 0;
+                            hookThread = null;
+                        }
+                        if (tidToStop != 0) {
+                            PostThreadMessage(tidToStop, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+                        }
+                        WriteStdoutLine("{\"event\":\"block_input_unlocked\"}");
+                        return new IntPtr(1);
+                    }
+                }
+            } catch { }
+            return new IntPtr(1);
+        }
+        return CallNextHookEx(hKeyboardHook, nCode, wParam, lParam);
+    }
+
+    private static IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam) {
+        if (nCode >= 0 && inputBlocked) {
+            try {
+                MSLLHOOKSTRUCT info = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                // Always allow VeloDeck's own injected mouse events
+                if (info.dwExtraInfo == VELODECK_EVENT_MAGIC) {
+                    return CallNextHookEx(hMouseHook, nCode, wParam, lParam);
+                }
+            } catch { }
+            return new IntPtr(1);
+        }
+        return CallNextHookEx(hMouseHook, nCode, wParam, lParam);
+    }
+
+    public static bool SetBlockInput(bool enabled) {
+        if (!enabled) {
+            uint tidToStop = 0;
+            lock (hookLock) {
+                inputBlocked = false;
+                hookGeneration++;
+                tidToStop = hookThreadId;
+                hookThreadId = 0;
+                hookThread = null;
+            }
+            if (tidToStop != 0) {
+                try { PostThreadMessage(tidToStop, WM_QUIT, IntPtr.Zero, IntPtr.Zero); } catch { }
+            }
+            return true;
+        }
+
+        int myGen;
+        uint staleTid = 0;
+        lock (hookLock) {
+            if (inputBlocked && hookThreadId != 0 && hKeyboardHook != IntPtr.Zero && hMouseHook != IntPtr.Zero) {
+                return true;
+            }
+            myGen = ++hookGeneration;
+            staleTid = hookThreadId;
+            hookThreadId = 0;
+            hookThread = null;
+            inputBlocked = false;
+        }
+        if (staleTid != 0) {
+            try { PostThreadMessage(staleTid, WM_QUIT, IntPtr.Zero, IntPtr.Zero); } catch { }
+        }
+
+        ManualResetEventSlim ready = new ManualResetEventSlim(false);
+        bool created = false;
+
+        Thread t = new Thread(() => {
+            IntPtr kbHook = IntPtr.Zero;
+            IntPtr msHook = IntPtr.Zero;
+            uint myTid = GetCurrentThreadId();
+            try {
+                // Force creation of Win32 message queue on this thread
+                MSG dummy;
+                PeekMessage(out dummy, IntPtr.Zero, 0, 0, 0);
+
+                IntPtr hMod = GetModuleHandle(null);
+                kbHook = SetWindowsHookEx(WH_KEYBOARD_LL, kbHookDelegate, hMod, 0);
+                msHook = SetWindowsHookEx(WH_MOUSE_LL, mouseHookDelegate, hMod, 0);
+
+                if (kbHook == IntPtr.Zero || msHook == IntPtr.Zero) {
+                    if (kbHook != IntPtr.Zero) UnhookWindowsHookEx(kbHook);
+                    if (msHook != IntPtr.Zero) UnhookWindowsHookEx(msHook);
+                    ready.Set();
+                    return;
+                }
+
+                lock (hookLock) {
+                    if (hookGeneration != myGen) {
+                        UnhookWindowsHookEx(kbHook);
+                        UnhookWindowsHookEx(msHook);
+                        ready.Set();
+                        return;
+                    }
+                    hKeyboardHook = kbHook;
+                    hMouseHook = msHook;
+                    hookThreadId = myTid;
+                    inputBlocked = true;
+                    created = true;
+                }
+
+                ready.Set();
+
+                MSG msg;
+                while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
+                    // Low-level hooks only require an active message loop
+                }
+            } catch {
+                try { ready.Set(); } catch { }
+            } finally {
+                if (kbHook != IntPtr.Zero) {
+                    try { UnhookWindowsHookEx(kbHook); } catch { }
+                }
+                if (msHook != IntPtr.Zero) {
+                    try { UnhookWindowsHookEx(msHook); } catch { }
+                }
+                lock (hookLock) {
+                    if (hKeyboardHook == kbHook) hKeyboardHook = IntPtr.Zero;
+                    if (hMouseHook == msHook) hMouseHook = IntPtr.Zero;
+                    if (hookThreadId == myTid) hookThreadId = 0;
+                    if (hookGeneration == myGen) {
+                        inputBlocked = false;
+                        hookThread = null;
+                    }
+                }
+            }
+        });
+        t.IsBackground = true;
+
+        lock (hookLock) {
+            if (hookGeneration != myGen) {
+                return false;
+            }
+            hookThread = t;
+        }
+
+        t.Start();
+        ready.Wait(1500);
+        ready.Dispose();
+
+        lock (hookLock) {
+            return created && inputBlocked && hookGeneration == myGen;
+        }
+    }
 
     public static void InitDpi() {
         try {
@@ -192,7 +444,7 @@ public static class VeloDeckWinInput {
         inputs[0].U.mi.mouseData = 0;
         inputs[0].U.mi.dwFlags = MOUSEEVENTF_MOVE;
         inputs[0].U.mi.time = 0;
-        inputs[0].U.mi.dwExtraInfo = IntPtr.Zero;
+        inputs[0].U.mi.dwExtraInfo = VELODECK_EVENT_MAGIC;
         SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
 
@@ -218,13 +470,6 @@ public static class VeloDeckWinInput {
         return "default";
     }
 
-    public static void SetBlockInput(bool enabled) {
-        try {
-            BlockInput(enabled);
-            inputBlocked = enabled;
-        } catch { }
-    }
-
     private static void SendMouseFlag(uint flag, uint mouseData = 0) {
         INPUT[] inputs = new INPUT[1];
         inputs[0].type = INPUT_MOUSE;
@@ -233,7 +478,7 @@ public static class VeloDeckWinInput {
         inputs[0].U.mi.mouseData = mouseData;
         inputs[0].U.mi.dwFlags = flag;
         inputs[0].U.mi.time = 0;
-        inputs[0].U.mi.dwExtraInfo = IntPtr.Zero;
+        inputs[0].U.mi.dwExtraInfo = VELODECK_EVENT_MAGIC;
         SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
 
@@ -243,10 +488,12 @@ public static class VeloDeckWinInput {
         SetCursorPos(x, y);
     }
 
-    public static void MouseDown(int x, int y, string button) {
-        lastX = x;
-        lastY = y;
-        SetCursorPos(x, y);
+    public static void MouseDown(int x, int y, bool hasCoords, string button) {
+        if (hasCoords) {
+            lastX = x;
+            lastY = y;
+            SetCursorPos(x, y);
+        }
         string b = (button ?? "left").ToLowerInvariant();
         if (b == "right") {
             rightDown = true;
@@ -260,10 +507,12 @@ public static class VeloDeckWinInput {
         }
     }
 
-    public static void MouseUp(int x, int y, string button) {
-        lastX = x;
-        lastY = y;
-        SetCursorPos(x, y);
+    public static void MouseUp(int x, int y, bool hasCoords, string button) {
+        if (hasCoords) {
+            lastX = x;
+            lastY = y;
+            SetCursorPos(x, y);
+        }
         string b = (button ?? "left").ToLowerInvariant();
         if (b == "right") {
             rightDown = false;
@@ -319,7 +568,7 @@ public static class VeloDeckWinInput {
         inputs[0].U.ki.wScan = 0;
         inputs[0].U.ki.dwFlags = (keyUp ? KEYEVENTF_KEYUP : 0u) | (extended ? KEYEVENTF_EXTENDEDKEY : 0u);
         inputs[0].U.ki.time = 0;
-        inputs[0].U.ki.dwExtraInfo = IntPtr.Zero;
+        inputs[0].U.ki.dwExtraInfo = VELODECK_EVENT_MAGIC;
         SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
 
@@ -506,6 +755,8 @@ public static class VeloDeckWinInput {
                 down.U.ki.wVk = 0;
                 down.U.ki.wScan = (ushort)ch;
                 down.U.ki.dwFlags = KEYEVENTF_UNICODE;
+                down.U.ki.time = 0;
+                down.U.ki.dwExtraInfo = VELODECK_EVENT_MAGIC;
                 list.Add(down);
 
                 INPUT up = new INPUT();
@@ -513,6 +764,8 @@ public static class VeloDeckWinInput {
                 up.U.ki.wVk = 0;
                 up.U.ki.wScan = (ushort)ch;
                 up.U.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+                up.U.ki.time = 0;
+                up.U.ki.dwExtraInfo = VELODECK_EVENT_MAGIC;
                 list.Add(up);
             }
             if (list.Count > 0) {
@@ -530,10 +783,7 @@ public static class VeloDeckWinInput {
     }
 
     public static void ReleaseAll() {
-        if (inputBlocked) {
-            try { BlockInput(false); } catch { }
-            inputBlocked = false;
-        }
+        SetBlockInput(false);
         if (leftDown) { leftDown = false; SendMouseFlag(MOUSEEVENTF_LEFTUP); }
         if (rightDown) { rightDown = false; SendMouseFlag(MOUSEEVENTF_RIGHTUP); }
         if (middleDown) { middleDown = false; SendMouseFlag(MOUSEEVENTF_MIDDLEUP); }
@@ -558,72 +808,85 @@ try {
         }
 
         $action = [string]$cmd.action
-        switch ($action) {
-            "ping" {
-                [Console]::Out.WriteLine('{"ok":true,"pong":true}')
-                [Console]::Out.Flush()
+        try {
+            switch ($action) {
+                "ping" {
+                    [VeloDeckWinInput]::WriteStdoutLine('{"ok":true,"pong":true}')
+                }
+                "query_cursor" {
+                    $shape = [VeloDeckWinInput]::QueryCursorShape()
+                    [VeloDeckWinInput]::WriteStdoutLine("{`"ok`":true,`"cursor`":`"$shape`"}")
+                }
+                "block_input" {
+                    $target = [bool]$cmd.enabled
+                    $ok = [VeloDeckWinInput]::SetBlockInput($target)
+                    $active = [VeloDeckWinInput]::IsInputBlocked()
+                    $okStr = if ($ok) { "true" } else { "false" }
+                    $actStr = if ($active) { "true" } else { "false" }
+                    [VeloDeckWinInput]::WriteStdoutLine("{`"event`":`"block_input_result`",`"ok`":$okStr,`"active`":$actStr}")
+                }
+                "mouse_move" {
+                    [VeloDeckWinInput]::MouseMove([int][Math]::Round([double]$cmd.x), [int][Math]::Round([double]$cmd.y))
+                }
+                "mouse_move_relative" {
+                    $rdx = if ($null -ne $cmd.dx) { [int][Math]::Round([double]$cmd.dx) } else { 0 }
+                    $rdy = if ($null -ne $cmd.dy) { [int][Math]::Round([double]$cmd.dy) } else { 0 }
+                    [VeloDeckWinInput]::MouseMoveRelative($rdx, $rdy)
+                }
+                "mouse_down" {
+                    $hasCoords = ($null -ne $cmd.x) -and ($null -ne $cmd.y)
+                    $mx = if ($hasCoords) { [int][Math]::Round([double]$cmd.x) } else { 0 }
+                    $my = if ($hasCoords) { [int][Math]::Round([double]$cmd.y) } else { 0 }
+                    $btn = if ($cmd.button) { [string]$cmd.button } else { "left" }
+                    [VeloDeckWinInput]::MouseDown($mx, $my, $hasCoords, $btn)
+                }
+                "mouse_up" {
+                    $hasCoords = ($null -ne $cmd.x) -and ($null -ne $cmd.y)
+                    $mx = if ($hasCoords) { [int][Math]::Round([double]$cmd.x) } else { 0 }
+                    $my = if ($hasCoords) { [int][Math]::Round([double]$cmd.y) } else { 0 }
+                    $btn = if ($cmd.button) { [string]$cmd.button } else { "left" }
+                    [VeloDeckWinInput]::MouseUp($mx, $my, $hasCoords, $btn)
+                }
+                "mouse_wheel" {
+                    $hasCoords = ($null -ne $cmd.x) -and ($null -ne $cmd.y)
+                    $wx = if ($hasCoords) { [int][Math]::Round([double]$cmd.x) } else { 0 }
+                    $wy = if ($hasCoords) { [int][Math]::Round([double]$cmd.y) } else { 0 }
+                    $dx = if ($null -ne $cmd.deltaX) { [int][Math]::Round([double]$cmd.deltaX) } else { 0 }
+                    $dy = if ($null -ne $cmd.deltaY) { [int][Math]::Round([double]$cmd.deltaY) } else { 0 }
+                    [VeloDeckWinInput]::MouseWheel($wx, $wy, $hasCoords, $dx, $dy)
+                }
+                "tap" {
+                    $cc = if ($null -ne $cmd.clickCount) { [int]$cmd.clickCount } else { 1 }
+                    [VeloDeckWinInput]::Tap([int][Math]::Round([double]$cmd.x), [int][Math]::Round([double]$cmd.y), $cc)
+                }
+                "long_press" {
+                    [VeloDeckWinInput]::LongPress([int][Math]::Round([double]$cmd.x), [int][Math]::Round([double]$cmd.y))
+                }
+                "key_event" {
+                    $phase = if ($cmd.phase) { [string]$cmd.phase } else { "press" }
+                    $code = if ($cmd.code) { [string]$cmd.code } else { "" }
+                    $key = if ($cmd.key) { [string]$cmd.key } else { "" }
+                    $mods = $cmd.modifiers
+                    $ctrl = [bool]($mods -and $mods.ctrl)
+                    $alt = [bool]($mods -and $mods.alt)
+                    $shift = [bool]($mods -and $mods.shift)
+                    $meta = [bool]($mods -and $mods.meta)
+                    [VeloDeckWinInput]::KeyEvent($phase, $code, $key, $ctrl, $alt, $shift, $meta)
+                }
+                "text" {
+                    $text = if ($null -ne $cmd.text) { [string]$cmd.text } else { "" }
+                    $submit = [bool]$cmd.submit
+                    [VeloDeckWinInput]::SendUnicodeText($text, $submit)
+                }
+                "lock" {
+                    [VeloDeckWinInput]::Lock()
+                }
+                "release_all" {
+                    [VeloDeckWinInput]::ReleaseAll()
+                }
             }
-            "query_cursor" {
-                $shape = [VeloDeckWinInput]::QueryCursorShape()
-                [Console]::Out.WriteLine("{`"ok`":true,`"cursor`":`"$shape`"}")
-                [Console]::Out.Flush()
-            }
-            "block_input" {
-                [VeloDeckWinInput]::SetBlockInput([bool]$cmd.enabled)
-            }
-            "mouse_move" {
-                [VeloDeckWinInput]::MouseMove([int][Math]::Round([double]$cmd.x), [int][Math]::Round([double]$cmd.y))
-            }
-            "mouse_move_relative" {
-                $rdx = if ($null -ne $cmd.dx) { [int][Math]::Round([double]$cmd.dx) } else { 0 }
-                $rdy = if ($null -ne $cmd.dy) { [int][Math]::Round([double]$cmd.dy) } else { 0 }
-                [VeloDeckWinInput]::MouseMoveRelative($rdx, $rdy)
-            }
-            "mouse_down" {
-                $btn = if ($cmd.button) { [string]$cmd.button } else { "left" }
-                [VeloDeckWinInput]::MouseDown([int][Math]::Round([double]$cmd.x), [int][Math]::Round([double]$cmd.y), $btn)
-            }
-            "mouse_up" {
-                $btn = if ($cmd.button) { [string]$cmd.button } else { "left" }
-                [VeloDeckWinInput]::MouseUp([int][Math]::Round([double]$cmd.x), [int][Math]::Round([double]$cmd.y), $btn)
-            }
-            "mouse_wheel" {
-                $hasCoords = ($null -ne $cmd.x) -and ($null -ne $cmd.y)
-                $wx = if ($hasCoords) { [int][Math]::Round([double]$cmd.x) } else { 0 }
-                $wy = if ($hasCoords) { [int][Math]::Round([double]$cmd.y) } else { 0 }
-                $dx = if ($null -ne $cmd.deltaX) { [int][Math]::Round([double]$cmd.deltaX) } else { 0 }
-                $dy = if ($null -ne $cmd.deltaY) { [int][Math]::Round([double]$cmd.deltaY) } else { 0 }
-                [VeloDeckWinInput]::MouseWheel($wx, $wy, $hasCoords, $dx, $dy)
-            }
-            "tap" {
-                $cc = if ($null -ne $cmd.clickCount) { [int]$cmd.clickCount } else { 1 }
-                [VeloDeckWinInput]::Tap([int][Math]::Round([double]$cmd.x), [int][Math]::Round([double]$cmd.y), $cc)
-            }
-            "long_press" {
-                [VeloDeckWinInput]::LongPress([int][Math]::Round([double]$cmd.x), [int][Math]::Round([double]$cmd.y))
-            }
-            "key_event" {
-                $phase = if ($cmd.phase) { [string]$cmd.phase } else { "press" }
-                $code = if ($cmd.code) { [string]$cmd.code } else { "" }
-                $key = if ($cmd.key) { [string]$cmd.key } else { "" }
-                $mods = $cmd.modifiers
-                $ctrl = [bool]($mods -and $mods.ctrl)
-                $alt = [bool]($mods -and $mods.alt)
-                $shift = [bool]($mods -and $mods.shift)
-                $meta = [bool]($mods -and $mods.meta)
-                [VeloDeckWinInput]::KeyEvent($phase, $code, $key, $ctrl, $alt, $shift, $meta)
-            }
-            "text" {
-                $text = if ($null -ne $cmd.text) { [string]$cmd.text } else { "" }
-                $submit = [bool]$cmd.submit
-                [VeloDeckWinInput]::SendUnicodeText($text, $submit)
-            }
-            "lock" {
-                [VeloDeckWinInput]::Lock()
-            }
-            "release_all" {
-                [VeloDeckWinInput]::ReleaseAll()
-            }
+        } catch {
+            # Swallow malformed command frames so the input helper daemon never terminates
         }
     }
 } finally {
