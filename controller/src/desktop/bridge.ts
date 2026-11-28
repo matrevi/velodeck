@@ -1,3 +1,4 @@
+import type { AccessApprovalMode, SessionPermissions } from "@velodeck/protocol";
 import { isPrivateHost } from "../state/profiles";
 
 export type DesktopPlatform = "darwin" | "win32" | "linux";
@@ -9,6 +10,30 @@ export type DesktopMenuCommand =
   | "save-screenshot"
   | "open-server-settings"
   | "reconnect";
+
+export interface LanPeerInfo {
+  deviceId: string;
+  name: string;
+  osPlatform: DesktopPlatform | string;
+  lanIp: string;
+  macAddresses: string[];
+  controlCode?: string;
+  lastSeen?: number;
+  seenAt?: number;
+}
+
+export interface DesktopHostChatMessage {
+  id: string;
+  sender: "controller" | "host";
+  senderName?: string;
+  text: string;
+  ts: number;
+}
+
+export interface DesktopHostPendingApproval {
+  sessionId: string;
+  requestedAt: number;
+}
 
 export interface DesktopWindowState {
   alwaysOnTop: boolean;
@@ -55,6 +80,12 @@ export interface DesktopHostState {
   audioCaptureEnabled?: boolean;
   clipboardAutoSync?: boolean;
   privacyScreenActive?: boolean;
+  accessMode?: AccessApprovalMode;
+  blockInputActive?: boolean;
+  lanIp?: string;
+  macAddresses?: string[];
+  pendingApproval?: DesktopHostPendingApproval | null;
+  chatMessages?: DesktopHostChatMessage[];
 }
 
 export interface DesktopHostConfigPatch {
@@ -65,6 +96,7 @@ export interface DesktopHostConfigPatch {
   preventSleep?: boolean;
   audioCaptureEnabled?: boolean;
   clipboardAutoSync?: boolean;
+  accessMode?: AccessApprovalMode;
 }
 
 export interface VeloDeckDesktopBridge {
@@ -103,6 +135,20 @@ export interface VeloDeckDesktopBridge {
   refreshHostPermissions?(): Promise<DesktopHostPermissions>;
   openPermissionSettings?(kind: "accessibility" | "screen"): Promise<void>;
   setHostPrivacyScreen?(enabled: boolean): Promise<DesktopHostState>;
+  setHostBlockInput?(enabled: boolean): Promise<DesktopHostState>;
+  discoverLanPeers?(): Promise<LanPeerInfo[]>;
+  sendWolPacket?(
+    macAddress: string,
+    broadcastIp?: string,
+  ): Promise<{ ok: boolean; error?: string }>;
+  approveHostSession?(
+    sessionId: string,
+    permissions: SessionPermissions,
+  ): Promise<DesktopHostState>;
+  rejectHostSession?(sessionId: string): Promise<DesktopHostState>;
+  sendHostChatMessage?(
+    text: string,
+  ): Promise<{ ok: boolean; error?: string } | DesktopHostState>;
   writeClipboardText?(text: string): Promise<boolean>;
   readClipboardText?(): Promise<string>;
 }

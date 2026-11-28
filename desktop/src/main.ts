@@ -624,6 +624,14 @@ function buildTrayContextMenu(): Menu {
       },
     },
     {
+      label: "锁定本机键鼠输入",
+      type: "checkbox",
+      checked: Boolean(hostState?.blockInputActive),
+      click: (item) => {
+        void hostManager?.setHostBlockInput(item.checked);
+      },
+    },
+    {
       label: "开机自启",
       type: "checkbox",
       checked: Boolean(hostState?.autoLaunch),
@@ -1405,6 +1413,139 @@ function registerIpcHandlers(): void {
       return hostManager.setHostPrivacyScreen(Boolean(enabled));
     },
   );
+
+  ipcMain.handle(
+    "velodeck:host-set-block-input",
+    (event, enabled: unknown) => {
+      if (!isTrustedIpcEvent(event)) {
+        throw new Error("Untrusted IPC sender");
+      }
+      if (!hostManager) {
+        throw new Error("Host manager unavailable");
+      }
+      return hostManager.setHostBlockInput(Boolean(enabled));
+    },
+  );
+
+  ipcMain.handle("velodeck:lan-discover-peers", (event) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    return hostManager.discoverLanPeers();
+  });
+
+  ipcMain.handle("velodeck:lan-send-wol", (event, rawPayload: unknown) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    if (typeof rawPayload === "string") {
+      return hostManager.sendWolPacket(rawPayload);
+    }
+    if (!rawPayload || typeof rawPayload !== "object") {
+      return { ok: false, error: "无效的唤醒参数" };
+    }
+    const { macAddress, broadcastIp } = rawPayload as {
+      macAddress?: unknown;
+      broadcastIp?: unknown;
+    };
+    if (typeof macAddress !== "string") {
+      return { ok: false, error: "缺少有效的 MAC 地址" };
+    }
+    return hostManager.sendWolPacket(
+      macAddress,
+      typeof broadcastIp === "string" && broadcastIp.trim()
+        ? broadcastIp.trim()
+        : undefined,
+    );
+  });
+
+  ipcMain.handle(
+    "velodeck:host-approve-session",
+    (event, rawPayload: unknown) => {
+      if (!isTrustedIpcEvent(event)) {
+        throw new Error("Untrusted IPC sender");
+      }
+      if (!hostManager) {
+        throw new Error("Host manager unavailable");
+      }
+      if (!rawPayload || typeof rawPayload !== "object") {
+        throw new Error("Invalid session approval payload");
+      }
+      const { sessionId, permissions } = rawPayload as {
+        sessionId?: unknown;
+        permissions?: Record<string, unknown>;
+      };
+      if (typeof sessionId !== "string" || !sessionId.trim()) {
+        throw new Error("Invalid session ID");
+      }
+      return hostManager.approveHostSession(
+        sessionId.trim(),
+        permissions && typeof permissions === "object"
+          ? {
+              keyboard:
+                typeof permissions.keyboard === "boolean"
+                  ? permissions.keyboard
+                  : true,
+              mouse:
+                typeof permissions.mouse === "boolean"
+                  ? permissions.mouse
+                  : true,
+              clipboard:
+                typeof permissions.clipboard === "boolean"
+                  ? permissions.clipboard
+                  : true,
+              fileTransfer:
+                typeof permissions.fileTransfer === "boolean"
+                  ? permissions.fileTransfer
+                  : true,
+              audio:
+                typeof permissions.audio === "boolean"
+                  ? permissions.audio
+                  : true,
+              terminal:
+                typeof permissions.terminal === "boolean"
+                  ? permissions.terminal
+                  : true,
+            }
+          : {},
+      );
+    },
+  );
+
+  ipcMain.handle(
+    "velodeck:host-reject-session",
+    (event, sessionId: unknown) => {
+      if (!isTrustedIpcEvent(event)) {
+        throw new Error("Untrusted IPC sender");
+      }
+      if (!hostManager) {
+        throw new Error("Host manager unavailable");
+      }
+      if (typeof sessionId !== "string" || !sessionId.trim()) {
+        throw new Error("Invalid session ID");
+      }
+      return hostManager.rejectHostSession(sessionId.trim());
+    },
+  );
+
+  ipcMain.handle("velodeck:host-send-chat", (event, text: unknown) => {
+    if (!isTrustedIpcEvent(event)) {
+      throw new Error("Untrusted IPC sender");
+    }
+    if (!hostManager) {
+      throw new Error("Host manager unavailable");
+    }
+    if (typeof text !== "string") {
+      throw new Error("Invalid chat message text");
+    }
+    return hostManager.sendHostChatMessage(text);
+  });
 
   ipcMain.handle("velodeck:clipboard-write-text", (event, text: unknown) => {
     if (!isTrustedIpcEvent(event)) {

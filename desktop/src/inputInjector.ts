@@ -4,6 +4,46 @@ import path from "node:path";
 
 export type InputPlatform = "darwin" | "win32" | "linux";
 
+export type CursorShape =
+  | "default"
+  | "pointer"
+  | "text"
+  | "crosshair"
+  | "move"
+  | "ew-resize"
+  | "ns-resize"
+  | "nwse-resize"
+  | "nesw-resize"
+  | "grab"
+  | "grabbing"
+  | "not-allowed"
+  | "wait"
+  | "none";
+
+const VALID_CURSOR_SHAPES: ReadonlySet<string> = new Set<CursorShape>([
+  "default",
+  "pointer",
+  "text",
+  "crosshair",
+  "move",
+  "ew-resize",
+  "ns-resize",
+  "nwse-resize",
+  "nesw-resize",
+  "grab",
+  "grabbing",
+  "not-allowed",
+  "wait",
+  "none",
+]);
+
+export function normalizeCursorShape(raw: unknown): CursorShape {
+  if (typeof raw === "string" && VALID_CURSOR_SHAPES.has(raw)) {
+    return raw as CursorShape;
+  }
+  return "default";
+}
+
 export interface DisplayBounds {
   x: number;
   y: number;
@@ -28,6 +68,9 @@ export interface NativeInputPayload {
   action: string;
   x?: number;
   y?: number;
+  dx?: number;
+  dy?: number;
+  enabled?: boolean;
   button?: "left" | "right" | "middle";
   clickCount?: number;
   deltaX?: number;
@@ -46,6 +89,7 @@ export interface NativeInputInjectorOptions {
   desktopRootDir?: string;
   isPackaged?: boolean;
   mapPoint?: (point: { x: number; y: number }) => { x: number; y: number };
+  onBlockInputChanged?: (active: boolean) => void;
 }
 
 const MAX_WHEEL_DELTA = 2000;
@@ -141,6 +185,19 @@ export function translateControlCommandToNativeEvents(
     case "mouse_move": {
       const pt = mapNormalizedPointToDisplay(Number(cmd.x), Number(cmd.y), displayBounds);
       return [{ action: "mouse_move", x: pt.x, y: pt.y }];
+    }
+
+    case "mouse_move_relative": {
+      const dx = clampDelta(cmd.dx);
+      const dy = clampDelta(cmd.dy);
+      if (dx === 0 && dy === 0) {
+        return [];
+      }
+      return [{ action: "mouse_move_relative", dx, dy }];
+    }
+
+    case "block_input": {
+      return [{ action: "block_input", enabled: Boolean(cmd.enabled) }];
     }
 
     case "mouse_down": {
@@ -406,6 +463,8 @@ export function translateControlCommandToNativeEvents(
 
     case "privacy_screen":
     case "audio_toggle":
+    case "wol":
+    case "whiteboard":
       // Handled at hostManager / hostWorkerRenderer level, never injected as HID events
       return [];
 
@@ -434,12 +493,15 @@ export class NativeInputInjector {
   private readonly desktopRootDir: string;
   private readonly isPackaged: boolean;
   private readonly mapPoint?: (point: { x: number; y: number }) => { x: number; y: number };
+  private readonly onBlockInputChanged?: (active: boolean) => void;
 
   private child: ChildProcessWithoutNullStreams | null = null;
   private disposed = false;
   private restartTimer: NodeJS.Timeout | null = null;
   private restartAttempts = 0;
   private lastSpawnAt = 0;
+  private stdoutLineBuffer = "";
+  private cursorQueryResolvers: Array<(shape: CursorShape) => void> = [];
 
   constructor(options: NativeInputInjectorOptions = {}) {
     this.platform =
@@ -451,6 +513,7 @@ export class NativeInputInjector {
     this.desktopRootDir = options.desktopRootDir ?? path.resolve(__dirname, "..");
     this.isPackaged = options.isPackaged ?? false;
     this.mapPoint = options.mapPoint;
+    this.onBlockInputChanged = options.onBlockInputChanged;
   }
 
   public resolveHelperPath(): string | null {
@@ -602,9 +665,11 @@ export class NativeInputInjector {
 
       this.child = spawned;
       this.lastSpawnAt = Date.now();
+      this.stdoutLineBuffer = "";
 
-      spawned.stdout.on("data", () => {
-        // Drain stdout so helper never blocks on pipe buffer
+      spawned.stdout.on("data", (chunk: Buffer) => {
+        if (this.child !== spawned) return;
+        this.handleHelperStdout(chunk);
       });
       spawned.stderr.on("data", (chunk: Buffer) => {
         const msg = chunk.toString("utf8").trim();
@@ -623,6 +688,9 @@ export class NativeInputInjector {
       spawned.on("exit", (code, signal) => {
         if (this.child === spawned) {
           this.child = null;
+          this.stdoutLineBuffer = "";
+          this.flushPendingCursorQueries("default");
+          this.onBlockInputChanged?.(false);
         }
         if (this.disposed) {
           return;
@@ -694,6 +762,102 @@ export class NativeInputInjector {
     return { ok: allOk, count: events.length };
   }
 
+  private handleHelperStdout(chunk: Buffer): void {
+    this.stdoutLineBuffer += chunk.toString("utf8");
+    let newlineIdx = this.stdoutLineBuffer.indexOf("\n");
+    while (newlineIdx !== -1) {
+      const line = this.stdoutLineBuffer.slice(0, newlineIdx).trim();
+      this.stdoutLineBuffer = this.stdoutLineBuffer.slice(newlineIdx + 1);
+      if (line) {
+        this.processHelperStdoutLine(line);
+      }
+      newlineIdx = this.stdoutLineBuffer.indexOf("\n");
+    }
+    // Bound buffer if helper ever emitted unbounded non-newline data
+    if (this.stdoutLineBuffer.length > 16_384) {
+      this.stdoutLineBuffer = "";
+    }
+  }
+
+  private processHelperStdoutLine(line: string): void {
+    let parsed: Record<string, unknown>;
+    try {
+      const obj: unknown = JSON.parse(line);
+      if (!obj || typeof obj !== "object") return;
+      parsed = obj as Record<string, unknown>;
+    } catch {
+      return;
+    }
+
+    if (typeof parsed.cursor === "string") {
+      const shape = normalizeCursorShape(parsed.cursor);
+      this.flushPendingCursorQueries(shape);
+      return;
+    }
+
+    if (parsed.event === "block_input_unlocked") {
+      this.onBlockInputChanged?.(false);
+    }
+  }
+
+  private flushPendingCursorQueries(shape: CursorShape): void {
+    if (this.cursorQueryResolvers.length === 0) return;
+    const resolvers = this.cursorQueryResolvers.splice(
+      0,
+      this.cursorQueryResolvers.length,
+    );
+    for (const resolve of resolvers) {
+      resolve(shape);
+    }
+  }
+
+  public queryCursorShape(timeoutMs = 250): Promise<CursorShape> {
+    if (this.disposed || this.platform === "linux") {
+      return Promise.resolve("default");
+    }
+    if (!this.ensureStarted() || !this.child || !this.child.stdin.writable) {
+      return Promise.resolve("default");
+    }
+
+    return new Promise<CursorShape>((resolve) => {
+      let settled = false;
+      const done = (shape: CursorShape): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(shape);
+      };
+
+      const timer = setTimeout(() => {
+        const idx = this.cursorQueryResolvers.indexOf(done);
+        if (idx >= 0) {
+          this.cursorQueryResolvers.splice(idx, 1);
+        }
+        done("default");
+      }, Math.max(50, timeoutMs));
+      timer.unref?.();
+
+      this.cursorQueryResolvers.push(done);
+
+      try {
+        this.child!.stdin.write('{"action":"query_cursor"}\n');
+      } catch {
+        const idx = this.cursorQueryResolvers.indexOf(done);
+        if (idx >= 0) {
+          this.cursorQueryResolvers.splice(idx, 1);
+        }
+        done("default");
+      }
+    });
+  }
+
+  public setBlockInput(enabled: boolean): boolean {
+    if (!enabled && (!this.child || this.child.killed || this.child.exitCode !== null)) {
+      return true;
+    }
+    return this.sendPayload({ action: "block_input", enabled: Boolean(enabled) });
+  }
+
   public releaseAll(): void {
     if (this.child && !this.child.killed && this.child.exitCode === null && this.child.stdin.writable) {
       try {
@@ -706,6 +870,7 @@ export class NativeInputInjector {
 
   public dispose(): void {
     this.disposed = true;
+    this.flushPendingCursorQueries("default");
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;

@@ -33,7 +33,9 @@ export type AuditEvent =
   | "control.black_screen"
   | "control.force_portrait"
   | "control.privacy_screen"
-  | "control.power";
+  | "control.power"
+  | "control.block_input"
+  | "control.wol";
 
 export interface AuditRecordInput {
   event: AuditEvent;

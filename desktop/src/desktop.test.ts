@@ -6,9 +6,16 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import {
   mapNormalizedPointToDisplay,
+  normalizeCursorShape,
   translateControlCommandToNativeEvents,
   type DisplayBounds,
 } from "./inputInjector.ts";
+import {
+  buildWolMagicPacket,
+  collectLocalNetworkInfo,
+  LanDiscoveryService,
+  normalizeMacAddress,
+} from "./lanDiscovery.ts";
 import {
   executePowerAction,
   isPowerOperation,
@@ -33,6 +40,11 @@ import {
   trashPath,
 } from "./remoteFileManager.ts";
 import {
+  RemoteTerminalManager,
+  sanitizeTerminalSize,
+  type RemoteTerminalEvent,
+} from "./remoteTerminal.ts";
+import {
   clampWindowBounds,
   computePresetBounds,
   ensureHostSettings,
@@ -43,11 +55,13 @@ import {
   loadSettings,
   normalizeServerUrl,
   PRESET_SIZES,
+  sanitizeHostAccessMode,
   saveSettingsAtomic,
   upsertRecentServer,
   type DesktopSettings,
   type WorkArea,
 } from "./settings.ts";
+import { sanitizeWhiteboardStroke } from "./whiteboardOverlay.ts";
 
 describe("protocol helpers", () => {
   const rootDir = path.resolve("/tmp/velodeck-renderer-dist");
@@ -986,6 +1000,359 @@ describe("remote file manager", () => {
       assert.throws(() => openDownloadStream(`${bigFile}\0.txt`));
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Wave 2+3: LAN discovery & Wake-on-LAN", () => {
+  it("builds exact 102-byte WoL magic packets for colon and dash MACs and rejects invalid MACs", () => {
+    const colonPacket = buildWolMagicPacket("aa:bb:cc:11:22:33");
+    assert.equal(colonPacket.length, 102);
+    // First 6 bytes are 0xFF
+    assert.deepEqual(
+      Array.from(colonPacket.subarray(0, 6)),
+      [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+    );
+    // Followed by 16 repetitions of the 6-byte MAC
+    const expectedMac = [0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33];
+    for (let i = 0; i < 16; i += 1) {
+      assert.deepEqual(
+        Array.from(colonPacket.subarray(6 + i * 6, 12 + i * 6)),
+        expectedMac,
+      );
+    }
+
+    // Dash-separated MAC builds byte-identical packet
+    const dashPacket = buildWolMagicPacket("AA-BB-CC-11-22-33");
+    assert.equal(dashPacket.length, 102);
+    assert.equal(dashPacket.equals(colonPacket), true);
+
+    assert.equal(normalizeMacAddress("de-ad-be-ef-00-01"), "DE:AD:BE:EF:00:01");
+    assert.equal(normalizeMacAddress("00:00:00:00:00:00"), null);
+
+    // Invalid MAC addresses throw
+    assert.throws(() => buildWolMagicPacket(""));
+    assert.throws(() => buildWolMagicPacket("not-a-mac"));
+    assert.throws(() => buildWolMagicPacket("AA:BB:CC:DD:EE"));
+    assert.throws(() => buildWolMagicPacket("AA:BB:CC:DD:EE:GG"));
+    assert.throws(() => buildWolMagicPacket("AA:BB-CC:DD:EE:FF"));
+    assert.throws(() => buildWolMagicPacket("00:00:00:00:00:00"));
+  });
+
+  it("collects RFC1918/CGNAT LAN IPs, normalized MACs, and subnet broadcasts while filtering loopback & zero MACs", () => {
+    const mockIfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = {
+      lo0: [
+        {
+          address: "127.0.0.1",
+          netmask: "255.0.0.0",
+          family: "IPv4",
+          mac: "00:00:00:00:00:00",
+          internal: true,
+          cidr: "127.0.0.1/8",
+        },
+      ],
+      utun0: [
+        {
+          address: "100.64.12.34",
+          netmask: "255.192.0.0",
+          family: "IPv4",
+          mac: "00:00:00:00:00:00",
+          internal: false,
+          cidr: "100.64.12.34/10",
+        },
+      ],
+      en0: [
+        {
+          address: "fe80::1",
+          netmask: "ffff:ffff:ffff:ffff::",
+          family: "IPv6",
+          mac: "aa:bb:cc:dd:ee:ff",
+          internal: false,
+          cidr: "fe80::1/64",
+          scopeid: 4,
+        },
+        {
+          address: "192.168.10.42",
+          netmask: "255.255.255.0",
+          family: "IPv4",
+          mac: "aa:bb:cc:dd:ee:ff",
+          internal: false,
+          cidr: "192.168.10.42/24",
+        },
+      ],
+      en1: [
+        {
+          address: "8.8.8.8",
+          netmask: "255.255.255.0",
+          family: "IPv4",
+          mac: "11:22:33:44:55:66",
+          internal: false,
+          cidr: "8.8.8.8/24",
+        },
+        {
+          address: "10.0.2.15",
+          netmask: "255.255.0.0",
+          family: "IPv4",
+          mac: "de-ad-be-ef-00-01",
+          internal: false,
+          cidr: "10.0.2.15/16",
+        },
+      ],
+    };
+
+    const info = collectLocalNetworkInfo(mockIfaces);
+    // Prefers RFC1918 over CGNAT
+    assert.equal(info.lanIp, "192.168.10.42");
+    assert.deepEqual(info.macAddresses, ["AA:BB:CC:DD:EE:FF", "DE:AD:BE:EF:00:01"]);
+    assert.ok(info.broadcastAddresses.includes("192.168.10.255"));
+    assert.ok(info.broadcastAddresses.includes("10.0.255.255"));
+    assert.ok(info.broadcastAddresses.includes("100.127.255.255"));
+    assert.equal(info.broadcastAddresses.includes("8.8.8.255"), false);
+
+    // Live OS probe never throws and returns structured arrays
+    const live = collectLocalNetworkInfo();
+    assert.equal(typeof live.lanIp, "string");
+    assert.ok(Array.isArray(live.macAddresses));
+    assert.ok(Array.isArray(live.broadcastAddresses));
+  });
+});
+
+describe("Wave 2+3: Remote terminal, relative mouse, block input, whiteboard, and accessMode", () => {
+  const primaryDisplay: DisplayBounds = { x: 0, y: 0, width: 1920, height: 1080 };
+
+  it("clamps terminal dimensions cleanly to 20..300 x 5..120 with 100x30 defaults", () => {
+    assert.deepEqual(sanitizeTerminalSize(), { cols: 100, rows: 30 });
+    assert.deepEqual(sanitizeTerminalSize(undefined, undefined), { cols: 100, rows: 30 });
+    assert.deepEqual(sanitizeTerminalSize(Number.NaN, Number.POSITIVE_INFINITY), {
+      cols: 100,
+      rows: 30,
+    });
+    assert.deepEqual(sanitizeTerminalSize(5, 1), { cols: 20, rows: 5 });
+    assert.deepEqual(sanitizeTerminalSize(999, 500), { cols: 300, rows: 120 });
+    assert.deepEqual(sanitizeTerminalSize(132.4, 42.6), { cols: 132, rows: 43 });
+  });
+
+  it("translates mouse_move_relative, block_input, wol, whiteboard, and validates cursor shapes", () => {
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "mouse_move_relative", dx: 12, dy: -8 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "mouse_move_relative", dx: 12, dy: -8 }],
+    );
+
+    // Clamps extreme relative deltas to [-2000, 2000]
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "mouse_move_relative", dx: 9500, dy: -4200 },
+        primaryDisplay,
+        "win32",
+      ),
+      [{ action: "mouse_move_relative", dx: 2000, dy: -2000 }],
+    );
+
+    // Zero relative move produces no HID event
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "mouse_move_relative", dx: 0, dy: 0 },
+        primaryDisplay,
+        "darwin",
+      ),
+      [],
+    );
+
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "block_input", enabled: true },
+        primaryDisplay,
+        "darwin",
+      ),
+      [{ action: "block_input", enabled: true }],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "block_input", enabled: false },
+        primaryDisplay,
+        "win32",
+      ),
+      [{ action: "block_input", enabled: false }],
+    );
+
+    // WoL & whiteboard are host-level actions and never emit raw HID events
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "wol", macAddress: "AA:BB:CC:DD:EE:FF" },
+        primaryDisplay,
+        "darwin",
+      ),
+      [],
+    );
+    assert.deepEqual(
+      translateControlCommandToNativeEvents(
+        { action: "whiteboard", op: "clear" },
+        primaryDisplay,
+        "darwin",
+      ),
+      [],
+    );
+
+    assert.equal(normalizeCursorShape("text"), "text");
+    assert.equal(normalizeCursorShape("ew-resize"), "ew-resize");
+    assert.equal(normalizeCursorShape("unknown-custom"), "default");
+
+    const stroke = sanitizeWhiteboardStroke({
+      id: "s-1",
+      color: "#00ff88",
+      width: 6,
+      points: [
+        { x: -0.2, y: 0.5 },
+        { x: 1.4, y: 0.25 },
+      ],
+    });
+    assert.ok(stroke);
+    assert.equal(stroke.id, "s-1");
+    assert.equal(stroke.color, "#00ff88");
+    assert.equal(stroke.width, 6);
+    assert.deepEqual(stroke.points, [
+      { x: 0, y: 0.5 },
+      { x: 1, y: 0.25 },
+    ]);
+    assert.equal(sanitizeWhiteboardStroke({ points: [] }), null);
+  });
+
+  it("defaults hostAccessMode to 'auto' and persists 'confirm' atomically while sanitizing invalid values", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "velodeck-access-mode-"));
+    const settingsPath = path.join(tmpDir, "desktop-settings.json");
+
+    try {
+      assert.equal(sanitizeHostAccessMode("auto"), "auto");
+      assert.equal(sanitizeHostAccessMode("confirm"), "confirm");
+      assert.equal(sanitizeHostAccessMode("always-allow"), undefined);
+
+      const initial = loadSettings(settingsPath);
+      const ensured = ensureHostSettings(initial, "Approval-Mac");
+      assert.equal(ensured.settings.hostAccessMode, "auto");
+
+      const confirmSettings: DesktopSettings = {
+        ...ensured.settings,
+        hostAccessMode: "confirm",
+      };
+      saveSettingsAtomic(settingsPath, confirmSettings);
+
+      const loaded = loadSettings(settingsPath);
+      assert.equal(loaded.hostAccessMode, "confirm");
+      assert.deepEqual(loaded, confirmSettings);
+
+      // Invalid persisted value is sanitized away and re-defaulted by ensureHostSettings
+      const rawJson = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      rawJson.hostAccessMode = "bogus-mode";
+      fs.writeFileSync(settingsPath, JSON.stringify(rawJson), "utf8");
+
+      const loadedInvalid = loadSettings(settingsPath);
+      assert.equal(loadedInvalid.hostAccessMode, undefined);
+      const reEnsured = ensureHostSettings(loadedInvalid);
+      assert.equal(reEnsured.changed, true);
+      assert.equal(reEnsured.settings.hostAccessMode, "auto");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("spawns an interactive remote terminal session, streams output, enforces max 4 concurrent shells, and cleans up", async () => {
+    const events: RemoteTerminalEvent[] = [];
+    const manager = new RemoteTerminalManager({
+      onEvent: (ev) => {
+        events.push(ev);
+      },
+    });
+
+    try {
+      const opened = manager.open("t-1", 80, 24);
+      assert.equal(opened, true);
+      assert.equal(manager.activeCount, 1);
+      assert.equal(events[0]?.type, "term_ready");
+
+      assert.equal(manager.resize("t-1", 120, 40), true);
+      assert.equal(manager.write("t-1", "echo VELODECK_PTY_OK\n"), true);
+
+      // Wait briefly for shell output to arrive
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        const combined = events
+          .filter((e): e is Extract<RemoteTerminalEvent, { type: "term_data" }> => e.type === "term_data")
+          .map((e) => e.data)
+          .join("");
+        if (combined.includes("VELODECK_PTY_OK")) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 40));
+      }
+
+      const output = events
+        .filter((e): e is Extract<RemoteTerminalEvent, { type: "term_data" }> => e.type === "term_data")
+        .map((e) => e.data)
+        .join("");
+      assert.ok(output.includes("VELODECK_PTY_OK"));
+
+      // Open 3 more sessions (total 4) and verify 5th is rejected
+      assert.equal(manager.open("t-2"), true);
+      assert.equal(manager.open("t-3"), true);
+      assert.equal(manager.open("t-4"), true);
+      assert.equal(manager.activeCount, 4);
+      assert.equal(manager.open("t-5"), false);
+      assert.ok(events.some((e) => e.type === "term_error" && e.termId === "t-5"));
+    } finally {
+      manager.closeAll();
+      assert.equal(manager.activeCount, 0);
+    }
+  });
+
+  it("announces public LAN discovery metadata without leaking secrets on UDP probe", async () => {
+    const dgram = await import("node:dgram");
+    const testPort = 21129 + Math.floor(Math.random() * 500);
+    const service = new LanDiscoveryService({
+      port: testPort,
+      getAnnouncement: () => ({
+        deviceId: "desktop-lan-peer-1",
+        name: "Studio Mac",
+        osPlatform: "darwin",
+        controlCode: "123456789",
+      }),
+    });
+
+    service.start();
+    await new Promise((r) => setTimeout(r, 60));
+
+    const client = dgram.createSocket("udp4");
+    try {
+      const reply = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("UDP announce timeout")), 1500);
+        client.once("message", (buf) => {
+          clearTimeout(timer);
+          resolve(JSON.parse(buf.toString("utf8")) as Record<string, unknown>);
+        });
+        client.bind(0, () => {
+          const probe = Buffer.from(JSON.stringify({ v: 1, cmd: "discover" }), "utf8");
+          client.send(probe, 0, probe.length, testPort, "127.0.0.1");
+        });
+      });
+
+      assert.equal(reply.v, 1);
+      assert.equal(reply.cmd, "announce");
+      assert.equal(reply.deviceId, "desktop-lan-peer-1");
+      assert.equal(reply.name, "Studio Mac");
+      assert.equal(reply.osPlatform, "darwin");
+      assert.equal(reply.controlCode, "123456789");
+      assert.equal("deviceSecret" in reply, false);
+      assert.equal("controlPassword" in reply, false);
+      assert.equal("authToken" in reply, false);
+    } finally {
+      client.close();
+      service.stop();
     }
   });
 });

@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { normalizeControlCode, type DeviceSummary } from "@velodeck/protocol";
+import {
+  normalizeControlCode,
+  type DeviceSummary,
+  type SessionPermissions,
+} from "@velodeck/protocol";
 import { ConnectionModal } from "./components/ConnectionModal";
 import { DashboardView } from "./components/DashboardView";
 import type { DesktopHostHandlers } from "./components/DesktopHostPanel";
+import { DesktopTabBar, type OpenSessionTab } from "./components/DesktopTabBar";
 import { LaunchView } from "./components/LaunchView";
 import { QuickConnectConfirmModal } from "./components/QuickConnectConfirmModal";
 import { RemoteViewport } from "./components/RemoteViewport";
@@ -21,6 +26,7 @@ import {
   type DesktopHostState,
   type DesktopWindowPreset,
   type DesktopWindowState,
+  type LanPeerInfo,
 } from "./desktop/bridge";
 import {
   changePasswordApi,
@@ -79,6 +85,24 @@ interface PendingCodeConnect {
 interface PendingQuickConnect {
   params: QuickConnectParams;
   security: QuickConnectSecurityAssessment;
+}
+
+interface TabSessionRuntime {
+  client: RemoteClient;
+  unsubscribe: () => void;
+  sessionRequested: boolean;
+  lastNoticeId: number;
+}
+
+const MAX_OPEN_TABS = 4;
+
+function createTabClientId(deviceId: string): string {
+  const safeSuffix = deviceId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 12) || "dev";
+  const rand =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID().replace(/-/g, "").slice(0, 14)
+      : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  return `tab-${rand}-${safeSuffix}`.slice(0, 60);
 }
 
 export function App() {
@@ -165,6 +189,17 @@ export function App() {
   const [modalOpen, setModalOpen] = useState(false);
   const [editProfileId, setEditProfileId] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastMessage | null>(null);
+  const [openTabs, setOpenTabs] = useState<OpenSessionTab[]>([]);
+  const [activeTabId, setActiveTabId] = useState<"dashboard" | string>("dashboard");
+  const [tabStates, setTabStates] = useState<Record<string, RemoteClientState>>({});
+
+  const sessionClientsRef = useRef<Map<string, TabSessionRuntime>>(new Map());
+  const activeTabIdRef = useRef<"dashboard" | string>(activeTabId);
+  activeTabIdRef.current = activeTabId;
+  const openTabDeviceIds = useMemo(
+    () => new Set(openTabs.map((tab) => tab.deviceId)),
+    [openTabs],
+  );
 
   const toastSeqRef = useRef(0);
   const toastTimerRef = useRef<number | null>(null);
@@ -201,8 +236,191 @@ export function App() {
         window.clearTimeout(toastTimerRef.current);
         toastTimerRef.current = null;
       }
+      for (const runtime of sessionClientsRef.current.values()) {
+        runtime.unsubscribe();
+        runtime.client.stopSession("user_exit");
+        runtime.client.disconnect();
+      }
+      sessionClientsRef.current.clear();
     };
   }, []);
+
+  const closeTab = useCallback((deviceId: string) => {
+    const runtime = sessionClientsRef.current.get(deviceId);
+    if (runtime) {
+      runtime.unsubscribe();
+      runtime.client.stopSession("user_exit");
+      runtime.client.disconnect();
+      sessionClientsRef.current.delete(deviceId);
+    }
+
+    setTabStates((prev) => {
+      if (!(deviceId in prev)) return prev;
+      const next = { ...prev };
+      delete next[deviceId];
+      return next;
+    });
+
+    setOpenTabs((prev) => {
+      const idx = prev.findIndex((t) => t.deviceId === deviceId);
+      if (idx < 0) return prev;
+      const nextTabs = prev.filter((t) => t.deviceId !== deviceId);
+      if (activeTabIdRef.current === deviceId) {
+        const fallbackTab = nextTabs[idx] ?? nextTabs[idx - 1];
+        setActiveTabId(fallbackTab ? fallbackTab.deviceId : "dashboard");
+      }
+      return nextTabs;
+    });
+  }, []);
+
+  const closeAllTabs = useCallback(() => {
+    for (const runtime of sessionClientsRef.current.values()) {
+      runtime.unsubscribe();
+      runtime.client.stopSession("user_exit");
+      runtime.client.disconnect();
+    }
+    sessionClientsRef.current.clear();
+    setOpenTabs([]);
+    setTabStates({});
+    setActiveTabId("dashboard");
+  }, []);
+
+  const openDeviceTab = useCallback(
+    (device: DeviceSummary) => {
+      const existing = sessionClientsRef.current.get(device.deviceId);
+      if (existing) {
+        setOpenTabs((prev) =>
+          prev.map((tab) =>
+            tab.deviceId === device.deviceId
+              ? {
+                  ...tab,
+                  label: device.name || device.model || tab.label,
+                  deviceType: device.deviceType === "desktop" ? "desktop" : "android",
+                }
+              : tab,
+          ),
+        );
+        setViewMode("dashboard");
+        setActiveTabId(device.deviceId);
+        return;
+      }
+
+      if (sessionClientsRef.current.size >= MAX_OPEN_TABS) {
+        showToast(
+          "warn",
+          `最多同时保持 ${MAX_OPEN_TABS} 个远控标签页，请先关闭一个标签页`,
+        );
+        return;
+      }
+
+      const primaryState = client.getState();
+      const preferredTransport =
+        primaryState.profile?.preferredTransport ??
+        primaryState.desiredTransport ??
+        defaultTransport;
+      const qualityPreset =
+        primaryState.profile?.qualityPreset ??
+        primaryState.qualityPreset ??
+        "auto";
+
+      // Only spawn dedicated multi-tab clients for Account or Token/Profile modes
+      const isTokenMode =
+        primaryState.authType === "token" && Boolean(primaryState.profile);
+      const accountToken = savedAccount?.authToken || client.getAuthToken() || "";
+      const accountWsUrl =
+        savedAccount?.wsUrl ||
+        primaryState.wsUrl ||
+        effectiveDefaultWsUrlRef.current;
+      const isAccountConnectable =
+        !isTokenMode && Boolean(accountToken && accountWsUrl);
+
+      if (!isTokenMode && !isAccountConnectable) {
+        client.startSession(device.deviceId, {
+          preferredTransport,
+          qualityPreset,
+        });
+        return;
+      }
+
+      const tabClient = new RemoteClient(createTabClientId(device.deviceId));
+      const runtime: TabSessionRuntime = {
+        client: tabClient,
+        unsubscribe: () => {},
+        sessionRequested: false,
+        lastNoticeId: 0,
+      };
+
+      runtime.unsubscribe = tabClient.subscribe((next) => {
+        setTabStates((prev) =>
+          prev[device.deviceId] === next
+            ? prev
+            : { ...prev, [device.deviceId]: next },
+        );
+        if (next.lastNotice && next.lastNotice.id !== runtime.lastNoticeId) {
+          runtime.lastNoticeId = next.lastNotice.id;
+          if (activeTabIdRef.current === device.deviceId) {
+            showToast(next.lastNotice.level, next.lastNotice.text);
+          }
+        }
+        if (next.socketStatus === "connected" && !runtime.sessionRequested) {
+          runtime.sessionRequested = true;
+          tabClient.startSession(device.deviceId, {
+            preferredTransport,
+            qualityPreset,
+          });
+        }
+      });
+
+      sessionClientsRef.current.set(device.deviceId, runtime);
+
+      if (isTokenMode && primaryState.profile) {
+        tabClient.connect(primaryState.profile);
+      } else {
+        tabClient.connectWithAccount({
+          wsUrl: accountWsUrl,
+          authToken: accountToken,
+          user: savedAccount?.user ?? primaryState.user ?? undefined,
+          preferredTransport,
+          qualityPreset,
+        });
+      }
+
+      const tabMeta: OpenSessionTab = {
+        deviceId: device.deviceId,
+        label: device.name || device.model || device.deviceId,
+        deviceType: device.deviceType === "desktop" ? "desktop" : "android",
+      };
+      setOpenTabs((prev) =>
+        prev.some((t) => t.deviceId === tabMeta.deviceId)
+          ? prev
+          : [...prev, tabMeta],
+      );
+      setViewMode("dashboard");
+      setActiveTabId(device.deviceId);
+    },
+    [client, defaultTransport, savedAccount, showToast],
+  );
+
+  // Keep open tab display names synchronized when fleet metadata updates
+  useEffect(() => {
+    if (openTabs.length === 0 || clientState.devices.length === 0) return;
+    setOpenTabs((prev) => {
+      let changed = false;
+      const next = prev.map((tab) => {
+        const fresh = clientState.devices.find((d) => d.deviceId === tab.deviceId);
+        if (!fresh) return tab;
+        const freshLabel = fresh.name || fresh.model || tab.label;
+        const freshType: "android" | "desktop" =
+          fresh.deviceType === "desktop" ? "desktop" : "android";
+        if (freshLabel !== tab.label || freshType !== tab.deviceType) {
+          changed = true;
+          return { ...tab, label: freshLabel, deviceType: freshType };
+        }
+        return tab;
+      });
+      return changed ? next : prev;
+    });
+  }, [clientState.devices, openTabs.length]);
 
   // Hydrate desktop server config & window state from Electron preload IPC
   useEffect(() => {
@@ -404,9 +622,9 @@ export function App() {
     );
     if (target) {
       pendingAutoDeviceIdRef.current = null;
-      client.startSession(target.deviceId);
+      openDeviceTab(target);
     }
-  }, [client, clientState.socketStatus, clientState.devices]);
+  }, [openDeviceTab, clientState.socketStatus, clientState.devices]);
 
   // Control-Code Auto-Enter: sync device name + auto-start session when online (or show offline notice)
   useEffect(() => {
@@ -494,6 +712,7 @@ export function App() {
     });
     setRecentCodes(updatedRecent);
     setCodeOfflineNotice(null);
+    closeAllTabs();
 
     pendingCodeRef.current = {
       controlCode: cleanCode,
@@ -570,6 +789,7 @@ export function App() {
   }
 
   function handleLogoutAccount() {
+    closeAllTabs();
     pendingCodeRef.current = null;
     setCodeOfflineNotice(null);
     clearAccountSession();
@@ -583,6 +803,7 @@ export function App() {
   }
 
   function handleReloginAccount() {
+    closeAllTabs();
     pendingCodeRef.current = null;
     setCodeOfflineNotice(null);
     clearAccountSession();
@@ -619,6 +840,19 @@ export function App() {
       preferredTransport: clientState.desiredTransport ?? defaultTransport,
       qualityPreset: clientState.qualityPreset ?? "auto",
     });
+    for (const runtime of sessionClientsRef.current.values()) {
+      const st = runtime.client.getState();
+      if (st.authType === "account") {
+        runtime.sessionRequested = false;
+        runtime.client.connectWithAccount({
+          wsUrl: updatedSession.wsUrl || effectiveDefaultWsUrl,
+          authToken: updatedSession.authToken,
+          user: updatedSession.user,
+          preferredTransport: st.desiredTransport ?? defaultTransport,
+          qualityPreset: st.qualityPreset ?? "auto",
+        });
+      }
+    }
     showToast("info", "密码已修改，其他设备登录态已失效");
   }
 
@@ -627,6 +861,7 @@ export function App() {
       throw new Error("当前未登录账号");
     }
     await logoutAllSessionsApi(savedAccount.apiBase, savedAccount.authToken);
+    closeAllTabs();
     pendingCodeRef.current = null;
     setCodeOfflineNotice(null);
     clearAccountSession();
@@ -674,6 +909,7 @@ export function App() {
         savedAccount.authToken,
         device.deviceId,
       );
+      closeTab(device.deviceId);
       client.removeDevice(device.deviceId);
       showToast("info", `已解绑设备「${device.name || device.model}」`);
     } catch (err) {
@@ -683,6 +919,7 @@ export function App() {
   }
 
   function handleSelectProfile(profile: ConnectionProfile) {
+    closeAllTabs();
     pendingCodeRef.current = null;
     setCodeOfflineNotice(null);
     setActiveProfileId(profile.id);
@@ -695,6 +932,7 @@ export function App() {
   function handleSaveProfile(
     input: Omit<ConnectionProfile, "id"> & { id?: string },
   ) {
+    closeAllTabs();
     pendingCodeRef.current = null;
     setCodeOfflineNotice(null);
     const { profiles: nextProfiles, saved } = upsertProfile(profiles, input);
@@ -717,8 +955,10 @@ export function App() {
       setActiveProfileId(fallback?.id ?? null);
       saveActiveProfileId(fallback?.id ?? null);
       if (fallback && clientState.authType === "token") {
+        closeAllTabs();
         client.connect(fallback);
       } else if (clientState.authType === "token") {
+        closeAllTabs();
         client.disconnect();
         if (!savedAccount) {
           setViewMode("launch");
@@ -728,12 +968,7 @@ export function App() {
   }
 
   function handleControlDevice(device: DeviceSummary) {
-    client.startSession(device.deviceId, {
-      preferredTransport:
-        clientState.profile?.preferredTransport ?? clientState.desiredTransport,
-      qualityPreset:
-        clientState.profile?.qualityPreset ?? clientState.qualityPreset,
-    });
+    openDeviceTab(device);
   }
 
   function handleWakeDevice(device: DeviceSummary) {
@@ -745,6 +980,96 @@ export function App() {
     }
   }
 
+  const handleSendWolRaw = useCallback(
+    async (
+      macAddress: string,
+      _peerName?: string,
+      _lanIp?: string,
+      excludeDeviceId?: string,
+    ) => {
+      const mac = macAddress.trim();
+      if (!mac) {
+        showToast("warn", "缺少目标设备的 MAC 地址，无法发送 WOL");
+        return;
+      }
+
+      let localSent = false;
+      if (desktopBridge && typeof desktopBridge.sendWolPacket === "function") {
+        try {
+          const res = await desktopBridge.sendWolPacket(mac);
+          if (res?.ok) {
+            localSent = true;
+          }
+        } catch {
+          // Fall through to relay peers
+        }
+      }
+
+      let relaySent = false;
+      const relayPeers = client
+        .getState()
+        .devices.filter(
+          (d) =>
+            d.online &&
+            d.capabilities.wolRelay === true &&
+            d.deviceId !== excludeDeviceId &&
+            d.deviceId !== hostState?.deviceId,
+        );
+      for (const peer of relayPeers) {
+        if (client.sendWolRelay(peer.deviceId, mac)) {
+          relaySent = true;
+          break;
+        }
+      }
+
+      if (localSent || relaySent) {
+        showToast("info", `已发送局域网 WOL 唤醒魔术包 (${mac})`);
+      } else {
+        showToast(
+          "warn",
+          "无法发送 WOL 魔术包：请在同局域网桌面端操作，或确保账号下有另一台在线电脑可作为中继",
+        );
+      }
+    },
+    [client, desktopBridge, hostState?.deviceId, showToast],
+  );
+
+  const handleSendWolDevice = useCallback(
+    async (device: DeviceSummary) => {
+      const mac = device.macAddresses?.[0];
+      if (!mac) {
+        showToast("warn", `「${device.name || device.model}」暂无可用的 MAC 地址`);
+        return;
+      }
+      await handleSendWolRaw(mac, device.name || device.model, device.lanIp, device.deviceId);
+    },
+    [handleSendWolRaw, showToast],
+  );
+
+  const handleDiscoverLanPeers = useCallback(async (): Promise<LanPeerInfo[]> => {
+    if (!desktopBridge || typeof desktopBridge.discoverLanPeers !== "function") {
+      return [];
+    }
+    return desktopBridge.discoverLanPeers();
+  }, [desktopBridge]);
+
+  const handleConnectLanPeerCode = useCallback(
+    (input: { controlCode: string; controlPassword: string; peerName?: string }) => {
+      const cleanCode = sanitizeControlCodeInput(input.controlCode);
+      if (cleanCode.length !== 9 || !input.controlPassword.trim()) return;
+      handleConnectWithCode({
+        controlCode: cleanCode,
+        controlPassword: input.controlPassword,
+        rememberPassword: false,
+      });
+      if (input.peerName) {
+        setRecentCodes(updateRecentCodeDeviceName(cleanCode, input.peerName));
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [desktopBridge, desktopServerUrl, savedAccount, defaultTransport],
+  );
+
   function handleSwitchToDirectUrl(device: DeviceSummary) {
     if (!device.directUrl) return;
     // Strictly validate private/LAN IP before forwarding accessToken to a device-advertised directUrl
@@ -753,6 +1078,7 @@ export function App() {
       return;
     }
 
+    closeAllTabs();
     const token = clientState.profile?.accessToken ?? "";
     const { profiles: nextProfiles, profile } = importQuickConnectProfile(
       profiles,
@@ -862,6 +1188,7 @@ export function App() {
       savedAccount !== null && accountApiBase !== normalized;
 
     if (serverChanged && hasStaleAccount) {
+      closeAllTabs();
       pendingCodeRef.current = null;
       setCodeOfflineNotice(null);
       clearAccountSession();
@@ -872,6 +1199,7 @@ export function App() {
       setViewMode("launch");
       showToast("info", `已切换至服务器 ${hostLabel}，请登录账号或输入控制码`);
     } else if (serverChanged) {
+      closeAllTabs();
       if (client.getState().authType === "code") {
         pendingCodeRef.current = null;
         setCodeOfflineNotice(null);
@@ -1147,6 +1475,94 @@ export function App() {
     [desktopBridge, showToast],
   );
 
+  const handleSetHostBlockInput = useCallback(
+    async (enabled: boolean) => {
+      if (
+        !desktopBridge ||
+        typeof desktopBridge.setHostBlockInput !== "function"
+      ) {
+        return;
+      }
+      try {
+        const next = await desktopBridge.setHostBlockInput(enabled);
+        if (next) setHostState(next);
+        showToast(
+          "info",
+          enabled ? "已锁定本机物理键鼠输入" : "已解除本机物理键鼠锁定",
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "切换本地键鼠锁定失败";
+        showToast("error", msg);
+      }
+    },
+    [desktopBridge, showToast],
+  );
+
+  const handleApproveHostSession = useCallback(
+    async (sessionId: string, permissions: SessionPermissions) => {
+      if (
+        !desktopBridge ||
+        typeof desktopBridge.approveHostSession !== "function"
+      ) {
+        return;
+      }
+      try {
+        const next = await desktopBridge.approveHostSession(sessionId, permissions);
+        if (next) setHostState(next);
+        showToast("info", "已允许远程控制接入");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "批准远程接入失败";
+        showToast("error", msg);
+      }
+    },
+    [desktopBridge, showToast],
+  );
+
+  const handleRejectHostSession = useCallback(
+    async (sessionId: string) => {
+      if (
+        !desktopBridge ||
+        typeof desktopBridge.rejectHostSession !== "function"
+      ) {
+        return;
+      }
+      try {
+        const next = await desktopBridge.rejectHostSession(sessionId);
+        if (next) setHostState(next);
+        showToast("info", "已拒绝远程接入请求");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "拒绝远程接入失败";
+        showToast("error", msg);
+      }
+    },
+    [desktopBridge, showToast],
+  );
+
+  const handleSendHostChatMessage = useCallback(
+    async (text: string) => {
+      if (
+        !desktopBridge ||
+        typeof desktopBridge.sendHostChatMessage !== "function"
+      ) {
+        return;
+      }
+      try {
+        const res = await desktopBridge.sendHostChatMessage(text);
+        if (res && typeof res === "object") {
+          if ("enabled" in res && "status" in res) {
+            setHostState(res as DesktopHostState);
+          } else if ("ok" in res && !res.ok) {
+            showToast("error", res.error || "发送会话消息失败");
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "发送会话消息失败";
+        showToast("error", msg);
+      }
+    },
+    [desktopBridge, showToast],
+  );
+
   const desktopHostHandlers = useMemo<DesktopHostHandlers | undefined>(() => {
     if (!desktopBridge || !hasDesktopHostBridge(desktopBridge)) {
       return undefined;
@@ -1166,6 +1582,22 @@ export function App() {
         typeof desktopBridge.setHostPrivacyScreen === "function"
           ? handleSetHostPrivacyScreen
           : undefined,
+      onSetBlockInput:
+        typeof desktopBridge.setHostBlockInput === "function"
+          ? handleSetHostBlockInput
+          : undefined,
+      onApproveSession:
+        typeof desktopBridge.approveHostSession === "function"
+          ? handleApproveHostSession
+          : undefined,
+      onRejectSession:
+        typeof desktopBridge.rejectHostSession === "function"
+          ? handleRejectHostSession
+          : undefined,
+      onSendChatMessage:
+        typeof desktopBridge.sendHostChatMessage === "function"
+          ? handleSendHostChatMessage
+          : undefined,
     };
   }, [
     desktopBridge,
@@ -1180,6 +1612,10 @@ export function App() {
     handleRefreshHostPermissions,
     handleOpenPermissionSettings,
     handleSetHostPrivacyScreen,
+    handleSetHostBlockInput,
+    handleApproveHostSession,
+    handleRejectHostSession,
+    handleSendHostChatMessage,
   ]);
 
   function handleExitViewport() {
@@ -1198,11 +1634,162 @@ export function App() {
     clientState.devices.find((d) => d.deviceId === clientState.activeDeviceId) ??
     null;
 
-  const isInRemoteViewport = Boolean(clientState.activeDeviceId);
+  const hasOpenTabs = openTabs.length > 0;
+  const isInSingleRemoteViewport =
+    !hasOpenTabs && Boolean(clientState.activeDeviceId);
+
+  const renderDashboardOrLaunch = (hasTabBar: boolean) =>
+    viewMode === "launch" ? (
+      <LaunchView
+        apiBase={activeApiBase}
+        serverInfo={serverInfo}
+        initialTab={launchTab}
+        savedAccount={savedAccount}
+        recentCodes={recentCodes}
+        profileCount={profiles.length}
+        clientState={clientState}
+        codeOfflineNotice={codeOfflineNotice}
+        desktopServerUrl={desktopBridge ? desktopServerUrl : undefined}
+        hostState={desktopBridge ? hostState : null}
+        hostHandlers={desktopHostHandlers}
+        onConnectWithCode={handleConnectWithCode}
+        onCancelCodeConnect={handleCancelCodeConnect}
+        onRetryCodeConnect={handleRetryCodeConnect}
+        onDeleteRecentCode={handleDeleteRecentCode}
+        onAccountAuthed={handleAccountAuthed}
+        onReturnToAccountDashboard={handleReturnToAccountDashboard}
+        onOpenConnections={() => {
+          setEditProfileId(null);
+          setModalOpen(true);
+        }}
+        onOpenServerSettings={
+          desktopBridge ? () => setServerConfigModalOpen(true) : undefined
+        }
+      />
+    ) : (
+      <DashboardView
+        clientState={clientState}
+        savedAccount={savedAccount}
+        apiBase={activeApiBase}
+        serverInfo={serverInfo}
+        profileCount={profiles.length}
+        desktopServerUrl={desktopBridge ? desktopServerUrl : undefined}
+        hostState={desktopBridge ? hostState : null}
+        hostHandlers={desktopHostHandlers}
+        openTabDeviceIds={openTabDeviceIds}
+        hasTabBar={hasTabBar}
+        onOpenConnections={(editId) => {
+          setEditProfileId(editId ?? null);
+          setModalOpen(true);
+        }}
+        onOpenControlCode={handleOpenControlCodeFromDashboard}
+        onLogoutAccount={handleLogoutAccount}
+        onReloginAccount={handleReloginAccount}
+        onChangePassword={handleChangePassword}
+        onLogoutAllSessions={handleLogoutAllSessions}
+        onControlDevice={handleControlDevice}
+        onWakeDevice={handleWakeDevice}
+        onSendWol={handleSendWolDevice}
+        onSendWolRaw={handleSendWolRaw}
+        onDiscoverLanPeers={
+          desktopBridge && typeof desktopBridge.discoverLanPeers === "function"
+            ? handleDiscoverLanPeers
+            : undefined
+        }
+        onConnectLanPeerCode={handleConnectLanPeerCode}
+        onUnbindDevice={handleUnbindDevice}
+        onReconnect={handleDashboardReconnect}
+        onSwitchToDirectUrl={handleSwitchToDirectUrl}
+        onOpenServerSettings={
+          desktopBridge ? () => setServerConfigModalOpen(true) : undefined
+        }
+        onOpenNewWindow={
+          desktopBridge ? () => void handleOpenNewWindow() : undefined
+        }
+      />
+    );
 
   return (
     <>
-      {isInRemoteViewport ? (
+      {hasOpenTabs ? (
+        <div className="flex h-[100dvh] w-screen flex-col overflow-hidden bg-black">
+          <DesktopTabBar
+            tabs={openTabs}
+            activeTabId={activeTabId}
+            maxTabs={MAX_OPEN_TABS}
+            getTabClient={(deviceId) => sessionClientsRef.current.get(deviceId)?.client}
+            tabStates={tabStates}
+            onSelectTab={(tabId) => {
+              setActiveTabId(tabId);
+              if (tabId === "dashboard") {
+                setViewMode("dashboard");
+              }
+            }}
+            onCloseTab={closeTab}
+            onOpenNewWindow={
+              desktopBridge ? () => void handleOpenNewWindow() : undefined
+            }
+          />
+
+          <div className="relative min-h-0 flex-1 overflow-hidden">
+            {activeTabId === "dashboard" && (
+              <div className="h-full w-full overflow-y-auto bg-[#F4F5F7]">
+                {renderDashboardOrLaunch(true)}
+              </div>
+            )}
+
+            {openTabs.map((tab) => {
+              const runtime = sessionClientsRef.current.get(tab.deviceId);
+              if (!runtime) return null;
+              const tabState = tabStates[tab.deviceId] ?? runtime.client.getState();
+              const tabDevice =
+                tabState.devices.find((d) => d.deviceId === tab.deviceId) ??
+                clientState.devices.find((d) => d.deviceId === tab.deviceId) ??
+                null;
+              const isTabActive = activeTabId === tab.deviceId;
+
+              return (
+                <div
+                  key={tab.deviceId}
+                  className={isTabActive ? "h-full w-full" : "hidden"}
+                >
+                  <RemoteViewport
+                    client={runtime.client}
+                    clientState={tabState}
+                    device={tabDevice}
+                    apiBase={activeApiBase}
+                    authToken={
+                      tabState.authType === "account"
+                        ? savedAccount?.authToken
+                        : undefined
+                    }
+                    serverInfo={serverInfo}
+                    desktopWindowState={
+                      desktopBridge ? desktopWindowState : undefined
+                    }
+                    onToggleAlwaysOnTop={
+                      desktopBridge ? handleToggleAlwaysOnTop : undefined
+                    }
+                    onSetWindowPreset={
+                      desktopBridge ? handleSetWindowPreset : undefined
+                    }
+                    onOpenNewWindow={
+                      desktopBridge ? handleOpenNewWindow : undefined
+                    }
+                    onShowToast={showToast}
+                    suppressKeyboard={
+                      serverConfigModalOpen || modalOpen || !isTabActive
+                    }
+                    isActiveTab={isTabActive}
+                    hasTabBar
+                    onExit={() => closeTab(tab.deviceId)}
+                  />
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : isInSingleRemoteViewport ? (
         <RemoteViewport
           client={client}
           clientState={clientState}
@@ -1220,66 +1807,12 @@ export function App() {
           onOpenNewWindow={desktopBridge ? handleOpenNewWindow : undefined}
           onShowToast={showToast}
           suppressKeyboard={serverConfigModalOpen || modalOpen}
+          isActiveTab
+          hasTabBar={false}
           onExit={handleExitViewport}
         />
-      ) : viewMode === "launch" ? (
-        <LaunchView
-          apiBase={activeApiBase}
-          serverInfo={serverInfo}
-          initialTab={launchTab}
-          savedAccount={savedAccount}
-          recentCodes={recentCodes}
-          profileCount={profiles.length}
-          clientState={clientState}
-          codeOfflineNotice={codeOfflineNotice}
-          desktopServerUrl={desktopBridge ? desktopServerUrl : undefined}
-          hostState={desktopBridge ? hostState : null}
-          hostHandlers={desktopHostHandlers}
-          onConnectWithCode={handleConnectWithCode}
-          onCancelCodeConnect={handleCancelCodeConnect}
-          onRetryCodeConnect={handleRetryCodeConnect}
-          onDeleteRecentCode={handleDeleteRecentCode}
-          onAccountAuthed={handleAccountAuthed}
-          onReturnToAccountDashboard={handleReturnToAccountDashboard}
-          onOpenConnections={() => {
-            setEditProfileId(null);
-            setModalOpen(true);
-          }}
-          onOpenServerSettings={
-            desktopBridge ? () => setServerConfigModalOpen(true) : undefined
-          }
-        />
       ) : (
-        <DashboardView
-          clientState={clientState}
-          savedAccount={savedAccount}
-          apiBase={activeApiBase}
-          serverInfo={serverInfo}
-          profileCount={profiles.length}
-          desktopServerUrl={desktopBridge ? desktopServerUrl : undefined}
-          hostState={desktopBridge ? hostState : null}
-          hostHandlers={desktopHostHandlers}
-          onOpenConnections={(editId) => {
-            setEditProfileId(editId ?? null);
-            setModalOpen(true);
-          }}
-          onOpenControlCode={handleOpenControlCodeFromDashboard}
-          onLogoutAccount={handleLogoutAccount}
-          onReloginAccount={handleReloginAccount}
-          onChangePassword={handleChangePassword}
-          onLogoutAllSessions={handleLogoutAllSessions}
-          onControlDevice={handleControlDevice}
-          onWakeDevice={handleWakeDevice}
-          onUnbindDevice={handleUnbindDevice}
-          onReconnect={handleDashboardReconnect}
-          onSwitchToDirectUrl={handleSwitchToDirectUrl}
-          onOpenServerSettings={
-            desktopBridge ? () => setServerConfigModalOpen(true) : undefined
-          }
-          onOpenNewWindow={
-            desktopBridge ? () => void handleOpenNewWindow() : undefined
-          }
-        />
+        renderDashboardOrLaunch(false)
       )}
 
       {desktopBridge && (

@@ -41,6 +41,33 @@ export interface DesktopHostPermissions {
   platform: DesktopPlatform;
 }
 
+export interface DesktopSessionPermissions {
+  keyboard?: boolean;
+  mouse?: boolean;
+  clipboard?: boolean;
+  fileTransfer?: boolean;
+  audio?: boolean;
+  terminal?: boolean;
+}
+
+export interface DesktopLanPeerInfo {
+  deviceId: string;
+  name: string;
+  osPlatform: string;
+  lanIp: string;
+  macAddresses: string[];
+  controlCode: string;
+  seenAt: number;
+}
+
+export interface DesktopChatMessage {
+  id: string;
+  sender: "controller" | "host";
+  senderName?: string;
+  text: string;
+  ts: number;
+}
+
 export interface DesktopHostState {
   enabled: boolean;
   status: "stopped" | "connecting" | "online" | "controlling" | "error";
@@ -61,6 +88,12 @@ export interface DesktopHostState {
   audioCaptureEnabled: boolean;
   clipboardAutoSync: boolean;
   privacyScreenActive: boolean;
+  accessMode: "auto" | "confirm";
+  blockInputActive: boolean;
+  lanIp: string;
+  macAddresses: string[];
+  pendingApproval: { sessionId: string; requestedAt: number } | null;
+  chatMessages: DesktopChatMessage[];
 }
 
 export interface DesktopHostConfigPatch {
@@ -71,6 +104,7 @@ export interface DesktopHostConfigPatch {
   preventSleep?: boolean;
   audioCaptureEnabled?: boolean;
   clipboardAutoSync?: boolean;
+  accessMode?: "auto" | "confirm";
 }
 
 export interface VeloDeckDesktopBridge {
@@ -109,6 +143,18 @@ export interface VeloDeckDesktopBridge {
   refreshHostPermissions(): Promise<DesktopHostPermissions>;
   openPermissionSettings(kind: "accessibility" | "screen"): Promise<void>;
   setHostPrivacyScreen(enabled: boolean): Promise<DesktopHostState>;
+  setHostBlockInput(enabled: boolean): Promise<DesktopHostState>;
+  discoverLanPeers(): Promise<DesktopLanPeerInfo[]>;
+  sendWolPacket(
+    macAddress: string,
+    broadcastIp?: string,
+  ): Promise<{ ok: boolean; error?: string }>;
+  approveHostSession(
+    sessionId: string,
+    permissions: DesktopSessionPermissions,
+  ): Promise<DesktopHostState>;
+  rejectHostSession(sessionId: string): Promise<DesktopHostState>;
+  sendHostChatMessage(text: string): Promise<DesktopHostState>;
   writeClipboardText(text: string): Promise<boolean>;
   readClipboardText(): Promise<string>;
 }
@@ -294,6 +340,42 @@ const bridge: VeloDeckDesktopBridge = Object.freeze({
 
   setHostPrivacyScreen(enabled: boolean): Promise<DesktopHostState> {
     return ipcRenderer.invoke("velodeck:host-set-privacy-screen", Boolean(enabled));
+  },
+
+  setHostBlockInput(enabled: boolean): Promise<DesktopHostState> {
+    return ipcRenderer.invoke("velodeck:host-set-block-input", Boolean(enabled));
+  },
+
+  discoverLanPeers(): Promise<DesktopLanPeerInfo[]> {
+    return ipcRenderer.invoke("velodeck:lan-discover-peers");
+  },
+
+  sendWolPacket(
+    macAddress: string,
+    broadcastIp?: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    return ipcRenderer.invoke("velodeck:lan-send-wol", {
+      macAddress,
+      broadcastIp: broadcastIp ?? "",
+    });
+  },
+
+  approveHostSession(
+    sessionId: string,
+    permissions: DesktopSessionPermissions,
+  ): Promise<DesktopHostState> {
+    return ipcRenderer.invoke("velodeck:host-approve-session", {
+      sessionId,
+      permissions,
+    });
+  },
+
+  rejectHostSession(sessionId: string): Promise<DesktopHostState> {
+    return ipcRenderer.invoke("velodeck:host-reject-session", sessionId);
+  },
+
+  sendHostChatMessage(text: string): Promise<DesktopHostState> {
+    return ipcRenderer.invoke("velodeck:host-send-chat", text);
   },
 
   writeClipboardText(text: string): Promise<boolean> {

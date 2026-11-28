@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
   Check,
@@ -12,21 +12,30 @@ import {
   FileCheck2,
   Link2,
   Loader2,
+  Lock,
+  MessageSquare,
   Monitor,
   Moon,
+  Network,
   Pencil,
   Power,
   PowerOff,
   RefreshCw,
   RotateCcw,
+  Send,
   Server,
   ShieldAlert,
   ShieldCheck,
   Unlink,
+  Unlock,
   Volume2,
   X,
 } from "lucide-react";
-import { formatControlCode } from "@velodeck/protocol";
+import {
+  formatControlCode,
+  type AccessApprovalMode,
+  type SessionPermissions,
+} from "@velodeck/protocol";
 import type {
   DesktopHostConfigPatch,
   DesktopHostState,
@@ -45,6 +54,13 @@ export interface DesktopHostHandlers {
   onRefreshPermissions: () => Promise<void>;
   onOpenPermissionSettings: (kind: "accessibility" | "screen") => Promise<void>;
   onSetPrivacyScreen?: (enabled: boolean) => Promise<void>;
+  onSetBlockInput?: (enabled: boolean) => Promise<void>;
+  onApproveSession?: (
+    sessionId: string,
+    permissions: SessionPermissions,
+  ) => Promise<void>;
+  onRejectSession?: (sessionId: string) => Promise<void>;
+  onSendChatMessage?: (text: string) => Promise<void>;
 }
 
 export interface DesktopHostPanelProps {
@@ -147,13 +163,66 @@ export function DesktopHostPanel({
   const [savingName, setSavingName] = useState(false);
   const [busySettingKey, setBusySettingKey] = useState<string | null>(null);
 
-  // Auto-expand collapsible dashboard card when host becomes active or receives an incoming session
+  const [approvalPerms, setApprovalPerms] = useState({
+    input: true,
+    clipboard: true,
+    fileTransfer: true,
+    audio: true,
+    terminal: true,
+  });
+  const [approvalBusy, setApprovalBusy] = useState<"approve" | "reject" | null>(null);
+  const [unblockingInput, setUnblockingInput] = useState(false);
+  const [chatExpanded, setChatExpanded] = useState(false);
+  const [chatDraft, setChatDraft] = useState("");
+  const [sendingChat, setSendingChat] = useState(false);
+  const prevChatCountRef = useRef<number>(hostState.chatMessages?.length ?? 0);
+
+  // Auto-expand collapsible dashboard card when host becomes active, receives an incoming session, pending approval, or block-input lock
   useEffect(() => {
     if (!collapsible) return;
-    if (hostState.enabled || hostState.activeSessionId || hostState.status === "error") {
+    if (
+      hostState.enabled ||
+      hostState.activeSessionId ||
+      hostState.pendingApproval ||
+      hostState.blockInputActive ||
+      hostState.status === "error"
+    ) {
       setExpanded(true);
     }
-  }, [collapsible, hostState.enabled, hostState.activeSessionId, hostState.status]);
+  }, [
+    collapsible,
+    hostState.enabled,
+    hostState.activeSessionId,
+    hostState.pendingApproval,
+    hostState.blockInputActive,
+    hostState.status,
+  ]);
+
+  // Reset permission checkboxes to all-checked whenever a new approval request arrives
+  useEffect(() => {
+    if (hostState.pendingApproval?.sessionId) {
+      setApprovalPerms({
+        input: true,
+        clipboard: true,
+        fileTransfer: true,
+        audio: true,
+        terminal: true,
+      });
+      setApprovalBusy(null);
+    }
+  }, [hostState.pendingApproval?.sessionId]);
+
+  // Auto-expand host session chat strip when a new message arrives from controller
+  useEffect(() => {
+    const msgs = hostState.chatMessages ?? [];
+    if (msgs.length > prevChatCountRef.current) {
+      const latest = msgs[msgs.length - 1];
+      if (latest?.sender === "controller") {
+        setChatExpanded(true);
+      }
+    }
+    prevChatCountRef.current = msgs.length;
+  }, [hostState.chatMessages]);
 
   // Keep draft inputs aligned with external IPC updates while not editing
   useEffect(() => {
@@ -335,6 +404,78 @@ export function DesktopHostPanel({
     }
   }
 
+  async function handleChangeAccessMode(nextMode: AccessApprovalMode) {
+    if (busySettingKey || (hostState.accessMode ?? "auto") === nextMode) return;
+    setBusySettingKey("accessMode");
+    try {
+      await handlers.onUpdateConfig({ accessMode: nextMode });
+    } finally {
+      setBusySettingKey(null);
+    }
+  }
+
+  async function handleApprovePending() {
+    if (
+      approvalBusy ||
+      !hostState.pendingApproval ||
+      !handlers.onApproveSession
+    ) {
+      return;
+    }
+    setApprovalBusy("approve");
+    try {
+      await handlers.onApproveSession(hostState.pendingApproval.sessionId, {
+        mouse: approvalPerms.input,
+        keyboard: approvalPerms.input,
+        clipboard: approvalPerms.clipboard,
+        fileTransfer: approvalPerms.fileTransfer,
+        audio: approvalPerms.audio,
+        terminal: approvalPerms.terminal,
+      });
+    } finally {
+      setApprovalBusy(null);
+    }
+  }
+
+  async function handleRejectPending() {
+    if (
+      approvalBusy ||
+      !hostState.pendingApproval ||
+      !handlers.onRejectSession
+    ) {
+      return;
+    }
+    setApprovalBusy("reject");
+    try {
+      await handlers.onRejectSession(hostState.pendingApproval.sessionId);
+    } finally {
+      setApprovalBusy(null);
+    }
+  }
+
+  async function handleUnblockLocalInput() {
+    if (unblockingInput || !handlers.onSetBlockInput) return;
+    setUnblockingInput(true);
+    try {
+      await handlers.onSetBlockInput(false);
+    } finally {
+      setUnblockingInput(false);
+    }
+  }
+
+  async function handleSendHostChat(e: React.FormEvent) {
+    e.preventDefault();
+    const trimmed = chatDraft.trim();
+    if (!trimmed || sendingChat || !handlers.onSendChatMessage) return;
+    setSendingChat(true);
+    try {
+      await handlers.onSendChatMessage(trimmed);
+      setChatDraft("");
+    } finally {
+      setSendingChat(false);
+    }
+  }
+
   const showBody = !collapsible || expanded;
 
   const content = (
@@ -459,37 +600,250 @@ export function DesktopHostPanel({
             </div>
           )}
 
-          {/* Active Incoming Remote Control Alert */}
-          {hostState.activeSessionId && (
-            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#93C5FD] bg-[#EFF6FF] px-3.5 py-3 text-xs text-[#1E3A8A]">
-              <div className="flex min-w-0 items-center gap-2.5">
-                <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-[#2563EB]" />
+          {/* Active Block-Input Warning Banner */}
+          {hostState.blockInputActive && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#F59E0B] bg-[#FFFBEB] px-3.5 py-3 text-xs text-[#92400E]">
+              <div className="flex min-w-0 items-start gap-2.5">
+                <Lock className="mt-0.5 h-4 w-4 shrink-0 text-[#D97706]" />
                 <div className="min-w-0">
-                  <p className="font-semibold text-[#111318]">
-                    当前正被远程控制（
-                    {hostState.activeTransport === "webrtc"
-                      ? "WebRTC 60fps"
-                      : "WS 帧流"}
-                    ）
+                  <p className="font-semibold text-[#78350F]">
+                    本机物理键鼠输入已被远控端锁定
                   </p>
-                  <p className="mt-0.5 font-mono text-[11px] text-[#3B82F6]">
-                    会话 ID: {hostState.activeSessionId.slice(0, 12)}
+                  <p className="mt-0.5 text-[11px] leading-relaxed text-[#92400E]">
+                    为防止操作冲突，本地实体键盘与鼠标暂时被禁用；你可随时点击右侧按钮立即解除。
                   </p>
                 </div>
               </div>
-              <button
-                type="button"
-                disabled={disconnecting}
-                onClick={() => void handleDisconnectClick()}
-                className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-[#DC2626] bg-[#DC2626] px-3 text-xs font-medium text-white transition hover:bg-[#B91C1C] disabled:opacity-50"
-              >
-                {disconnecting ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <PowerOff className="h-3.5 w-3.5" />
-                )}
-                断开远控
-              </button>
+              {handlers.onSetBlockInput && (
+                <button
+                  type="button"
+                  disabled={unblockingInput}
+                  onClick={() => void handleUnblockLocalInput()}
+                  className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-[#D97706] bg-[#D97706] px-3 text-xs font-medium text-white transition hover:bg-[#B45309] disabled:opacity-50"
+                >
+                  {unblockingInput ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Unlock className="h-3.5 w-3.5" />
+                  )}
+                  解除本地键鼠锁定
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Incoming Connection Approval Request Card */}
+          {hostState.pendingApproval && (
+            <div className="space-y-3 rounded-lg border-2 border-[#2563EB] bg-[#EFF6FF] p-4 text-xs text-[#1E3A8A]">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="flex items-start gap-2.5">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#F59E0B]/40 bg-[#FFFBEB] text-[#D97706]">
+                    <ShieldAlert className="h-4 w-4" />
+                  </div>
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="text-sm font-semibold text-[#111318]">
+                        收到远程接入请求
+                      </p>
+                      <span className="rounded border border-[#FDE68A] bg-[#FFFBEB] px-1.5 py-0.5 text-[10px] font-semibold text-[#B45309]">
+                        等待本机审批
+                      </span>
+                    </div>
+                    <p className="mt-0.5 font-mono text-[11px] text-[#3B82F6]">
+                      会话 {hostState.pendingApproval.sessionId.slice(0, 12)}
+                      {hostState.pendingApproval.requestedAt > 0
+                        ? ` · ${formatReceivedTime(hostState.pendingApproval.requestedAt)}`
+                        : ""}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-md border border-[#BFDBFE] bg-white px-3 py-2.5">
+                <p className="mb-2 text-[11px] font-semibold text-[#374151]">
+                  本次会话授予权限：
+                </p>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  {(
+                    [
+                      { key: "input", label: "鼠标与键盘" },
+                      { key: "clipboard", label: "剪贴板" },
+                      { key: "fileTransfer", label: "文件管理" },
+                      { key: "audio", label: "系统声音" },
+                      { key: "terminal", label: "远程终端" },
+                    ] as const
+                  ).map((item) => (
+                    <label
+                      key={item.key}
+                      className="inline-flex cursor-pointer items-center gap-1.5 select-none text-xs text-[#111318]"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={approvalPerms[item.key]}
+                        onChange={(e) =>
+                          setApprovalPerms((prev) => ({
+                            ...prev,
+                            [item.key]: e.target.checked,
+                          }))
+                        }
+                        className="h-4 w-4 rounded border-[#CBD2DC] accent-[#2563EB]"
+                      />
+                      <span>{item.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={Boolean(approvalBusy) || !handlers.onRejectSession}
+                  onClick={() => void handleRejectPending()}
+                  className="btn-outline inline-flex h-9 items-center gap-1.5 rounded-md border-[#FCA5A5] bg-white px-3.5 text-xs font-medium text-[#DC2626] hover:bg-[#FEF2F2] disabled:opacity-50"
+                >
+                  {approvalBusy === "reject" ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <X className="h-3.5 w-3.5" />
+                  )}
+                  拒绝
+                </button>
+                <button
+                  type="button"
+                  disabled={Boolean(approvalBusy) || !handlers.onApproveSession}
+                  onClick={() => void handleApprovePending()}
+                  className="btn-primary inline-flex h-9 items-center gap-1.5 rounded-md px-4 text-xs font-semibold disabled:opacity-50"
+                >
+                  {approvalBusy === "approve" ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Check className="h-3.5 w-3.5" />
+                  )}
+                  允许接入
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Active Incoming Remote Control Alert */}
+          {hostState.activeSessionId && (
+            <div className="overflow-hidden rounded-lg border border-[#93C5FD] bg-[#EFF6FF] text-xs text-[#1E3A8A]">
+              <div className="flex flex-wrap items-center justify-between gap-3 px-3.5 py-3">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-[#2563EB]" />
+                  <div className="min-w-0">
+                    <p className="font-semibold text-[#111318]">
+                      当前正被远程控制（
+                      {hostState.activeTransport === "webrtc"
+                        ? "WebRTC 60fps"
+                        : "WS 帧流"}
+                      ）
+                    </p>
+                    <p className="mt-0.5 font-mono text-[11px] text-[#3B82F6]">
+                      会话 ID: {hostState.activeSessionId.slice(0, 12)}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {handlers.onSendChatMessage && (
+                    <button
+                      type="button"
+                      onClick={() => setChatExpanded((prev) => !prev)}
+                      className="btn-outline inline-flex h-8 items-center gap-1.5 rounded-md border-[#93C5FD] bg-white px-2.5 text-xs font-medium text-[#1D4ED8] hover:bg-[#DBEAFE]/50"
+                    >
+                      <MessageSquare className="h-3.5 w-3.5" />
+                      <span>会话消息</span>
+                      {(hostState.chatMessages?.length ?? 0) > 0 && (
+                        <span className="rounded bg-[#2563EB] px-1.5 py-0.2 font-mono text-[10px] font-semibold text-white">
+                          {hostState.chatMessages?.length}
+                        </span>
+                      )}
+                      {chatExpanded ? (
+                        <ChevronUp className="h-3.5 w-3.5" />
+                      ) : (
+                        <ChevronDown className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={disconnecting}
+                    onClick={() => void handleDisconnectClick()}
+                    className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-[#DC2626] bg-[#DC2626] px-3 text-xs font-medium text-white transition hover:bg-[#B91C1C] disabled:opacity-50"
+                  >
+                    {disconnecting ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <PowerOff className="h-3.5 w-3.5" />
+                    )}
+                    断开远控
+                  </button>
+                </div>
+              </div>
+
+              {/* Collapsible Host Session Chat Strip */}
+              {chatExpanded && handlers.onSendChatMessage && (
+                <div className="border-t border-[#BFDBFE] bg-white px-3.5 py-3">
+                  <div className="max-h-40 space-y-2 overflow-y-auto rounded-md border border-[#E2E6EC] bg-[#F8F9FB] p-2.5">
+                    {(hostState.chatMessages?.length ?? 0) === 0 ? (
+                      <p className="py-2 text-center text-[11px] text-[#6B7280]">
+                        暂无消息，可向正在操作本机的控制端发送快捷回复
+                      </p>
+                    ) : (
+                      (hostState.chatMessages ?? []).map((msg) => {
+                        const isHost = msg.sender === "host";
+                        return (
+                          <div
+                            key={msg.id}
+                            className={`flex flex-col ${isHost ? "items-end" : "items-start"}`}
+                          >
+                            <span className="mb-0.5 text-[10px] text-[#6B7280]">
+                              {isHost ? "本机" : msg.senderName || "控制端"} ·{" "}
+                              <span className="font-mono">
+                                {formatReceivedTime(msg.ts)}
+                              </span>
+                            </span>
+                            <div
+                              className={`max-w-[85%] break-words rounded-lg border px-2.5 py-1.5 text-xs ${
+                                isHost
+                                  ? "border-[#2563EB] bg-[#2563EB] text-white"
+                                  : "border-[#E2E6EC] bg-white text-[#111318]"
+                              }`}
+                            >
+                              {msg.text}
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                  <form
+                    onSubmit={(e) => void handleSendHostChat(e)}
+                    className="mt-2 flex items-center gap-1.5"
+                  >
+                    <input
+                      type="text"
+                      value={chatDraft}
+                      onChange={(e) => setChatDraft(e.target.value)}
+                      placeholder="回复控制端消息..."
+                      maxLength={2000}
+                      className="field h-8 min-w-0 flex-1 rounded-md px-2.5 text-xs"
+                    />
+                    <button
+                      type="submit"
+                      disabled={sendingChat || !chatDraft.trim()}
+                      className="btn-primary inline-flex h-8 shrink-0 items-center gap-1 rounded-md px-3 text-xs font-medium disabled:opacity-45"
+                    >
+                      {sendingChat ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Send className="h-3.5 w-3.5" />
+                      )}
+                      发送
+                    </button>
+                  </form>
+                </div>
+              )}
             </div>
           )}
 
@@ -790,6 +1144,33 @@ export function DesktopHostPanel({
                 </button>
               ) : null}
             </div>
+
+            {/* Subtle LAN IP & MAC Metadata Row (WOL readiness) */}
+            {(hostState.lanIp || (hostState.macAddresses && hostState.macAddresses.length > 0)) && (
+              <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 text-xs">
+                <div className="flex items-center gap-2 text-[#4B5563]">
+                  <Network className="h-3.5 w-3.5 shrink-0 text-[#6B7280]" />
+                  <span>局域网 / WOL</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] text-[#374151]">
+                  {hostState.lanIp && (
+                    <span className="rounded border border-[#E2E6EC] bg-[#F8F9FB] px-1.5 py-0.5">
+                      {hostState.lanIp}
+                    </span>
+                  )}
+                  {hostState.macAddresses?.[0] && (
+                    <span className="rounded border border-[#E2E6EC] bg-[#F8F9FB] px-1.5 py-0.5 text-[#4B5563]">
+                      {hostState.macAddresses[0]}
+                    </span>
+                  )}
+                  {hostState.macAddresses && hostState.macAddresses.length > 0 && (
+                    <span className="rounded border border-[#BBF7D0] bg-[#ECFDF3] px-1.5 py-0.5 font-sans text-[10px] font-medium text-[#15803D]">
+                      WOL 就绪
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Pro Unattended Host Settings */}
@@ -807,6 +1188,49 @@ export function DesktopHostPanel({
             </div>
 
             <div className="divide-y divide-[#ECEFF4]">
+              {/* Access Approval Mode Segmented Control */}
+              <div className="flex flex-wrap items-center justify-between gap-3 px-3.5 py-2.5">
+                <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                  <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#4B5563]" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-medium text-[#111318]">接入策略</p>
+                    <p className="mt-0.5 text-[11px] leading-snug text-[#6B7280]">
+                      {(hostState.accessMode ?? "auto") === "confirm"
+                        ? "每次远程接入需在本机点击「允许接入」，并可细分勾选权限"
+                        : "通过账号或控制密码验证后自动放行，适合 7×24 无人值守"}
+                    </p>
+                  </div>
+                </div>
+                <div
+                  role="group"
+                  aria-label="接入策略"
+                  className="inline-flex shrink-0 rounded-lg border border-[#CBD2DC] bg-[#F4F5F7] p-0.5"
+                >
+                  {(
+                    [
+                      { id: "auto", label: "无人值守自动接入" },
+                      { id: "confirm", label: "来访弹窗审批" },
+                    ] as Array<{ id: AccessApprovalMode; label: string }>
+                  ).map((option) => {
+                    const active = (hostState.accessMode ?? "auto") === option.id;
+                    return (
+                      <button
+                        key={option.id}
+                        type="button"
+                        disabled={Boolean(busySettingKey)}
+                        onClick={() => void handleChangeAccessMode(option.id)}
+                        className={`h-7 rounded-md px-2.5 text-[11px] font-medium transition disabled:opacity-50 ${
+                          active
+                            ? "bg-[#2563EB] text-white shadow-xs"
+                            : "text-[#4B5563] hover:text-[#111318]"
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
               <HostSettingToggleRow
                 icon={<Power className="h-3.5 w-3.5 text-[#4B5563]" />}
                 title="开机自启（Login Item）"

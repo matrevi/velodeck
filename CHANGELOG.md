@@ -2,7 +2,20 @@
 
 All notable changes to **VeloDeck（极控）** are documented in this file.
 
-## [Unreleased / Desktop Pro Suite] - 2026-11-28
+## [Unreleased / Desktop Pro & RustDesk-Grade Remote Suite] - 2026-11-28
+
+### RustDesk-Grade Controller & Remote Desktop Enhancements
+- **Cross-OS Smart Keymap (Mac ↔ Win)**: Automatic `Cmd`↔`Ctrl` shortcut translation (`Cmd+C/V/A/Z/F/S/W/T/...`) when controlling Windows/Linux from macOS or macOS from Windows, with mapped key-release tracking and 1-click `智能 / 原生 (Raw)` toggle.
+- **4-Edge Collapsible Floating Toolbar**: Switchable `标准顶栏 / 悬浮条` chrome mode with draggable top/bottom/left/right edge snapping so full-screen remote control never obscures remote macOS menu bars or Windows taskbars.
+- **View Styles & View-Only Mode**: Switch between `自适应` (`adaptive`), `1:1 原画` (`original` native DPR pixels with scrollbars), and `铺满` (`stretch`), plus 1-click **「只读观察」** lock that blocks accidental remote input.
+- **Local Session Recording**: Zero-dependency `MediaRecorder` local `.webm`/`.mp4` video+audio recording (including WS-JPEG canvas fallback) with pulsing `REC mm:ss` HUD badge and instant file download.
+- **Multi-Tab Concurrent Session Manager**: Keep up to **4 simultaneous live WebRTC sessions** warm inside a single window with instant tab switching (`DesktopTabBar`) and strict active-tab keyboard/shortcut isolation.
+- **LAN Peer Discovery & Wake-on-LAN (WOL)**: Local UDP `:21119` LAN host discovery (metadata-only, zero secrets) plus 1-click 102-byte UDP `:9` WOL magic packets via local NIC or online `wolRelay` peer host.
+- **Remote Interactive PTY Terminal**: Dedicated WebRTC `"terminal"` DataChannel launching remote interactive shells (macOS/Linux PTY + Windows PowerShell) with ANSI SGR color rendering, quick control keys (`Ctrl+C/D/Tab/↑/↓`), and resize sync.
+- **Relative Mouse Lock (`Cmd/Ctrl+G`) & Real-Time Remote Cursor Shape Sync**: Pointer Lock relative `dx/dy` injection for 3D/CAD/FPS apps plus 140ms system cursor shape polling (`I-beam`, `pointer`, resize arrows, etc.) synced over `"pointer"` DataChannel.
+- **Block Remote Physical Input**: Host-side physical keyboard/mouse lock (`CGEventTap` on macOS, Win32 `BlockInput` on Windows) while still accepting tagged VeloDeck remote input, with guaranteed `Cmd/Ctrl+Alt+Esc` emergency unlock.
+- **Interactive Host Approval & Granular Permissions**: Optional `confirm`（「来访弹窗审批」）host access mode with 60s OS notification + per-session permission toggles (`keyboard`, `mouse`, `clipboard`, `fileTransfer`, `audio`, `terminal`) enforced on both host and controller.
+- **Session Text Chat & Click-Through Screen Whiteboard**: Built-in real-time bidirectional session chat drawer (`chat.msg`) and normalized `[0..1]` multi-color screen annotation overlay (`whiteboard`) rendered transparently over the remote display with 8-second auto-fade.
 
 ### Bidirectional Desktop App (macOS & Windows · `desktop/`)
 - **Native Desktop Controller**: Electron app (`app://velodeck`) with hardware H.264/HEVC WebRTC decode, `backgroundThrottling: false`, Always-on-Top PiP phone mode, window presets (`430×880` / `1100×760` / `360×740`), System Tray, right-click Back & middle-click Home for Android targets, 1-click HD screenshot copy/save, multi-window multi-device control, and built-in Self-Hosted Server Switcher (`Cmd/Ctrl+,`).

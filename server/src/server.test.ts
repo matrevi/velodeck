@@ -15,9 +15,11 @@ import {
   formatControlCode,
   type AgentRegisterMessage,
   type AgentRegisteredMessage,
+  type ChatMessage,
   type ControlAckMessage,
   type ControlCmdMessage,
   type ControllerAuthedMessage,
+  type CursorUpdateMessage,
   type DeviceStatusMessage,
   type DisplayInfo,
   type ErrorMessage,
@@ -26,9 +28,12 @@ import {
   type RtcIceMessage,
   type RtcOfferMessage,
   type SessionEndMessage,
+  type SessionPendingMessage,
+  type SessionPermissionsMessage,
   type SessionReadyMessage,
   type SessionRequestMessage,
   type UserProfile,
+  type WhiteboardStroke,
   type WireMessage,
 } from "@velodeck/protocol";
 import { AsyncSemaphore, verifyPassword } from "./auth.js";
@@ -4367,4 +4372,827 @@ test("privacy_screen, audio_toggle, and power commands validate, require active 
     ["lock", "sleep", "restart", "shutdown"],
   );
   assert.ok(powerAudit.every((e) => e.deviceId === "desk-power-01" && e.sessionId === "sess-power-01"));
+});
+
+test("Wave 2+3 metadata (macAddresses, lanIp, accessMode, blockInputActive) and capabilities sanitize, propagate on register/telemetry/clone, and persist on reload", async (t) => {
+  const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "velodeck-wave23-meta-test-"));
+  const { server, baseUrl, wsUrl } = await startServer({ dataDir });
+  t.after(async () => {
+    await server.close();
+    await fsp.rm(dataDir, { recursive: true, force: true });
+  });
+
+  const regRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "wave23_owner", password: "wave23-password-123" }),
+  });
+  assert.equal(regRes.status, 201);
+  const { token } = (await regRes.json()) as { token: string };
+
+  const desktopAgent = await TestWsClient.connect(wsUrl);
+  const badMetaAgent = await TestWsClient.connect(wsUrl);
+  const androidAgent = await TestWsClient.connect(wsUrl);
+  const ctrl = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([desktopAgent.close(), badMetaAgent.close(), androidAgent.close(), ctrl.close()]);
+  });
+
+  // 1. Register desktop host with Wave 2+3 capabilities + mixed/deduped/capped MACs + valid LAN IP + accessMode + blockInputActive
+  desktopAgent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-wave23-01",
+      deviceSecret: "desk-wave23-secret-01",
+      authToken: token,
+      deviceType: "desktop",
+      osPlatform: "win32",
+      blockInputActive: true,
+      accessMode: "confirm",
+      macAddresses: [
+        "aa-bb-cc-dd-ee-01",
+        "AA:BB:CC:DD:EE:01", // duplicate after normalization
+        "not-a-mac",
+        "11:22:33:44:55:02",
+        "11:22:33:44:55:03",
+        "11:22:33:44:55:04",
+        "11:22:33:44:55:05",
+        "11:22:33:44:55:06",
+        "11:22:33:44:55:07",
+        "11:22:33:44:55:08",
+        "11:22:33:44:55:09", // 9th valid unique MAC -> capped at 8
+      ],
+      lanIp: "192.168.10.42",
+      capabilities: {
+        webrtc: true,
+        wsJpeg: true,
+        wsH264: false,
+        wake: false,
+        unlock: false,
+        accessibility: true,
+        mediaProjection: true,
+        remoteTerminal: true,
+        relativeMouse: true,
+        cursorSync: true,
+        blockInput: true,
+        wolRelay: true,
+        whiteboard: true,
+        chat: true,
+      },
+    }),
+  );
+  await desktopAgent.nextJson<AgentRegisteredMessage>();
+
+  // 2. Register agent with invalid MACs, public lanIp, and invalid accessMode -> all sanitized out
+  badMetaAgent.sendJson({
+    ...makeAgentRegister({
+      deviceId: "desk-badmeta-02",
+      deviceSecret: "desk-badmeta-secret-02",
+      authToken: token,
+      deviceType: "desktop",
+      osPlatform: "linux",
+    }),
+    accessMode: "always-allow",
+    macAddresses: ["ZZZZ", "12:34:56", "aa:bb:cc:dd:ee:gg", 12345],
+    lanIp: "8.8.8.8",
+  });
+  await badMetaAgent.nextJson<AgentRegisteredMessage>();
+
+  // 3. Legacy Android agent registers without any Wave 2+3 fields
+  androidAgent.sendJson(
+    makeAgentRegister({
+      deviceId: "dev-android-w23",
+      deviceSecret: "android-w23-secret",
+      authToken: token,
+    }),
+  );
+  await androidAgent.nextJson<AgentRegisteredMessage>();
+
+  ctrl.sendJson({
+    type: "controller.auth",
+    authToken: token,
+    clientId: "ctrl-wave23-1",
+  });
+  const authed = await ctrl.nextJson<ControllerAuthedMessage>();
+  assert.equal(authed.devices.length, 3);
+
+  const desk = authed.devices.find((d) => d.deviceId === "desk-wave23-01");
+  const badMeta = authed.devices.find((d) => d.deviceId === "desk-badmeta-02");
+  const legacyAndroid = authed.devices.find((d) => d.deviceId === "dev-android-w23");
+
+  assert.ok(desk);
+  assert.equal(desk.blockInputActive, true);
+  assert.equal(desk.accessMode, "confirm");
+  assert.equal(desk.lanIp, "192.168.10.42");
+  assert.deepEqual(desk.macAddresses, [
+    "AA:BB:CC:DD:EE:01",
+    "11:22:33:44:55:02",
+    "11:22:33:44:55:03",
+    "11:22:33:44:55:04",
+    "11:22:33:44:55:05",
+    "11:22:33:44:55:06",
+    "11:22:33:44:55:07",
+    "11:22:33:44:55:08",
+  ]);
+  assert.equal(desk.capabilities.remoteTerminal, true);
+  assert.equal(desk.capabilities.relativeMouse, true);
+  assert.equal(desk.capabilities.cursorSync, true);
+  assert.equal(desk.capabilities.blockInput, true);
+  assert.equal(desk.capabilities.wolRelay, true);
+  assert.equal(desk.capabilities.whiteboard, true);
+  assert.equal(desk.capabilities.chat, true);
+
+  assert.ok(badMeta);
+  assert.equal(Object.hasOwn(badMeta, "accessMode"), false);
+  assert.equal(Object.hasOwn(badMeta, "macAddresses"), false);
+  assert.equal(Object.hasOwn(badMeta, "lanIp"), false);
+
+  assert.ok(legacyAndroid);
+  assert.equal(Object.hasOwn(legacyAndroid, "blockInputActive"), false);
+  assert.equal(Object.hasOwn(legacyAndroid, "accessMode"), false);
+  assert.equal(Object.hasOwn(legacyAndroid, "macAddresses"), false);
+  assert.equal(Object.hasOwn(legacyAndroid, "lanIp"), false);
+  assert.equal(Object.hasOwn(legacyAndroid.capabilities, "remoteTerminal"), false);
+  assert.equal(Object.hasOwn(legacyAndroid.capabilities, "relativeMouse"), false);
+  assert.equal(Object.hasOwn(legacyAndroid.capabilities, "cursorSync"), false);
+  assert.equal(Object.hasOwn(legacyAndroid.capabilities, "blockInput"), false);
+  assert.equal(Object.hasOwn(legacyAndroid.capabilities, "wolRelay"), false);
+  assert.equal(Object.hasOwn(legacyAndroid.capabilities, "whiteboard"), false);
+  assert.equal(Object.hasOwn(legacyAndroid.capabilities, "chat"), false);
+
+  // 4. Telemetry updates propagate valid Wave 2+3 fields and ignore public lanIp / invalid MACs
+  desktopAgent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "desk-wave23-01",
+    blockInputActive: false,
+    accessMode: "auto",
+    macAddresses: ["de-ad-be-ef-00-01", "bad-mac"],
+    lanIp: "100.64.12.34", // CGNAT / Tailscale allowed
+    capabilities: {
+      remoteTerminal: false,
+      chat: false,
+    },
+  });
+  const telemetry1 = await ctrl.nextJson<DeviceStatusMessage>();
+  assert.equal(telemetry1.device.blockInputActive, false);
+  assert.equal(telemetry1.device.accessMode, "auto");
+  assert.deepEqual(telemetry1.device.macAddresses, ["DE:AD:BE:EF:00:01"]);
+  assert.equal(telemetry1.device.lanIp, "100.64.12.34");
+  assert.equal(telemetry1.device.capabilities.remoteTerminal, false);
+  assert.equal(telemetry1.device.capabilities.chat, false);
+  assert.equal(telemetry1.device.capabilities.wolRelay, true);
+  assert.equal(telemetry1.device.capabilities.whiteboard, true);
+
+  // Public IP & invalid MAC in telemetry must NOT overwrite valid sanitized fields
+  desktopAgent.sendJson({
+    type: "agent.telemetry",
+    deviceId: "desk-wave23-01",
+    lanIp: "203.0.113.9",
+    macAddresses: ["invalid-only"],
+  });
+  const telemetry2 = await ctrl.nextJson<DeviceStatusMessage>();
+  assert.equal(telemetry2.device.lanIp, "100.64.12.34");
+  assert.deepEqual(telemetry2.device.macAddresses, ["DE:AD:BE:EF:00:01"]);
+
+  // 5. cloneDeviceSummary deep-clones macAddresses & preserves all new fields
+  const cloned = cloneDeviceSummary(telemetry2.device);
+  assert.deepEqual(cloned.macAddresses, ["DE:AD:BE:EF:00:01"]);
+  assert.notEqual(cloned.macAddresses, telemetry2.device.macAddresses);
+  cloned.macAddresses?.push("00:11:22:33:44:55");
+  assert.deepEqual(telemetry2.device.macAddresses, ["DE:AD:BE:EF:00:01"]);
+  assert.equal(cloned.lanIp, "100.64.12.34");
+  assert.equal(cloned.accessMode, "auto");
+  assert.equal(cloned.blockInputActive, false);
+
+  // 6. Persisted disk reload preserves registered Wave 2+3 fields and capabilities
+  await server.hub.store.flush();
+  const reloadedStore = new VeloDeckStore(dataDir);
+  const persisted = reloadedStore.getDevice("desk-wave23-01");
+  assert.ok(persisted);
+  assert.equal(persisted.summary.blockInputActive, true);
+  assert.equal(persisted.summary.accessMode, "confirm");
+  assert.equal(persisted.summary.lanIp, "192.168.10.42");
+  assert.equal(persisted.summary.macAddresses?.length, 8);
+  assert.equal(persisted.summary.macAddresses?.[0], "AA:BB:CC:DD:EE:01");
+  assert.equal(persisted.summary.capabilities.remoteTerminal, true);
+  assert.equal(persisted.summary.capabilities.relativeMouse, true);
+  assert.equal(persisted.summary.capabilities.cursorSync, true);
+  assert.equal(persisted.summary.capabilities.blockInput, true);
+  assert.equal(persisted.summary.capabilities.wolRelay, true);
+  assert.equal(persisted.summary.capabilities.whiteboard, true);
+  assert.equal(persisted.summary.capabilities.chat, true);
+
+  const persistedBad = reloadedStore.getDevice("desk-badmeta-02");
+  assert.ok(persistedBad);
+  assert.equal(Object.hasOwn(persistedBad.summary, "lanIp"), false);
+  assert.equal(Object.hasOwn(persistedBad.summary, "macAddresses"), false);
+  assert.equal(Object.hasOwn(persistedBad.summary, "accessMode"), false);
+});
+
+test("Wave 2+3 control commands: mouse_move_relative, block_input (session-only + audit), whiteboard validation, and sessionless wol auth + audit", async (t) => {
+  const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "velodeck-wave23-ctrl-test-"));
+  const { server, baseUrl, wsUrl } = await startServer({
+    dataDir,
+    registrationInviteCode: "WAVE23-TEST-INVITE",
+  });
+  t.after(async () => {
+    await server.close();
+    await fsp.rm(dataDir, { recursive: true, force: true });
+  });
+
+  // Register two separate users to test ownership enforcement on sessionless WOL
+  const regAlice = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "wave23_alice",
+      password: "alice-password-123",
+      inviteCode: "WAVE23-TEST-INVITE",
+    }),
+  });
+  assert.equal(regAlice.status, 201);
+  const { token: aliceToken } = (await regAlice.json()) as { token: string };
+
+  const regBob = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "wave23_bob",
+      password: "bob-password-123",
+      inviteCode: "WAVE23-TEST-INVITE",
+    }),
+  });
+  assert.equal(regBob.status, 201);
+  const { token: bobToken } = (await regBob.json()) as { token: string };
+
+  const alicePeer = await TestWsClient.connect(wsUrl);
+  const aliceCtrl = await TestWsClient.connect(wsUrl);
+  const bobCtrl = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([alicePeer.close(), aliceCtrl.close(), bobCtrl.close()]);
+  });
+
+  alicePeer.sendJson(
+    makeAgentRegister({
+      deviceId: "alice-mac-relay",
+      deviceSecret: "alice-mac-secret",
+      authToken: aliceToken,
+      deviceType: "desktop",
+      osPlatform: "darwin",
+      capabilities: {
+        webrtc: true,
+        wsJpeg: true,
+        wsH264: false,
+        wake: true,
+        unlock: false,
+        accessibility: true,
+        mediaProjection: true,
+        wolRelay: true,
+        blockInput: true,
+        relativeMouse: true,
+        whiteboard: true,
+      },
+    }),
+  );
+  await alicePeer.nextJson<AgentRegisteredMessage>();
+
+  aliceCtrl.sendJson({
+    type: "controller.auth",
+    authToken: aliceToken,
+    clientId: "ctrl-alice-w23",
+  });
+  await aliceCtrl.nextJson<ControllerAuthedMessage>();
+
+  bobCtrl.sendJson({
+    type: "controller.auth",
+    authToken: bobToken,
+    clientId: "ctrl-bob-w23",
+  });
+  await bobCtrl.nextJson<ControllerAuthedMessage>();
+
+  // 1. Sessionless block_input, mouse_move_relative, and whiteboard MUST be rejected with SESSION_NOT_FOUND
+  for (const sessionlessDenied of [
+    { action: "block_input", enabled: true },
+    { action: "mouse_move_relative", dx: 10, dy: -5 },
+    { action: "whiteboard", op: "clear" },
+  ] as const) {
+    aliceCtrl.sendJson({
+      type: "control.cmd",
+      sessionId: "",
+      deviceId: "alice-mac-relay",
+      seq: 1,
+      command: sessionlessDenied,
+    } satisfies ControlCmdMessage);
+    const err = await aliceCtrl.nextJson<ErrorMessage>();
+    assert.equal(err.type, "error");
+    assert.equal(err.code, "SESSION_NOT_FOUND");
+  }
+
+  // 2. Sessionless WOL from authorized owner (Alice) succeeds & routes out-of-band control.ack back
+  aliceCtrl.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "alice-mac-relay",
+    seq: 42,
+    command: {
+      action: "wol",
+      macAddress: "AA:BB:CC:DD:EE:FF",
+      broadcastIp: "192.168.1.255",
+    },
+  } satisfies ControlCmdMessage);
+  const wolForwarded = await alicePeer.nextJson<ControlCmdMessage>();
+  assert.equal(wolForwarded.type, "control.cmd");
+  assert.equal(wolForwarded.sessionId, "");
+  assert.equal(wolForwarded.deviceId, "alice-mac-relay");
+  assert.equal(wolForwarded.seq, 42);
+  assert.deepEqual(wolForwarded.command, {
+    action: "wol",
+    macAddress: "AA:BB:CC:DD:EE:FF",
+    broadcastIp: "192.168.1.255",
+  });
+
+  // Also allow 255.255.255.255 and omitted broadcastIp
+  aliceCtrl.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "alice-mac-relay",
+    seq: 43,
+    command: {
+      action: "wol",
+      macAddress: "aa-bb-cc-dd-ee-00",
+      broadcastIp: "255.255.255.255",
+    },
+  } satisfies ControlCmdMessage);
+  const wolBroadcast255 = await alicePeer.nextJson<ControlCmdMessage>();
+  assert.deepEqual(wolBroadcast255.command, {
+    action: "wol",
+    macAddress: "aa-bb-cc-dd-ee-00",
+    broadcastIp: "255.255.255.255",
+  });
+
+  alicePeer.sendJson({
+    type: "control.ack",
+    sessionId: "",
+    deviceId: "alice-mac-relay",
+    seq: 42,
+    ok: true,
+    message: "wol_sent",
+  } satisfies ControlAckMessage);
+  const wolAck = await aliceCtrl.nextJson<ControlAckMessage>();
+  assert.equal(wolAck.type, "control.ack");
+  assert.equal(wolAck.seq, 42);
+  assert.equal(wolAck.ok, true);
+
+  // 3. Unauthorized user (Bob) sending sessionless WOL to Alice's peer device MUST be rejected
+  bobCtrl.sendJson({
+    type: "control.cmd",
+    sessionId: "",
+    deviceId: "alice-mac-relay",
+    seq: 99,
+    command: {
+      action: "wol",
+      macAddress: "AA:BB:CC:DD:EE:FF",
+    },
+  } satisfies ControlCmdMessage);
+  const bobErr = await bobCtrl.nextJson<ErrorMessage>();
+  assert.equal(bobErr.type, "error");
+  assert.equal(bobErr.code, "UNAUTHORIZED");
+
+  // 4. Invalid WOL payloads rejected with INVALID_MESSAGE
+  for (const badWol of [
+    { action: "wol", macAddress: "not-a-mac" },
+    { action: "wol", macAddress: "AA:BB:CC:DD:EE:GG" },
+    { action: "wol", macAddress: "AA:BB:CC:DD:EE:FF", broadcastIp: "8.8.8.8" },
+    { action: "wol", macAddress: "AA:BB:CC:DD:EE:FF", broadcastIp: "127.0.0.1" },
+    { action: "wol", macAddress: "AA:BB:CC:DD:EE:FF", broadcastIp: "" },
+  ]) {
+    aliceCtrl.sendJson({
+      type: "control.cmd",
+      sessionId: "",
+      deviceId: "alice-mac-relay",
+      seq: 50,
+      command: badWol,
+    });
+    const err = await aliceCtrl.nextJson<ErrorMessage>();
+    assert.equal(err.type, "error");
+    assert.equal(err.code, "INVALID_MESSAGE");
+  }
+
+  // 5. Establish active session for in-session commands
+  aliceCtrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-wave23-01",
+    deviceId: "alice-mac-relay",
+    preferredTransport: "webrtc",
+    quality: DESKTOP_QUALITY_PRESETS.balanced,
+  } satisfies SessionRequestMessage);
+  await alicePeer.nextJson<SessionRequestMessage>();
+
+  alicePeer.sendJson({
+    type: "session.ready",
+    sessionId: "sess-wave23-01",
+    deviceId: "alice-mac-relay",
+    transport: "webrtc",
+    screenWidth: 1920,
+    screenHeight: 1080,
+    rotation: 0,
+  } satisfies SessionReadyMessage);
+  await aliceCtrl.nextJson<SessionReadyMessage>();
+
+  const validStroke: WhiteboardStroke = {
+    id: "stroke-01",
+    color: "#ff3b30",
+    width: 4,
+    points: [
+      { x: 0.1, y: 0.2 },
+      { x: 0.5, y: 0.6 },
+    ],
+  };
+
+  const validInSessionCommands: ControlCmdMessage["command"][] = [
+    { action: "mouse_move_relative", dx: -14.5, dy: 22 },
+    { action: "block_input", enabled: true },
+    { action: "block_input", enabled: false },
+    { action: "whiteboard", op: "stroke", stroke: validStroke },
+    { action: "whiteboard", op: "clear" },
+  ];
+
+  let seq = 100;
+  for (const command of validInSessionCommands) {
+    seq += 1;
+    aliceCtrl.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-wave23-01",
+      deviceId: "alice-mac-relay",
+      seq,
+      command,
+    } satisfies ControlCmdMessage);
+    const forwarded = await alicePeer.nextJson<ControlCmdMessage>();
+    assert.deepEqual(forwarded.command, command);
+  }
+
+  // 6. Malformed in-session mouse_move_relative, block_input, and whiteboard (including >256 points) rejected
+  const oversizedPoints = Array.from({ length: 257 }, (_, i) => ({ x: i * 0.001, y: 0.5 }));
+  const invalidInSessionCommands: unknown[] = [
+    { action: "mouse_move_relative", dx: Number.NaN, dy: 5 },
+    { action: "mouse_move_relative", dx: "10", dy: 5 },
+    { action: "block_input", enabled: "yes" },
+    { action: "whiteboard", op: "erase" },
+    { action: "whiteboard", op: "stroke" },
+    { action: "whiteboard", op: "clear", stroke: validStroke },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s-big", color: "#fff", width: 3, points: oversizedPoints },
+    },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s-empty", color: "#fff", width: 3, points: [] },
+    },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s-color", color: "c".repeat(25), width: 3, points: [{ x: 1, y: 2 }] },
+    },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s-w0", color: "#fff", width: 0, points: [{ x: 1, y: 2 }] },
+    },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s-w33", color: "#fff", width: 33, points: [{ x: 1, y: 2 }] },
+    },
+    {
+      action: "whiteboard",
+      op: "stroke",
+      stroke: { id: "s-nan", color: "#fff", width: 4, points: [{ x: Number.NaN, y: 2 }] },
+    },
+  ];
+
+  for (const badCmd of invalidInSessionCommands) {
+    seq += 1;
+    aliceCtrl.sendJson({
+      type: "control.cmd",
+      sessionId: "sess-wave23-01",
+      deviceId: "alice-mac-relay",
+      seq,
+      command: badCmd,
+    });
+    const err = await aliceCtrl.nextJson<ErrorMessage>();
+    assert.equal(err.type, "error");
+    assert.equal(err.code, "INVALID_MESSAGE");
+  }
+
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(alicePeer.drainJson().length, 0);
+
+  // 7. Verify audit log entries for control.block_input and control.wol
+  await server.hub.audit.flush();
+  const auditEntries = (await fsp.readFile(path.join(dataDir, "audit.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as { event: string; detail?: string; deviceId?: string; sessionId?: string });
+
+  const blockAudit = auditEntries.filter((e) => e.event === "control.block_input");
+  assert.deepEqual(
+    blockAudit.map((e) => e.detail),
+    ["on", "off"],
+  );
+  assert.ok(blockAudit.every((e) => e.deviceId === "alice-mac-relay" && e.sessionId === "sess-wave23-01"));
+
+  const wolAudit = auditEntries.filter((e) => e.event === "control.wol");
+  assert.equal(wolAudit.length, 2);
+  assert.ok(wolAudit.every((e) => e.deviceId === "alice-mac-relay" && e.detail === "sessionless"));
+});
+
+test("Wave 2+3 in-session wire messages: cursor.update, chat.msg (bidirectional + sender role enforcement + >4KB rejection), session.pending, and session.permissions", async (t) => {
+  const { server, baseUrl, wsUrl } = await startServer({
+    registrationInviteCode: "WAVE23-WIRE-INVITE",
+  });
+  t.after(() => server.close());
+
+  const regOwner = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "wire_owner",
+      password: "wire-owner-password-1",
+      inviteCode: "WAVE23-WIRE-INVITE",
+    }),
+  });
+  assert.equal(regOwner.status, 201);
+  const { token: ownerToken } = (await regOwner.json()) as { token: string };
+
+  const regOther = await fetch(`${baseUrl}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: "wire_intruder",
+      password: "wire-intruder-pass-1",
+      inviteCode: "WAVE23-WIRE-INVITE",
+    }),
+  });
+  assert.equal(regOther.status, 201);
+  const { token: intruderToken } = (await regOther.json()) as { token: string };
+
+  const agent = await TestWsClient.connect(wsUrl);
+  const ctrl = await TestWsClient.connect(wsUrl);
+  const intruder = await TestWsClient.connect(wsUrl);
+  t.after(async () => {
+    await Promise.all([agent.close(), ctrl.close(), intruder.close()]);
+  });
+
+  agent.sendJson(
+    makeAgentRegister({
+      deviceId: "desk-wire-01",
+      deviceSecret: "desk-wire-secret-01",
+      authToken: ownerToken,
+      deviceType: "desktop",
+      osPlatform: "darwin",
+      accessMode: "confirm",
+    }),
+  );
+  await agent.nextJson<AgentRegisteredMessage>();
+
+  ctrl.sendJson({
+    type: "controller.auth",
+    authToken: ownerToken,
+    clientId: "ctrl-wire-01",
+  });
+  await ctrl.nextJson<ControllerAuthedMessage>();
+
+  intruder.sendJson({
+    type: "controller.auth",
+    authToken: intruderToken,
+    clientId: "ctrl-intruder-01",
+  });
+  await intruder.nextJson<ControllerAuthedMessage>();
+
+  // Request session -> agent sends session.pending -> then session.permissions -> then session.ready
+  ctrl.sendJson({
+    type: "session.request",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    preferredTransport: "webrtc",
+    quality: DESKTOP_QUALITY_PRESETS.balanced,
+  } satisfies SessionRequestMessage);
+  await agent.nextJson<SessionRequestMessage>();
+
+  // 1. session.pending (agent -> controller)
+  agent.sendJson({
+    type: "session.pending",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    message: "Waiting for host user approval",
+  } satisfies SessionPendingMessage);
+  const pending = await ctrl.nextJson<SessionPendingMessage>();
+  assert.deepEqual(pending, {
+    type: "session.pending",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    message: "Waiting for host user approval",
+  });
+
+  // Controller must not be allowed to send session.pending
+  ctrl.sendJson({
+    type: "session.pending",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+  });
+  const ctrlPendingErr = await ctrl.nextJson<ErrorMessage>();
+  assert.equal(ctrlPendingErr.code, "UNAUTHORIZED");
+
+  // 2. session.permissions (agent -> controller)
+  agent.sendJson({
+    type: "session.permissions",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    permissions: {
+      keyboard: true,
+      mouse: true,
+      clipboard: true,
+      fileTransfer: false,
+      audio: true,
+      terminal: false,
+    },
+  } satisfies SessionPermissionsMessage);
+  const perms = await ctrl.nextJson<SessionPermissionsMessage>();
+  assert.deepEqual(perms, {
+    type: "session.permissions",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    permissions: {
+      keyboard: true,
+      mouse: true,
+      clipboard: true,
+      fileTransfer: false,
+      audio: true,
+      terminal: false,
+    },
+  });
+
+  // Invalid permissions field type rejected
+  agent.sendJson({
+    type: "session.permissions",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    permissions: { keyboard: "yes" },
+  });
+  const badPermErr = await agent.nextJson<ErrorMessage>();
+  assert.equal(badPermErr.code, "INVALID_MESSAGE");
+
+  // Controller cannot send session.permissions
+  ctrl.sendJson({
+    type: "session.permissions",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    permissions: { terminal: true },
+  });
+  const ctrlPermErr = await ctrl.nextJson<ErrorMessage>();
+  assert.equal(ctrlPermErr.code, "UNAUTHORIZED");
+
+  // Complete session handshake
+  agent.sendJson({
+    type: "session.ready",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    transport: "webrtc",
+    screenWidth: 2560,
+    screenHeight: 1440,
+    rotation: 0,
+  } satisfies SessionReadyMessage);
+  await ctrl.nextJson<SessionReadyMessage>();
+
+  // 3. cursor.update (agent -> controller, validated CursorShape)
+  agent.sendJson({
+    type: "cursor.update",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    shape: "ew-resize",
+    visible: true,
+  } satisfies CursorUpdateMessage);
+  const cursorMsg = await ctrl.nextJson<CursorUpdateMessage>();
+  assert.deepEqual(cursorMsg, {
+    type: "cursor.update",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    shape: "ew-resize",
+    visible: true,
+  });
+
+  // Invalid cursor shape rejected
+  agent.sendJson({
+    type: "cursor.update",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    shape: "custom-svg-cursor",
+  });
+  const badCursorErr = await agent.nextJson<ErrorMessage>();
+  assert.equal(badCursorErr.code, "INVALID_MESSAGE");
+
+  // Controller cannot send cursor.update
+  ctrl.sendJson({
+    type: "cursor.update",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    shape: "pointer",
+  });
+  const ctrlCursorErr = await ctrl.nextJson<ErrorMessage>();
+  assert.equal(ctrlCursorErr.code, "UNAUTHORIZED");
+
+  // 4. chat.msg bidirectional + strict sender role enforcement + >4KB rejection
+  // Controller tries to spoof sender="host" -> Hub forces sender="controller"
+  ctrl.sendJson({
+    type: "chat.msg",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    id: "chat-01",
+    sender: "host",
+    senderName: "Alice",
+    text: "Hello host!",
+    ts: 1700000001000,
+  } satisfies ChatMessage);
+  const chatToAgent = await agent.nextJson<ChatMessage>();
+  assert.deepEqual(chatToAgent, {
+    type: "chat.msg",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    id: "chat-01",
+    sender: "controller",
+    senderName: "Alice",
+    text: "Hello host!",
+    ts: 1700000001000,
+  });
+
+  // Agent tries to spoof sender="controller" -> Hub forces sender="host"
+  agent.sendJson({
+    type: "chat.msg",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    id: "chat-02",
+    sender: "controller",
+    senderName: "Mac Studio",
+    text: "Hello controller!",
+    ts: 1700000002000,
+  } satisfies ChatMessage);
+  const chatToCtrl = await ctrl.nextJson<ChatMessage>();
+  assert.deepEqual(chatToCtrl, {
+    type: "chat.msg",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    id: "chat-02",
+    sender: "host",
+    senderName: "Mac Studio",
+    text: "Hello controller!",
+    ts: 1700000002000,
+  });
+
+  // Exact 4096-byte message succeeds
+  ctrl.sendJson({
+    type: "chat.msg",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    id: "chat-4k-ok",
+    sender: "controller",
+    text: "a".repeat(4096),
+    ts: 1700000003000,
+  } satisfies ChatMessage);
+  const chat4k = await agent.nextJson<ChatMessage>();
+  assert.equal(chat4k.id, "chat-4k-ok");
+  assert.equal(chat4k.text.length, 4096);
+  assert.equal(chat4k.sender, "controller");
+
+  // >4096-byte ASCII and multi-byte UTF-8 messages rejected with INVALID_MESSAGE
+  for (const oversizedText of ["a".repeat(4097), "中".repeat(1366)]) {
+    ctrl.sendJson({
+      type: "chat.msg",
+      sessionId: "sess-wire-01",
+      deviceId: "desk-wire-01",
+      id: "chat-too-big",
+      sender: "controller",
+      text: oversizedText,
+      ts: 1700000004000,
+    });
+    const tooBigErr = await ctrl.nextJson<ErrorMessage>();
+    assert.equal(tooBigErr.code, "INVALID_MESSAGE");
+  }
+
+  // Intruder cannot inject chat.msg into another user's session
+  intruder.sendJson({
+    type: "chat.msg",
+    sessionId: "sess-wire-01",
+    deviceId: "desk-wire-01",
+    id: "chat-intruder",
+    sender: "controller",
+    text: "spoofed",
+    ts: 1700000005000,
+  });
+  const intruderErr = await intruder.nextJson<ErrorMessage>();
+  assert.equal(intruderErr.code, "UNAUTHORIZED");
+
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(agent.drainJson().length, 0);
+  assert.equal(ctrl.drainJson().length, 0);
 });

@@ -9,8 +9,53 @@
  */
 
 type HostPlatform = "darwin" | "win32" | "linux";
+type HostAccessMode = "auto" | "confirm";
 type TransportMode = "webrtc" | "ws-jpeg";
 type VideoCodecPreference = "auto" | "h264" | "hevc" | "av1" | "vp9";
+type HostCursorShape =
+  | "default"
+  | "pointer"
+  | "text"
+  | "crosshair"
+  | "move"
+  | "ew-resize"
+  | "ns-resize"
+  | "nwse-resize"
+  | "nesw-resize"
+  | "grab"
+  | "grabbing"
+  | "not-allowed"
+  | "wait"
+  | "none";
+
+interface HostSessionPermissions {
+  keyboard?: boolean;
+  mouse?: boolean;
+  clipboard?: boolean;
+  fileTransfer?: boolean;
+  audio?: boolean;
+  terminal?: boolean;
+}
+
+interface HostChatMessagePayload {
+  id: string;
+  sender: "controller" | "host";
+  senderName?: string;
+  text: string;
+  ts: number;
+}
+
+type HostTerminalEventPayload =
+  | { type: "term_ready"; termId: string; shell: string; cwd: string }
+  | { type: "term_data"; termId: string; data: string }
+  | { type: "term_exit"; termId: string; exitCode: number }
+  | { type: "term_error"; termId: string; error: string };
+
+interface HostSessionApprovalResult {
+  approved: boolean;
+  permissions: HostSessionPermissions;
+  reason?: string;
+}
 
 interface HostDisplayInfo {
   id: string;
@@ -43,6 +88,10 @@ interface HostWorkerConfig {
   permissions: HostPermissions;
   audioCaptureEnabled: boolean;
   privacyScreenActive: boolean;
+  accessMode: HostAccessMode;
+  blockInputActive: boolean;
+  lanIp: string;
+  macAddresses: string[];
 }
 
 type HostWorkerCommand =
@@ -55,6 +104,10 @@ type HostWorkerCommand =
     }
   | { type: "clipboard-push"; text: string }
   | { type: "privacy-state-changed"; active: boolean }
+  | { type: "block-input-changed"; active: boolean }
+  | { type: "cursor-update"; shape: HostCursorShape; visible: boolean }
+  | { type: "terminal-event"; event: HostTerminalEventPayload }
+  | { type: "chat-send"; message: HostChatMessagePayload }
   | { type: "disconnect-session"; reason?: string }
   | { type: "stop" };
 
@@ -67,6 +120,7 @@ interface HostWorkerStateReport {
   activeDisplayId?: string;
   lastError?: string | null;
   privacyScreenActive?: boolean;
+  blockInputActive?: boolean;
   audioEnabled?: boolean;
 }
 
@@ -127,9 +181,32 @@ interface HostWorkerBridge {
   setPrivacyScreen(
     enabled: boolean,
   ): Promise<{ ok: boolean; active: boolean; message?: string }>;
+  setBlockInput(
+    enabled: boolean,
+  ): Promise<{ ok: boolean; active: boolean; message?: string }>;
   executePower(
     operation: string,
   ): Promise<{ ok: boolean; message?: string }>;
+  sendWol(
+    macAddress: string,
+    broadcastIp?: string,
+  ): Promise<{ ok: boolean; error?: string }>;
+  whiteboardCommand(
+    op: "stroke" | "clear",
+    stroke?: unknown,
+    displayId?: string,
+  ): Promise<{ ok: boolean; message?: string }>;
+  terminalCommand(
+    sessionId: string,
+    cmd: Record<string, unknown>,
+  ): Promise<{ ok: boolean; error?: string }>;
+  terminalCloseAll(sessionId: string): void;
+  requestSessionApproval(sessionId: string): Promise<HostSessionApprovalResult>;
+  cancelSessionApproval(sessionId: string): void;
+  incomingChatMessage(
+    sessionId: string,
+    message: HostChatMessagePayload,
+  ): void;
   fileTransferText(sessionId: string, text: string): Promise<string | null>;
   fileTransferBinary(sessionId: string, chunk: Uint8Array): Promise<string | null>;
   fileTransferAbort(sessionId: string): void;
@@ -178,6 +255,50 @@ const DEFAULT_QUALITY: StreamQuality = {
   codec: "auto",
   audioEnabled: true,
 };
+
+const FULL_SESSION_PERMISSIONS: Readonly<Required<HostSessionPermissions>> = {
+  keyboard: true,
+  mouse: true,
+  clipboard: true,
+  fileTransfer: true,
+  audio: true,
+  terminal: true,
+};
+
+function normalizeSessionPermissions(
+  raw?: HostSessionPermissions | null,
+): Required<HostSessionPermissions> {
+  return {
+    keyboard: raw?.keyboard !== false,
+    mouse: raw?.mouse !== false,
+    clipboard: raw?.clipboard !== false,
+    fileTransfer: raw?.fileTransfer !== false,
+    audio: raw?.audio !== false,
+    terminal: raw?.terminal !== false,
+  };
+}
+
+function isMouseControlAction(action: string): boolean {
+  return (
+    action === "mouse_move" ||
+    action === "mouse_move_relative" ||
+    action === "mouse_down" ||
+    action === "mouse_up" ||
+    action === "mouse_wheel" ||
+    action === "tap" ||
+    action === "long_press" ||
+    action === "swipe" ||
+    action === "touch_down" ||
+    action === "touch_move" ||
+    action === "touch_up" ||
+    action === "pinch" ||
+    action === "wake"
+  );
+}
+
+function isKeyboardControlAction(action: string): boolean {
+  return action === "key_event" || action === "key" || action === "text";
+}
 
 const textEncoder = new TextEncoder();
 
@@ -414,6 +535,7 @@ class DesktopHostWorkerEngine {
   private controlDc: RTCDataChannel | null = null;
   private pointerDc: RTCDataChannel | null = null;
   private fileDc: RTCDataChannel | null = null;
+  private terminalDc: RTCDataChannel | null = null;
   private remoteDescriptionReady = false;
   private pendingRemoteIce: RTCIceCandidateInit[] = [];
   private fileMsgChain: Promise<void> = Promise.resolve();
@@ -423,6 +545,11 @@ class DesktopHostWorkerEngine {
   // Pro runtime state
   private audioEnabled = true;
   private privacyScreenActive = false;
+  private blockInputActive = false;
+  private sessionPermissions: Required<HostSessionPermissions> = {
+    ...FULL_SESSION_PERMISSIONS,
+  };
+  private pendingApprovalSessionId: string | null = null;
 
   // Adaptive QoS state
   private qosTimer: ReturnType<typeof setInterval> | null = null;
@@ -443,6 +570,7 @@ class DesktopHostWorkerEngine {
   public start(config: HostWorkerConfig): void {
     this.config = config;
     this.privacyScreenActive = Boolean(config.privacyScreenActive);
+    this.blockInputActive = Boolean(config.blockInputActive);
     this.audioEnabled = Boolean(config.audioCaptureEnabled);
     this.running = true;
     this.reconnectAttempt = 0;
@@ -458,12 +586,14 @@ class DesktopHostWorkerEngine {
     this.teardownSession(true, "host_stopped");
     this.closeSocket();
     this.privacyScreenActive = false;
+    this.blockInputActive = false;
     this.report({
       status: "stopped",
       activeSessionId: null,
       activeTransport: null,
       lastError: null,
       privacyScreenActive: false,
+      blockInputActive: false,
     });
   }
 
@@ -475,6 +605,7 @@ class DesktopHostWorkerEngine {
     const prevAudioCapture = this.config?.audioCaptureEnabled;
     this.config = config;
     this.privacyScreenActive = Boolean(config.privacyScreenActive);
+    this.blockInputActive = Boolean(config.blockInputActive);
 
     if (!this.running) {
       return;
@@ -511,8 +642,80 @@ class DesktopHostWorkerEngine {
     this.sendTelemetry();
   }
 
+  public onBlockInputChanged(active: boolean): void {
+    this.blockInputActive = Boolean(active);
+    this.sendTelemetry();
+  }
+
+  public pushCursorUpdate(shape: HostCursorShape, visible: boolean): void {
+    if (!this.sessionId || !this.config) {
+      return;
+    }
+    const payload: Record<string, unknown> = {
+      type: "cursor.update",
+      sessionId: this.sessionId,
+      deviceId: this.config.deviceId,
+      shape,
+      visible,
+    };
+    if (
+      this.pointerDc &&
+      this.pointerDc.readyState === "open" &&
+      this.pointerDc.bufferedAmount < 64 * 1024
+    ) {
+      try {
+        this.pointerDc.send(JSON.stringify(payload));
+        return;
+      } catch {
+        // Fall back to WS
+      }
+    }
+    this.sendJson(payload);
+  }
+
+  public pushTerminalEvent(event: HostTerminalEventPayload): void {
+    if (!this.sessionId || !this.terminalDc || this.terminalDc.readyState !== "open") {
+      return;
+    }
+    try {
+      this.terminalDc.send(JSON.stringify(event));
+    } catch {
+      // Ignore closed channel
+    }
+  }
+
+  public sendHostChatMessage(message: HostChatMessagePayload): void {
+    if (!this.sessionId || !this.config) {
+      return;
+    }
+    const payload: Record<string, unknown> = {
+      type: "chat.msg",
+      sessionId: this.sessionId,
+      deviceId: this.config.deviceId,
+      id: message.id,
+      sender: "host",
+      ...(message.senderName ? { senderName: message.senderName } : {}),
+      text: message.text,
+      ts: message.ts,
+    };
+    if (this.controlDc && this.controlDc.readyState === "open") {
+      try {
+        this.controlDc.send(JSON.stringify(payload));
+        return;
+      } catch {
+        // Fall through to Relay WS
+      }
+    }
+    this.sendJson(payload);
+  }
+
   public pushLocalClipboard(text: string): void {
-    if (!this.sessionId || !this.config || !text) {
+    if (
+      !this.sessionId ||
+      !this.config ||
+      !text ||
+      this.sessionPermissions.clipboard === false
+    ) {
       return;
     }
     const payload: Record<string, unknown> = {
@@ -551,7 +754,11 @@ class DesktopHostWorkerEngine {
   }
 
   private isAudioEffectivelyEnabled(): boolean {
-    if (!this.config?.audioCaptureEnabled || !this.audioEnabled) {
+    if (
+      !this.config?.audioCaptureEnabled ||
+      !this.audioEnabled ||
+      this.sessionPermissions.audio === false
+    ) {
       return false;
     }
     if (!this.mediaStream) {
@@ -563,7 +770,11 @@ class DesktopHostWorkerEngine {
 
   private syncAudioTrackMuteState(): void {
     if (!this.mediaStream) return;
-    const allow = Boolean(this.config?.audioCaptureEnabled && this.audioEnabled);
+    const allow = Boolean(
+      this.config?.audioCaptureEnabled &&
+        this.audioEnabled &&
+        this.sessionPermissions.audio !== false,
+    );
     for (const track of this.mediaStream.getAudioTracks()) {
       track.enabled = allow;
     }
@@ -585,6 +796,13 @@ class DesktopHostWorkerEngine {
       fileManager: true,
       powerControl: true,
       highRefresh: true,
+      remoteTerminal: true,
+      relativeMouse: true,
+      cursorSync: true,
+      blockInput: true,
+      wolRelay: true,
+      whiteboard: true,
+      chat: true,
     };
   }
 
@@ -733,6 +951,12 @@ class DesktopHostWorkerEngine {
         screenOn: true,
         privacyScreenActive: this.privacyScreenActive,
         audioEnabled: this.isAudioEffectivelyEnabled(),
+        blockInputActive: this.blockInputActive,
+        accessMode: this.config.accessMode,
+        ...(this.config.lanIp ? { lanIp: this.config.lanIp } : {}),
+        ...(this.config.macAddresses.length > 0
+          ? { macAddresses: this.config.macAddresses }
+          : {}),
         displays: this.config.displays,
         activeDisplayId: activeDisp.id,
         capabilities: this.buildCapabilities(),
@@ -829,6 +1053,12 @@ class DesktopHostWorkerEngine {
       rotation: 0,
       privacyScreenActive: this.privacyScreenActive,
       audioEnabled: this.isAudioEffectivelyEnabled(),
+      blockInputActive: this.blockInputActive,
+      accessMode: this.config.accessMode,
+      ...(this.config.lanIp ? { lanIp: this.config.lanIp } : {}),
+      ...(this.config.macAddresses.length > 0
+        ? { macAddresses: this.config.macAddresses }
+        : {}),
       displays: this.config.displays,
       activeDisplayId: disp.id,
       capabilities: this.buildCapabilities(),
@@ -878,7 +1108,10 @@ class DesktopHostWorkerEngine {
 
       case "session.end": {
         const sid = typeof msg.sessionId === "string" ? msg.sessionId : "";
-        if (sid && sid === this.sessionId) {
+        if (
+          sid &&
+          (sid === this.sessionId || sid === this.pendingApprovalSessionId)
+        ) {
           this.teardownSession(false);
           if (this.running && this.registered) {
             this.report({
@@ -924,9 +1157,20 @@ class DesktopHostWorkerEngine {
       }
 
       case "clipboard.sync": {
+        if (this.sessionPermissions.clipboard === false) {
+          break;
+        }
         const text = typeof msg.text === "string" ? msg.text : "";
         if (text) {
           void getBridge()?.setClipboard(text);
+        }
+        break;
+      }
+
+      case "chat.msg": {
+        const sid = typeof msg.sessionId === "string" ? msg.sessionId : "";
+        if (!sid || sid === this.sessionId) {
+          this.handleIncomingChatMsg(sid || this.sessionId || "", msg);
         }
         break;
       }
@@ -962,7 +1206,10 @@ class DesktopHostWorkerEngine {
       throw new Error("Host worker bridge unavailable");
     }
 
-    const wantAudio = Boolean(this.config?.audioCaptureEnabled);
+    const wantAudio = Boolean(
+      this.config?.audioCaptureEnabled &&
+        this.sessionPermissions.audio !== false,
+    );
     const sourceRes = await bridge.requestCaptureSource(displayId, wantAudio);
     if (!sourceRes.ok || !sourceRes.sourceId || !sourceRes.display) {
       throw new Error(
@@ -1041,7 +1288,9 @@ class DesktopHostWorkerEngine {
     }
 
     const allowAudioNow = Boolean(
-      this.config?.audioCaptureEnabled && this.audioEnabled,
+      this.config?.audioCaptureEnabled &&
+        this.audioEnabled &&
+        this.sessionPermissions.audio !== false,
     );
     for (const audioTrack of stream.getAudioTracks()) {
       audioTrack.enabled = allowAudioNow;
@@ -1105,8 +1354,62 @@ class DesktopHostWorkerEngine {
     const gen = ++this.sessionGeneration;
     this.sessionId = sid;
     this.activeQuality = quality;
+    this.sessionPermissions = { ...FULL_SESSION_PERMISSIONS };
+
+    // Host approval gate when accessMode === "confirm"
+    if (this.config.accessMode === "confirm") {
+      this.pendingApprovalSessionId = sid;
+      this.sendJson({
+        type: "session.pending",
+        sessionId: sid,
+        deviceId: this.config.deviceId,
+        message: "等待被控端确认接入请求...",
+      });
+
+      const bridge = getBridge();
+      const approval: HostSessionApprovalResult = bridge
+        ? await bridge.requestSessionApproval(sid)
+        : { approved: false, permissions: {}, reason: "rejected_by_host" };
+
+      if (
+        this.sessionGeneration !== gen ||
+        !this.running ||
+        this.ws?.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
+
+      this.pendingApprovalSessionId = null;
+
+      if (!approval.approved) {
+        this.sessionId = null;
+        this.sendJson({
+          type: "session.end",
+          sessionId: sid,
+          deviceId: this.config.deviceId,
+          reason: "rejected_by_host",
+        });
+        this.report({
+          status: this.registered ? "online" : "stopped",
+          activeSessionId: null,
+          activeTransport: null,
+        });
+        return;
+      }
+
+      this.sessionPermissions = normalizeSessionPermissions(approval.permissions);
+      this.sendJson({
+        type: "session.permissions",
+        sessionId: sid,
+        deviceId: this.config.deviceId,
+        permissions: this.sessionPermissions,
+      });
+    }
+
     this.audioEnabled = Boolean(
-      this.config.audioCaptureEnabled && quality.audioEnabled !== false,
+      this.config.audioCaptureEnabled &&
+        quality.audioEnabled !== false &&
+        this.sessionPermissions.audio !== false,
     );
 
     let captured: {
@@ -1390,6 +1693,36 @@ class DesktopHostWorkerEngine {
         if (this.sessionGeneration !== gen) return;
         const payload = event.data;
 
+        if (this.sessionPermissions.fileTransfer === false) {
+          if (typeof payload === "string" && dc.readyState === "open") {
+            try {
+              const obj = JSON.parse(payload) as Record<string, unknown>;
+              const t = typeof obj.type === "string" ? obj.type : "";
+              if (t.startsWith("fs_")) {
+                dc.send(
+                  JSON.stringify({
+                    type: "fs_error",
+                    reqId: typeof obj.reqId === "string" ? obj.reqId : "",
+                    error: "被控端未授予文件传输权限",
+                  }),
+                );
+              } else {
+                dc.send(
+                  JSON.stringify({
+                    type: "file.error",
+                    transferId:
+                      typeof obj.transferId === "string" ? obj.transferId : "",
+                    error: "被控端未授予文件传输权限",
+                  }),
+                );
+              }
+            } catch {
+              // Ignore malformed message
+            }
+          }
+          return;
+        }
+
         if (typeof payload === "string") {
           const fsHandled = this.tryDispatchRemoteFsMessage(sid, gen, dc, payload);
           if (fsHandled) {
@@ -1426,6 +1759,80 @@ class DesktopHostWorkerEngine {
           this.fileDc = null;
           this.cancelledDownloads.clear();
           getBridge()?.fileTransferAbort(sid);
+        }
+      };
+      return;
+    }
+
+    if (label === "terminal") {
+      this.terminalDc = dc;
+      dc.onmessage = (event) => {
+        if (this.sessionGeneration !== gen || typeof event.data !== "string") {
+          return;
+        }
+        let parsed: Record<string, unknown>;
+        try {
+          const obj: unknown = JSON.parse(event.data);
+          if (!obj || typeof obj !== "object") return;
+          parsed = obj as Record<string, unknown>;
+        } catch {
+          return;
+        }
+        const type = typeof parsed.type === "string" ? parsed.type : "";
+        const termId = typeof parsed.termId === "string" ? parsed.termId : "";
+        if (
+          type !== "term_open" &&
+          type !== "term_data" &&
+          type !== "term_resize" &&
+          type !== "term_close"
+        ) {
+          return;
+        }
+        if (this.sessionPermissions.terminal === false) {
+          if (dc.readyState === "open") {
+            try {
+              dc.send(
+                JSON.stringify({
+                  type: "term_error",
+                  termId,
+                  error: "被控端未授予远程终端权限",
+                }),
+              );
+            } catch {
+              // Ignore closed channel
+            }
+          }
+          return;
+        }
+        void getBridge()
+          ?.terminalCommand(sid, parsed)
+          .then((res) => {
+            if (
+              res &&
+              !res.ok &&
+              res.error &&
+              this.terminalDc === dc &&
+              dc.readyState === "open"
+            ) {
+              try {
+                dc.send(
+                  JSON.stringify({
+                    type: "term_error",
+                    termId,
+                    error: res.error,
+                  }),
+                );
+              } catch {
+                // Ignore
+              }
+            }
+          })
+          .catch(() => undefined);
+      };
+      dc.onclose = () => {
+        if (this.terminalDc === dc) {
+          this.terminalDc = null;
+          getBridge()?.terminalCloseAll(sid);
         }
       };
     }
@@ -1711,11 +2118,43 @@ class DesktopHostWorkerEngine {
       }
       void this.handleControlCmd(obj, true);
     } else if (obj.type === "clipboard.sync") {
+      if (this.sessionPermissions.clipboard === false) {
+        return;
+      }
       const text = typeof obj.text === "string" ? obj.text : "";
       if (text) {
         void getBridge()?.setClipboard(text);
       }
+    } else if (obj.type === "chat.msg") {
+      this.handleIncomingChatMsg(sid, obj);
     }
+  }
+
+  private handleIncomingChatMsg(
+    sid: string,
+    obj: Record<string, unknown>,
+  ): void {
+    const rawText = typeof obj.text === "string" ? obj.text.trim() : "";
+    if (!rawText) return;
+    const id =
+      typeof obj.id === "string" && obj.id.trim()
+        ? obj.id.trim().slice(0, 64)
+        : `msg-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const senderName =
+      typeof obj.senderName === "string" && obj.senderName.trim()
+        ? obj.senderName.trim().slice(0, 64)
+        : undefined;
+    const ts =
+      typeof obj.ts === "number" && Number.isFinite(obj.ts)
+        ? obj.ts
+        : Date.now();
+    getBridge()?.incomingChatMessage(sid, {
+      id,
+      sender: "controller",
+      ...(senderName ? { senderName } : {}),
+      text: rawText.slice(0, 2000),
+      ts,
+    });
   }
 
   private async handleRemoteOffer(sid: string, sdp: string): Promise<void> {
@@ -2392,14 +2831,22 @@ class DesktopHostWorkerEngine {
       }
 
       case "clipboard_set": {
-        const text = typeof cmd.text === "string" ? cmd.text : "";
-        ok = (await getBridge()?.setClipboard(text)) ?? false;
+        if (this.sessionPermissions.clipboard === false) {
+          ok = false;
+          detail = "被控端未授予剪贴板权限";
+        } else {
+          const text = typeof cmd.text === "string" ? cmd.text : "";
+          ok = (await getBridge()?.setClipboard(text)) ?? false;
+        }
         break;
       }
 
       case "audio_toggle": {
         const enabled = Boolean(cmd.enabled);
-        if (enabled && !this.config?.audioCaptureEnabled) {
+        if (enabled && this.sessionPermissions.audio === false) {
+          ok = false;
+          detail = "被控端未授予音频权限";
+        } else if (enabled && !this.config?.audioCaptureEnabled) {
           ok = false;
           detail = "被控电脑已关闭系统音频采集";
         } else {
@@ -2427,6 +2874,44 @@ class DesktopHostWorkerEngine {
         break;
       }
 
+      case "block_input": {
+        const enabled = Boolean(cmd.enabled);
+        const res = await getBridge()?.setBlockInput(enabled);
+        ok = res?.ok ?? false;
+        detail = res?.message;
+        this.blockInputActive = res?.active ?? false;
+        this.sendTelemetry();
+        break;
+      }
+
+      case "wol": {
+        const macAddress = typeof cmd.macAddress === "string" ? cmd.macAddress : "";
+        const broadcastIp =
+          typeof cmd.broadcastIp === "string" ? cmd.broadcastIp : undefined;
+        const res = await getBridge()?.sendWol(macAddress, broadcastIp);
+        ok = res?.ok ?? false;
+        detail = res?.error;
+        break;
+      }
+
+      case "whiteboard": {
+        const op =
+          cmd.op === "clear" ? "clear" : cmd.op === "stroke" ? "stroke" : "";
+        if (!op) {
+          ok = false;
+          detail = "不支持的白板操作";
+        } else {
+          const res = await getBridge()?.whiteboardCommand(
+            op,
+            cmd.stroke,
+            this.activeDisplay?.id ?? this.config?.activeDisplayId,
+          );
+          ok = res?.ok ?? false;
+          detail = res?.message;
+        }
+        break;
+      }
+
       case "power": {
         const operation =
           typeof cmd.operation === "string"
@@ -2441,6 +2926,19 @@ class DesktopHostWorkerEngine {
       }
 
       default: {
+        if (isMouseControlAction(action) && this.sessionPermissions.mouse === false) {
+          ok = false;
+          detail = "被控端未授予鼠标控制权限";
+          break;
+        }
+        if (
+          isKeyboardControlAction(action) &&
+          this.sessionPermissions.keyboard === false
+        ) {
+          ok = false;
+          detail = "被控端未授予键盘控制权限";
+          break;
+        }
         const res = await getBridge()?.dispatchControl(
           cmd,
           this.activeDisplay?.id ?? this.config?.activeDisplayId,
@@ -2453,7 +2951,10 @@ class DesktopHostWorkerEngine {
 
     // Avoid flooding ACKs for high-frequency pointer moves when ok
     const isHighFreq =
-      action === "mouse_move" || action === "touch_move" || action === "mouse_wheel";
+      action === "mouse_move" ||
+      action === "mouse_move_relative" ||
+      action === "touch_move" ||
+      action === "mouse_wheel";
     if (ok && isHighFreq) {
       return;
     }
@@ -2493,7 +2994,7 @@ class DesktopHostWorkerEngine {
     this.audioSender = null;
     this.cancelledDownloads.clear();
 
-    for (const dc of [this.controlDc, this.pointerDc, this.fileDc]) {
+    for (const dc of [this.controlDc, this.pointerDc, this.fileDc, this.terminalDc]) {
       if (dc) {
         dc.onopen = null;
         dc.onmessage = null;
@@ -2508,6 +3009,7 @@ class DesktopHostWorkerEngine {
     this.controlDc = null;
     this.pointerDc = null;
     this.fileDc = null;
+    this.terminalDc = null;
 
     const pc = this.pc;
     this.pc = null;
@@ -2526,8 +3028,11 @@ class DesktopHostWorkerEngine {
 
   private teardownSession(notifyPeer: boolean, reason?: string): void {
     const prevSid = this.sessionId;
+    const prevPendingSid = this.pendingApprovalSessionId;
     this.sessionGeneration += 1;
     this.sessionId = null;
+    this.pendingApprovalSessionId = null;
+    this.sessionPermissions = { ...FULL_SESSION_PERMISSIONS };
     this.activeTransport = null;
     this.activeCaptureBounds = null;
     this.stopWsJpegLoop();
@@ -2544,8 +3049,13 @@ class DesktopHostWorkerEngine {
       this.mediaStream = null;
     }
 
+    if (prevPendingSid) {
+      getBridge()?.cancelSessionApproval(prevPendingSid);
+    }
+
     if (prevSid) {
       getBridge()?.fileTransferAbort(prevSid);
+      getBridge()?.terminalCloseAll(prevSid);
       if (notifyPeer && this.config && this.ws?.readyState === WebSocket.OPEN) {
         this.sendJson({
           type: "session.end",
@@ -2579,6 +3089,18 @@ if (bridge) {
         break;
       case "privacy-state-changed":
         engine.onPrivacyStateChanged(command.active);
+        break;
+      case "block-input-changed":
+        engine.onBlockInputChanged(command.active);
+        break;
+      case "cursor-update":
+        engine.pushCursorUpdate(command.shape, command.visible);
+        break;
+      case "terminal-event":
+        engine.pushTerminalEvent(command.event);
+        break;
+      case "chat-send":
+        engine.sendHostChatMessage(command.message);
         break;
       case "disconnect-session":
         engine.disconnectSession(command.reason);

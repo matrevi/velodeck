@@ -127,6 +127,27 @@ function cloneCapabilities(cap: DeviceCapabilities): DeviceCapabilities {
   if (cap.highRefresh !== undefined) {
     copy.highRefresh = Boolean(cap.highRefresh);
   }
+  if (cap.remoteTerminal !== undefined) {
+    copy.remoteTerminal = Boolean(cap.remoteTerminal);
+  }
+  if (cap.relativeMouse !== undefined) {
+    copy.relativeMouse = Boolean(cap.relativeMouse);
+  }
+  if (cap.cursorSync !== undefined) {
+    copy.cursorSync = Boolean(cap.cursorSync);
+  }
+  if (cap.blockInput !== undefined) {
+    copy.blockInput = Boolean(cap.blockInput);
+  }
+  if (cap.wolRelay !== undefined) {
+    copy.wolRelay = Boolean(cap.wolRelay);
+  }
+  if (cap.whiteboard !== undefined) {
+    copy.whiteboard = Boolean(cap.whiteboard);
+  }
+  if (cap.chat !== undefined) {
+    copy.chat = Boolean(cap.chat);
+  }
   return copy;
 }
 
@@ -186,6 +207,18 @@ export function cloneDeviceSummary(summary: DeviceSummary): DeviceSummary {
   }
   if (summary.audioEnabled !== undefined) {
     copy.audioEnabled = summary.audioEnabled;
+  }
+  if (summary.blockInputActive !== undefined) {
+    copy.blockInputActive = summary.blockInputActive;
+  }
+  if (summary.accessMode !== undefined) {
+    copy.accessMode = summary.accessMode;
+  }
+  if (Array.isArray(summary.macAddresses)) {
+    copy.macAddresses = summary.macAddresses.filter((mac): mac is string => typeof mac === "string");
+  }
+  if (summary.lanIp !== undefined) {
+    copy.lanIp = summary.lanIp;
   }
   if (summary.directUrl !== undefined) {
     copy.directUrl = summary.directUrl;

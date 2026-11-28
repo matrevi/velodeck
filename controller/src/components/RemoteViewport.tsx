@@ -9,11 +9,14 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
+  Circle,
   Clipboard,
   ClipboardCopy,
   CornerDownLeft,
+  Crosshair,
   Delete,
   Download,
+  Eye,
   EyeOff,
   FileUp,
   FolderOpen,
@@ -22,23 +25,30 @@ import {
   Home,
   Keyboard,
   Layers,
+  Loader2,
   Lock,
   LogOut,
   Maximize2,
+  MessageSquare,
   Monitor,
   Moon,
   MousePointer2,
   MousePointerClick,
   Package,
+  PanelTopClose,
+  PenTool,
   Pin,
   Plus,
   Power,
   RefreshCw,
   RotateCw,
   Send,
+  ShieldAlert,
   SlidersHorizontal,
   Smartphone,
+  Square,
   Sun,
+  Terminal,
   Trash2,
   Unlock,
   Upload,
@@ -54,6 +64,7 @@ import {
 import {
   DESKTOP_QUALITY_PRESETS,
   type ControlCommand,
+  type CursorShape,
   type DesktopPowerOperation,
   type DeviceSummary,
   type MediaFrame,
@@ -62,9 +73,24 @@ import {
   type StreamQuality,
   type TransportMode,
   type VideoCodecPreference,
+  type WhiteboardStroke,
 } from "@velodeck/protocol";
 import { DesktopShortcutBar } from "./DesktopShortcutBar";
+import {
+  FloatingEdgeToolbar,
+  getNextViewStyle,
+  getViewStyleLabel,
+  loadChromeMode,
+  loadViewStyle,
+  saveChromeMode,
+  saveViewStyle,
+  type ViewportChromeMode,
+  type ViewportViewStyle,
+} from "./FloatingEdgeToolbar";
 import { RemoteFileBrowser } from "./RemoteFileBrowser";
+import { RemoteTerminalSheet } from "./RemoteTerminalSheet";
+import { SessionChatDrawer } from "./SessionChatDrawer";
+import { WhiteboardLayer } from "./WhiteboardLayer";
 import {
   getDesktopBridge,
   isDesktopApp,
@@ -72,6 +98,22 @@ import {
   type DesktopWindowPreset,
   type DesktopWindowState,
 } from "../desktop/bridge";
+import {
+  detectLocalOsPlatform,
+  formatDesktopOsShortLabel,
+  isCrossOsDesktopPair,
+  loadKeyboardMappingMode,
+  mapKeyboardEventForTarget,
+  saveKeyboardMappingMode,
+  toDesktopOsPlatform,
+  type DesktopOsPlatform,
+  type KeyboardMappingMode,
+} from "../desktop/keymap";
+import {
+  SessionRecorder,
+  formatRecordingDuration,
+  triggerRecordingDownload,
+} from "../desktop/recorder";
 import {
   GestureRecognizer,
   clientPointToNormalized,
@@ -110,6 +152,8 @@ interface RemoteViewportProps {
   onOpenNewWindow?: () => Promise<void> | void;
   onShowToast?: (level: "info" | "warn" | "error", text: string) => void;
   suppressKeyboard?: boolean;
+  isActiveTab?: boolean;
+  hasTabBar?: boolean;
   onExit: () => void;
 }
 
@@ -126,7 +170,9 @@ type UtilityPanel =
   | "files"
   | "shortcuts"
   | "quality"
-  | "more";
+  | "more"
+  | "terminal"
+  | "chat";
 
 type VideoElementWithRVFC = HTMLVideoElement & {
   requestVideoFrameCallback?: (cb: () => void) => number;
@@ -178,6 +224,28 @@ function mapMouseButton(button: number): MouseButton | null {
   if (button === 1) return "middle";
   if (button === 2) return "right";
   return null;
+}
+
+function mapRemoteCursorToCss(shape: CursorShape, visible: boolean): string {
+  if (!visible || shape === "none") return "none";
+  switch (shape) {
+    case "pointer":
+    case "text":
+    case "crosshair":
+    case "move":
+    case "ew-resize":
+    case "ns-resize":
+    case "nwse-resize":
+    case "nesw-resize":
+    case "grab":
+    case "grabbing":
+    case "not-allowed":
+    case "wait":
+    case "default":
+      return shape;
+    default:
+      return "default";
+  }
 }
 
 function isLocalDesktopAppShortcut(e: KeyboardEvent): boolean {
@@ -234,9 +302,17 @@ const DESKTOP_MOD_SHORTCUT_KEYS = new Set([
   "l",
   "r",
   "k",
+  "o",
+  "n",
   "b",
   "i",
   "u",
+  "/",
+  "=",
+  "-",
+  "0",
+  "[",
+  "]",
 ]);
 
 function shouldPreventDefaultForDesktopKey(e: KeyboardEvent): boolean {
@@ -279,11 +355,14 @@ export function RemoteViewport({
   onOpenNewWindow,
   onShowToast,
   suppressKeyboard = false,
+  isActiveTab = true,
+  hasTabBar = false,
   onExit,
 }: RemoteViewportProps) {
   const desktopBridge = useMemo(() => getDesktopBridge(), []);
   const desktopApp = isDesktopApp();
   const macDesktop = isMacDesktop();
+  const localOs = useMemo(() => detectLocalOsPlatform(), []);
 
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const mediaStageRef = useRef<HTMLDivElement | null>(null);
@@ -293,6 +372,11 @@ export function RemoteViewport({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragCounterRef = useRef(0);
   const apkAbortRef = useRef<AbortController | null>(null);
+  const recorderRef = useRef<SessionRecorder | null>(null);
+  const onShowToastRef = useRef(onShowToast);
+  onShowToastRef.current = onShowToast;
+  const isActiveTabRef = useRef(isActiveTab);
+  isActiveTabRef.current = isActiveTab;
 
   const resolvedApiBase = useMemo(
     () =>
@@ -303,6 +387,24 @@ export function RemoteViewport({
 
   const [dockExpanded, setDockExpanded] = useState(false);
   const [activePanel, setActivePanel] = useState<UtilityPanel>("none");
+  const [chromeMode, setChromeMode] = useState<ViewportChromeMode>(() =>
+    loadChromeMode(),
+  );
+  const [viewStyle, setViewStyle] = useState<ViewportViewStyle>(() =>
+    loadViewStyle(),
+  );
+  const [viewOnly, setViewOnly] = useState(false);
+  const [pointerLocked, setPointerLocked] = useState(false);
+  const [whiteboardActive, setWhiteboardActive] = useState(false);
+  const [keymapMode, setKeymapMode] = useState<KeyboardMappingMode>(() =>
+    loadKeyboardMappingMode(),
+  );
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingDurationSec, setRecordingDurationSec] = useState(0);
+  const [mediaSize, setMediaSize] = useState<{ width: number; height: number }>({
+    width: 0,
+    height: 0,
+  });
   const [ripples, setRipples] = useState<TouchRipple[]>([]);
   const [mouseNavHint, setMouseNavHint] = useState<string | null>(null);
   const [screenshotCopied, setScreenshotCopied] = useState(false);
@@ -375,7 +477,42 @@ export function RemoteViewport({
   const kbTextTimerRef = useRef<number | null>(null);
 
   const isDesktopTarget = device?.deviceType === "desktop";
+  const targetDesktopOs = toDesktopOsPlatform(device?.osPlatform);
   const targetDeviceId = clientState.activeDeviceId ?? device?.deviceId ?? "";
+
+  const sessionPerms = clientState.sessionPermissions;
+  const canMouse = sessionPerms?.mouse !== false;
+  const canKeyboard = sessionPerms?.keyboard !== false;
+  const canClipboard = sessionPerms?.clipboard !== false;
+  const canFileTransfer = sessionPerms?.fileTransfer !== false;
+  const canAudio = sessionPerms?.audio !== false;
+  const canTerminal = sessionPerms?.terminal !== false;
+  const restrictedPermLabels = useMemo(() => {
+    if (!sessionPerms) return [] as string[];
+    const list: string[] = [];
+    if (sessionPerms.mouse === false) list.push("鼠标");
+    if (sessionPerms.keyboard === false) list.push("键盘");
+    if (sessionPerms.clipboard === false) list.push("剪贴板");
+    if (sessionPerms.fileTransfer === false) list.push("文件");
+    if (sessionPerms.audio === false) list.push("声音");
+    if (sessionPerms.terminal === false) list.push("终端");
+    return list;
+  }, [sessionPerms]);
+
+  const viewOnlyRef = useRef(viewOnly);
+  viewOnlyRef.current = viewOnly;
+  const pointerLockedRef = useRef(pointerLocked);
+  pointerLockedRef.current = pointerLocked;
+  const pointerLockShortcutActiveRef = useRef(false);
+  const viewOnlyPanRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startScrollLeft: number;
+    startScrollTop: number;
+    startPanX: number;
+    startPanY: number;
+  } | null>(null);
 
   const virtualCursorRef = useRef<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
   const viewZoomRef = useRef(1);
@@ -518,9 +655,38 @@ export function RemoteViewport({
   }, [isDesktopTarget]);
 
   const markVideoFrameReady = useCallback(() => {
+    const video = videoRef.current;
+    if (video && video.videoWidth > 0 && video.videoHeight > 0) {
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      setMediaSize((prev) =>
+        prev.width === w && prev.height === h ? prev : { width: w, height: h },
+      );
+    }
     if (!hasVideoFrameRef.current) {
       hasVideoFrameRef.current = true;
       setHasVideoFrame(true);
+    }
+  }, []);
+
+  const stopAndSaveRecording = useCallback(async (reasonPrefix?: string) => {
+    const recorder = recorderRef.current;
+    if (!recorder) {
+      setIsRecording(false);
+      setRecordingDurationSec(0);
+      return;
+    }
+    const result = await recorder.stop();
+    setIsRecording(false);
+    setRecordingDurationSec(0);
+    if (result && result.blob.size > 0) {
+      triggerRecordingDownload(result.blob, result.fileName);
+      onShowToastRef.current?.(
+        "info",
+        reasonPrefix
+          ? `${reasonPrefix}，录屏已保存 (${result.fileName})`
+          : `录屏已保存 (${result.fileName})`,
+      );
     }
   }, []);
 
@@ -569,8 +735,37 @@ export function RemoteViewport({
       rippleTimersRef.current.clear();
       apkAbortRef.current?.abort();
       apkAbortRef.current = null;
+      if (recorderRef.current?.isRecording()) {
+        void recorderRef.current.stop().then((result) => {
+          if (result && result.blob.size > 0) {
+            triggerRecordingDownload(result.blob, result.fileName);
+            onShowToastRef.current?.("info", `录屏已保存 (${result.fileName})`);
+          }
+        });
+      }
     };
   }, []);
+
+  // Auto-stop and save local recording if session ends, errors out, or drops its media stream
+  useEffect(() => {
+    if (!isRecording) return;
+    const streamDropped =
+      clientState.activeTransport === "webrtc" && clientState.mediaStream === null;
+    const sessionLost =
+      clientState.sessionStatus === "ended" ||
+      clientState.sessionStatus === "error" ||
+      clientState.socketStatus === "error";
+    if (streamDropped || sessionLost) {
+      void stopAndSaveRecording("会话已断开");
+    }
+  }, [
+    isRecording,
+    clientState.activeTransport,
+    clientState.mediaStream,
+    clientState.sessionStatus,
+    clientState.socketStatus,
+    stopAndSaveRecording,
+  ]);
 
   // Reset first-frame gates on sessionId / mediaStream change (P0-2)
   useEffect(() => {
@@ -610,8 +805,10 @@ export function RemoteViewport({
   // Auto two-way clipboard sync for desktop targets: remote -> local system clipboard
   useEffect(() => {
     if (
+      !isActiveTab ||
       !isDesktopTarget ||
       !autoClipboardSync ||
+      !canClipboard ||
       !clientState.remoteClipboard ||
       clientState.lastClipboardAt <= 0 ||
       clientState.lastClipboardAt === lastSyncedClipAtRef.current
@@ -653,8 +850,10 @@ export function RemoteViewport({
       cancelled = true;
     };
   }, [
+    isActiveTab,
     isDesktopTarget,
     autoClipboardSync,
+    canClipboard,
     clientState.remoteClipboard,
     clientState.lastClipboardAt,
     desktopBridge,
@@ -664,14 +863,24 @@ export function RemoteViewport({
   // Auto two-way clipboard sync (Electron Desktop App only, zero prompt): local -> remote on focus
   useEffect(() => {
     if (
+      !isActiveTab ||
+      viewOnly ||
       !isDesktopTarget ||
       !autoClipboardSync ||
+      !canClipboard ||
       typeof desktopBridge?.readClipboardText !== "function"
     ) {
       return;
     }
     const syncLocalToRemote = async () => {
-      if (clientState.sessionStatus !== "streaming" || !targetDeviceId) return;
+      if (
+        !isActiveTabRef.current ||
+        viewOnlyRef.current ||
+        clientState.sessionStatus !== "streaming" ||
+        !targetDeviceId
+      ) {
+        return;
+      }
       try {
         const localText = await desktopBridge.readClipboardText!();
         if (
@@ -691,8 +900,11 @@ export function RemoteViewport({
       window.removeEventListener("focus", syncLocalToRemote);
     };
   }, [
+    isActiveTab,
+    viewOnly,
     isDesktopTarget,
     autoClipboardSync,
+    canClipboard,
     desktopBridge,
     client,
     targetDeviceId,
@@ -806,6 +1018,7 @@ export function RemoteViewport({
           if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
             canvas.width = bitmap.width;
             canvas.height = bitmap.height;
+            setMediaSize({ width: bitmap.width, height: bitmap.height });
           }
           const ctx = getCanvasContext(canvas);
           ctx?.drawImage(bitmap, 0, 0);
@@ -824,6 +1037,7 @@ export function RemoteViewport({
               if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
                 canvas.width = img.naturalWidth;
                 canvas.height = img.naturalHeight;
+                setMediaSize({ width: img.naturalWidth, height: img.naturalHeight });
               }
               const ctx = getCanvasContext(canvas);
               ctx?.drawImage(img, 0, 0);
@@ -945,28 +1159,197 @@ export function RemoteViewport({
     resetDesktopInputs,
   ]);
 
-  // P1-5: Reset recognizer & desktop held inputs on overlay appearance or session switch
+  // P1-5: Reset recognizer & desktop held inputs on overlay appearance, viewOnly lock, tab switch, or session switch
   useEffect(() => {
-    if (showOverlay) {
+    if (showOverlay || viewOnly || !isActiveTab) {
       recognizer.reset();
       if (isDesktopTarget) {
         resetDesktopInputs();
       }
+      viewOnlyPanRef.current = null;
     }
-  }, [showOverlay, recognizer, isDesktopTarget, resetDesktopInputs]);
+  }, [showOverlay, viewOnly, isActiveTab, recognizer, isDesktopTarget, resetDesktopInputs]);
 
   useEffect(() => {
     recognizer.reset();
     if (isDesktopTarget) {
       resetDesktopInputs();
     }
+    setWhiteboardActive(false);
   }, [clientState.sessionId, recognizer, isDesktopTarget, resetDesktopInputs]);
 
-  // Desktop target: Full keydown / keyup forwarding with modifier state & local Electron shortcut guard
+  const exitPointerLockSafe = useCallback(() => {
+    if (
+      typeof document !== "undefined" &&
+      document.pointerLockElement &&
+      typeof document.exitPointerLock === "function"
+    ) {
+      try {
+        document.exitPointerLock();
+      } catch {
+        // Ignore exit errors
+      }
+    }
+  }, []);
+
+  // Track browser Pointer Lock state (Feature 8: Relative Mouse Lock Mode)
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const handleLockChange = () => {
+      const locked = Boolean(
+        surfaceRef.current && document.pointerLockElement === surfaceRef.current,
+      );
+      setPointerLocked(locked);
+    };
+    const handleLockError = () => {
+      setPointerLocked(false);
+      onShowToastRef.current?.("warn", "无法锁定相对鼠标指针，请先点击画面后重试");
+    };
+    document.addEventListener("pointerlockchange", handleLockChange);
+    document.addEventListener("pointerlockerror", handleLockError);
+    return () => {
+      document.removeEventListener("pointerlockchange", handleLockChange);
+      document.removeEventListener("pointerlockerror", handleLockError);
+      if (surfaceRef.current && document.pointerLockElement === surfaceRef.current) {
+        exitPointerLockSafe();
+      }
+    };
+  }, [exitPointerLockSafe]);
+
+  // Automatically release pointer lock & whiteboard on viewOnly, modal open, tab switch, permission block, or session end
+  useEffect(() => {
+    const shouldReleaseLock =
+      !isDesktopTarget ||
+      !isStreamingReady ||
+      !isActiveTab ||
+      viewOnly ||
+      !canMouse ||
+      whiteboardActive ||
+      activePanel !== "none";
+    if (
+      shouldReleaseLock &&
+      typeof document !== "undefined" &&
+      surfaceRef.current &&
+      document.pointerLockElement === surfaceRef.current
+    ) {
+      exitPointerLockSafe();
+    }
+  }, [
+    isDesktopTarget,
+    isStreamingReady,
+    isActiveTab,
+    viewOnly,
+    canMouse,
+    whiteboardActive,
+    activePanel,
+    exitPointerLockSafe,
+  ]);
+
+  useEffect(() => {
+    if (!isDesktopTarget || !isStreamingReady || viewOnly) {
+      setWhiteboardActive(false);
+    }
+  }, [isDesktopTarget, isStreamingReady, viewOnly]);
+
+  useEffect(() => {
+    if (activePanel === "terminal" && !canTerminal) {
+      setActivePanel("none");
+    }
+  }, [activePanel, canTerminal]);
+
+  const handleTogglePointerLock = useCallback(() => {
+    if (!isDesktopTarget || !isStreamingReady) return;
+    if (viewOnlyRef.current) {
+      onShowToastRef.current?.("warn", "当前为只读观察模式，点击「只读观察」解除锁定");
+      return;
+    }
+    if (!canMouse) {
+      onShowToastRef.current?.("warn", "被控端当前会话未开放鼠标控制权限");
+      return;
+    }
+    if (pointerLockedRef.current) {
+      exitPointerLockSafe();
+      return;
+    }
+    const surface = surfaceRef.current;
+    if (!surface || typeof surface.requestPointerLock !== "function") {
+      onShowToastRef.current?.("warn", "当前浏览器不支持相对鼠标锁定 (Pointer Lock)");
+      return;
+    }
+    setWhiteboardActive(false);
+    setActivePanel("none");
+    try {
+      const maybePromise = surface.requestPointerLock() as unknown as Promise<void> | undefined;
+      if (maybePromise && typeof maybePromise.catch === "function") {
+        void maybePromise.catch(() => {
+          setPointerLocked(false);
+          onShowToastRef.current?.("warn", "无法锁定相对鼠标指针");
+        });
+      }
+    } catch {
+      setPointerLocked(false);
+      onShowToastRef.current?.("warn", "无法锁定相对鼠标指针");
+    }
+  }, [isDesktopTarget, isStreamingReady, canMouse, exitPointerLockSafe]);
+
+  // Shortcut Cmd/Ctrl+G toggles Relative Mouse Lock mode on desktop targets
   useEffect(() => {
     if (
       !isDesktopTarget ||
       !isStreamingReady ||
+      !isActiveTab ||
+      viewOnly ||
+      activePanel !== "none" ||
+      suppressKeyboard
+    ) {
+      return;
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (isEditableTarget(e.target) || e.isComposing) return;
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "g"
+      ) {
+        e.preventDefault();
+        e.stopPropagation();
+        pointerLockShortcutActiveRef.current = true;
+        handleTogglePointerLock();
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (pointerLockShortcutActiveRef.current && e.key.toLowerCase() === "g") {
+        pointerLockShortcutActiveRef.current = false;
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+      pointerLockShortcutActiveRef.current = false;
+    };
+  }, [
+    isDesktopTarget,
+    isStreamingReady,
+    isActiveTab,
+    viewOnly,
+    activePanel,
+    suppressKeyboard,
+    handleTogglePointerLock,
+  ]);
+
+  // Desktop target: Full keydown / keyup forwarding with cross-OS smart keymap, modifier state & local Electron shortcut guard
+  useEffect(() => {
+    if (
+      !isDesktopTarget ||
+      !isStreamingReady ||
+      !isActiveTab ||
+      viewOnly ||
+      !canKeyboard ||
       (activePanel !== "none" && activePanel !== "shortcuts") ||
       suppressKeyboard
     ) {
@@ -1004,11 +1387,8 @@ export function RemoteViewport({
         e.preventDefault();
       }
 
-      desktopPressedKeysRef.current.set(e.code, { code: e.code, key: e.key });
-      client.sendCommand(
+      const mapped = mapKeyboardEventForTarget(
         {
-          action: "key_event",
-          phase: "down",
           code: e.code,
           key: e.key,
           modifiers: {
@@ -1017,6 +1397,23 @@ export function RemoteViewport({
             shift: e.shiftKey,
             meta: e.metaKey,
           },
+        },
+        localOs,
+        targetDesktopOs,
+        keymapMode,
+      );
+
+      desktopPressedKeysRef.current.set(e.code, {
+        code: mapped.code,
+        key: mapped.key,
+      });
+      client.sendCommand(
+        {
+          action: "key_event",
+          phase: "down",
+          code: mapped.code,
+          key: mapped.key,
+          modifiers: mapped.modifiers,
         },
         targetDeviceId,
       );
@@ -1038,11 +1435,10 @@ export function RemoteViewport({
         e.preventDefault();
       }
 
+      const tracked = desktopPressedKeysRef.current.get(e.code);
       desktopPressedKeysRef.current.delete(e.code);
-      client.sendCommand(
+      const mapped = mapKeyboardEventForTarget(
         {
-          action: "key_event",
-          phase: "up",
           code: e.code,
           key: e.key,
           modifiers: {
@@ -1051,6 +1447,19 @@ export function RemoteViewport({
             shift: e.shiftKey,
             meta: e.metaKey,
           },
+        },
+        localOs,
+        targetDesktopOs,
+        keymapMode,
+      );
+
+      client.sendCommand(
+        {
+          action: "key_event",
+          phase: "up",
+          code: tracked?.code ?? mapped.code,
+          key: tracked?.key ?? mapped.key,
+          modifiers: mapped.modifiers,
         },
         targetDeviceId,
       );
@@ -1081,8 +1490,14 @@ export function RemoteViewport({
     isDesktopTarget,
     desktopApp,
     isStreamingReady,
+    isActiveTab,
+    viewOnly,
+    canKeyboard,
     activePanel,
     suppressKeyboard,
+    localOs,
+    targetDesktopOs,
+    keymapMode,
   ]);
 
   // P1-6: Android target desktop keyboard & paste shortcuts when streaming and no utility sheet is open
@@ -1090,6 +1505,8 @@ export function RemoteViewport({
     if (
       isDesktopTarget ||
       !isStreamingReady ||
+      !isActiveTab ||
+      viewOnly ||
       activePanel !== "none" ||
       suppressKeyboard
     ) {
@@ -1186,6 +1603,8 @@ export function RemoteViewport({
     targetDeviceId,
     isDesktopTarget,
     isStreamingReady,
+    isActiveTab,
+    viewOnly,
     activePanel,
     dockExpanded,
     suppressKeyboard,
@@ -1246,11 +1665,24 @@ export function RemoteViewport({
     }, 850);
   }
 
-  function buildPointerInput(e: React.PointerEvent<HTMLDivElement>) {
+  function isPointerOnScrollbar(e: React.PointerEvent<HTMLDivElement>): boolean {
+    if (viewStyle !== "original") return false;
     const surface = surfaceRef.current;
-    if (!surface) return null;
+    if (!surface) return false;
     const rect = surface.getBoundingClientRect();
+    return (
+      e.clientX > rect.left + surface.clientWidth ||
+      e.clientY > rect.top + surface.clientHeight
+    );
+  }
+
+  function buildPointerInput(e: React.PointerEvent<HTMLDivElement>) {
+    const targetEl = getActiveMediaElement();
+    if (!targetEl) return null;
+    const rect = targetEl.getBoundingClientRect();
     const content = getRenderedContentSize();
+    const effectiveW = viewStyle === "adaptive" ? content.width : rect.width;
+    const effectiveH = viewStyle === "adaptive" ? content.height : rect.height;
     return {
       pointerId: e.pointerId,
       clientX: e.clientX,
@@ -1261,16 +1693,13 @@ export function RemoteViewport({
         width: rect.width,
         height: rect.height,
       },
-      contentW: content.width,
-      contentH: content.height,
+      contentW: effectiveW,
+      contentH: effectiveH,
       timestampMs: Date.now(),
     };
   }
 
   function getActiveMediaElement(): HTMLElement | null {
-    if (!isDesktopTarget) {
-      return surfaceRef.current;
-    }
     if (
       clientState.activeTransport === "webrtc" &&
       clientState.mediaStream !== null &&
@@ -1342,16 +1771,18 @@ export function RemoteViewport({
   ): NormalizedPoint | null {
     const targetEl = getActiveMediaElement();
     if (!targetEl) return null;
-    // When zoomed/panned, video/canvas/mediaStage getBoundingClientRect() automatically reflects
-    // the CSS transform (translate3d + scale), mapping every tap/click to the exact desktop pixel.
+    // When zoomed/panned or scrolled in 1:1 original mode, getBoundingClientRect() automatically reflects
+    // both CSS transform (translate3d + scale) and scroll offsets, mapping every tap/click to the exact pixel.
     const rect = targetEl.getBoundingClientRect();
     const content = getRenderedContentSize();
+    const effectiveW = viewStyle === "adaptive" ? content.width : rect.width;
+    const effectiveH = viewStyle === "adaptive" ? content.height : rect.height;
     return clientPointToNormalized(
       clientX,
       clientY,
       { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
-      content.width,
-      content.height,
+      effectiveW,
+      effectiveH,
     );
   }
 
@@ -1362,6 +1793,12 @@ export function RemoteViewport({
     const targetEl = getActiveMediaElement();
     if (!targetEl) return null;
     const rect = targetEl.getBoundingClientRect();
+    if (viewStyle !== "adaptive") {
+      return {
+        rect,
+        contentBox: { left: 0, top: 0, width: rect.width, height: rect.height },
+      };
+    }
     const content = getRenderedContentSize();
     const contentBox = computeContentRect(
       rect.width,
@@ -1851,7 +2288,37 @@ export function RemoteViewport({
       void videoEl.play().catch(() => undefined);
     }
 
+    if (isPointerOnScrollbar(e)) {
+      return;
+    }
+
+    // View-Only Mode: block ALL remote pointer inputs while still allowing local drag-to-pan in 1:1 / zoomed mode
+    if (viewOnly) {
+      const surface = surfaceRef.current;
+      if (
+        surface &&
+        (viewStyle === "original" || (isDesktopTarget && viewZoomRef.current > 1.01))
+      ) {
+        viewOnlyPanRef.current = {
+          pointerId: e.pointerId,
+          startX: e.clientX,
+          startY: e.clientY,
+          startScrollLeft: surface.scrollLeft,
+          startScrollTop: surface.scrollTop,
+          startPanX: viewPanRef.current.x,
+          startPanY: viewPanRef.current.y,
+        };
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+          // Ignore capture failures
+        }
+      }
+      return;
+    }
+
     if (isDesktopTarget) {
+      if (!canMouse) return;
       if (e.pointerType === "touch") {
         handleDesktopTouchDown(e);
         return;
@@ -1859,14 +2326,19 @@ export function RemoteViewport({
       if (!isStreamingReady) return;
       const button = mapMouseButton(e.button);
       if (!button) return;
-      const norm = mapClientToNormalized(e.clientX, e.clientY);
+      const isLocked = pointerLockedRef.current;
+      const norm = isLocked
+        ? { ...lastDesktopPointerNormRef.current, inside: true }
+        : mapClientToNormalized(e.clientX, e.clientY);
       if (!norm || !norm.inside) return;
 
       e.preventDefault();
-      try {
-        e.currentTarget.setPointerCapture(e.pointerId);
-      } catch {
-        // Ignore capture failures
+      if (!isLocked) {
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+          // Ignore capture failures
+        }
       }
 
       flushDesktopMoveTimer();
@@ -1938,12 +2410,45 @@ export function RemoteViewport({
   }
 
   function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (viewOnly) {
+      const pan = viewOnlyPanRef.current;
+      if (!pan || pan.pointerId !== e.pointerId) return;
+      const dx = e.clientX - pan.startX;
+      const dy = e.clientY - pan.startY;
+      if (viewStyle === "original") {
+        const surface = surfaceRef.current;
+        if (surface) {
+          surface.scrollLeft = pan.startScrollLeft - dx;
+          surface.scrollTop = pan.startScrollTop - dy;
+        }
+      } else if (isDesktopTarget && viewZoomRef.current > 1.01) {
+        applyDesktopZoomAndPan(
+          viewZoomRef.current,
+          pan.startPanX + dx,
+          pan.startPanY + dy,
+        );
+      }
+      return;
+    }
+
     if (isDesktopTarget) {
+      if (!canMouse) return;
       if (e.pointerType === "touch") {
         handleDesktopTouchMove(e);
         return;
       }
       if (!isStreamingReady) return;
+      if (pointerLockedRef.current) {
+        const dx = Math.round(e.movementX);
+        const dy = Math.round(e.movementY);
+        if (dx !== 0 || dy !== 0) {
+          client.sendCommand(
+            { action: "mouse_move_relative", dx, dy },
+            targetDeviceId,
+          );
+        }
+        return;
+      }
       const norm = mapClientToNormalized(e.clientX, e.clientY);
       if (!norm) return;
       if (!norm.inside && desktopPressedButtonsRef.current.size === 0) return;
@@ -1964,6 +2469,20 @@ export function RemoteViewport({
   }
 
   function handlePointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    if (viewOnly) {
+      if (viewOnlyPanRef.current?.pointerId === e.pointerId) {
+        viewOnlyPanRef.current = null;
+        try {
+          if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          }
+        } catch {
+          // Ignore release failures
+        }
+      }
+      return;
+    }
+
     if (isDesktopTarget) {
       if (e.pointerType === "touch") {
         handleDesktopTouchUp(e);
@@ -1981,9 +2500,10 @@ export function RemoteViewport({
         // Ignore release failures
       }
       if (!isStreamingReady && !hadButton) return;
-      const norm =
-        mapClientToNormalized(e.clientX, e.clientY) ??
-        lastDesktopPointerNormRef.current;
+      const norm = pointerLockedRef.current
+        ? lastDesktopPointerNormRef.current
+        : (mapClientToNormalized(e.clientX, e.clientY) ??
+          lastDesktopPointerNormRef.current);
       flushDesktopMoveTimer();
       lastDesktopPointerNormRef.current = { x: norm.x, y: norm.y };
       client.sendCommand(
@@ -2005,6 +2525,13 @@ export function RemoteViewport({
   }
 
   function handlePointerCancel(e: React.PointerEvent<HTMLDivElement>) {
+    if (viewOnly) {
+      if (viewOnlyPanRef.current?.pointerId === e.pointerId) {
+        viewOnlyPanRef.current = null;
+      }
+      return;
+    }
+
     if (isDesktopTarget) {
       if (e.pointerType === "touch") {
         handleDesktopTouchCancel(e);
@@ -2038,7 +2565,7 @@ export function RemoteViewport({
 
   function handleContextMenu(e: React.MouseEvent<HTMLDivElement>) {
     e.preventDefault();
-    if (isDesktopTarget || !isStreamingReady) return;
+    if (viewOnly || isDesktopTarget || !isStreamingReady) return;
     addRipple(e.clientX, e.clientY);
     client.sendCommand({ action: "key", key: "back" }, targetDeviceId);
     flashMouseNavHint("返回");
@@ -2047,7 +2574,7 @@ export function RemoteViewport({
   function handleAuxClick(e: React.MouseEvent<HTMLDivElement>) {
     if (e.button !== 1) return;
     e.preventDefault();
-    if (isDesktopTarget || !isStreamingReady) return;
+    if (viewOnly || isDesktopTarget || !isStreamingReady) return;
     addRipple(e.clientX, e.clientY);
     client.sendCommand({ action: "key", key: "home" }, targetDeviceId);
     flashMouseNavHint("主页");
@@ -2056,9 +2583,11 @@ export function RemoteViewport({
   // Non-passive wheel listener for remote PC targets so preventDefault blocks browser scroll/back-swipe cleanly
   const desktopWheelHandlerRef = useRef<(e: WheelEvent) => void>(() => {});
   desktopWheelHandlerRef.current = (e: WheelEvent) => {
-    if (!isStreamingReady) return;
+    if (viewOnly || !isStreamingReady || !canMouse) return;
     e.preventDefault();
-    const norm = mapClientToNormalized(e.clientX, e.clientY);
+    const norm = pointerLockedRef.current
+      ? { ...lastDesktopPointerNormRef.current, inside: true }
+      : mapClientToNormalized(e.clientX, e.clientY);
     if (!norm || !norm.inside) return;
     const modeScale = e.deltaMode === 1 ? 32 : e.deltaMode === 2 ? 400 : 1;
     const deltaX = Math.round(e.deltaX * modeScale);
@@ -2089,18 +2618,20 @@ export function RemoteViewport({
 
   // P0-3 & P0-4: Accurate letterbox wheel coordinates + normalized deltaMode + strict non-overlapping cooldown
   function handleWheel(e: React.WheelEvent<HTMLDivElement>) {
-    if (isDesktopTarget || e.ctrlKey || !isStreamingReady) return;
-    const surface = surfaceRef.current;
-    if (!surface) return;
+    if (viewOnly || isDesktopTarget || e.ctrlKey || !isStreamingReady) return;
+    const targetEl = getActiveMediaElement();
+    if (!targetEl) return;
 
-    const rect = surface.getBoundingClientRect();
+    const rect = targetEl.getBoundingClientRect();
     const content = getRenderedContentSize();
+    const effectiveW = viewStyle === "adaptive" ? content.width : rect.width;
+    const effectiveH = viewStyle === "adaptive" ? content.height : rect.height;
     const norm = clientPointToNormalized(
       e.clientX,
       e.clientY,
       { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
-      content.width,
-      content.height,
+      effectiveW,
+      effectiveH,
     );
     if (!norm.inside) return;
 
@@ -2168,23 +2699,134 @@ export function RemoteViewport({
     });
   }, []);
 
+  function guardViewOnly(): boolean {
+    if (!viewOnly) return false;
+    onShowToast?.("warn", "当前为只读观察模式，点击「只读观察」解除锁定");
+    return true;
+  }
+
+  function handleSetChromeMode(next: ViewportChromeMode) {
+    setChromeMode(next);
+    saveChromeMode(next);
+    if (next === "floating") {
+      setDockExpanded(false);
+      onShowToast?.("info", "已切换沉浸悬浮条（拖拽手柄可吸附屏幕四边）");
+    }
+  }
+
+  function handleChangeViewStyle(next: ViewportViewStyle) {
+    setViewStyle(next);
+    saveViewStyle(next);
+    if (next !== "adaptive") {
+      resetDesktopZoom();
+    }
+    const labelMap: Record<ViewportViewStyle, string> = {
+      adaptive: "适应屏幕",
+      original: "1:1 原始像素",
+      stretch: "拉伸铺满",
+    };
+    onShowToast?.("info", `画面显示已切换为「${labelMap[next]}」`);
+  }
+
+  function handleCycleViewStyle() {
+    handleChangeViewStyle(getNextViewStyle(viewStyle));
+  }
+
+  function handleToggleViewOnly() {
+    setViewOnly((prev) => {
+      const next = !prev;
+      onShowToast?.(
+        "info",
+        next
+          ? "已开启只读观察模式（仅观看/截屏/录屏，已禁止全部远控输入）"
+          : "已解除只读观察锁定，恢复远控操作",
+      );
+      return next;
+    });
+  }
+
+  function handleChangeKeymapMode(next: KeyboardMappingMode) {
+    setKeymapMode(next);
+    saveKeyboardMappingMode(next);
+    onShowToast?.(
+      "info",
+      next === "smart"
+        ? "已开启智能跨系统键位（macOS ⌘ ↔ Win/Linux Ctrl 自动适配）"
+        : "已切换为原生透传键位（不做跨系统修饰键转换）",
+    );
+  }
+
+  function handleToggleRecording() {
+    if (isRecording) {
+      void stopAndSaveRecording();
+      return;
+    }
+
+    let stream: MediaStream | null = null;
+    if (
+      clientState.mediaStream &&
+      clientState.mediaStream.getTracks().length > 0
+    ) {
+      stream = clientState.mediaStream;
+    } else if (
+      hasCanvasFrameRef.current &&
+      canvasRef.current &&
+      typeof canvasRef.current.captureStream === "function"
+    ) {
+      stream = canvasRef.current.captureStream(30);
+    }
+
+    if (!stream || stream.getTracks().length === 0) {
+      onShowToast?.("warn", "当前暂无可录制的实时画面");
+      return;
+    }
+
+    try {
+      if (!recorderRef.current) {
+        recorderRef.current = new SessionRecorder();
+      }
+      recorderRef.current.start(stream, device?.name || device?.model || "VeloDeck", {
+        onDuration: (sec) => setRecordingDurationSec(sec),
+        onError: (err) => {
+          onShowToastRef.current?.("error", err.message || "本地录屏异常中断");
+          void stopAndSaveRecording();
+        },
+      });
+      setIsRecording(true);
+      setRecordingDurationSec(0);
+      onShowToast?.("info", "已开始本地录屏，点击红色 REC 按钮即可停止并保存");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "启动本地录屏失败";
+      onShowToast?.("error", msg);
+    }
+  }
+
   function sendKey(key: RemoteKey) {
+    if (guardViewOnly()) return;
     client.sendCommand({ action: "key", key }, targetDeviceId);
   }
 
   function sendWake() {
+    if (guardViewOnly()) return;
     client.sendCommand({ action: "wake" }, targetDeviceId);
   }
 
   function sendBlackScreen(enabled: boolean) {
+    if (guardViewOnly()) return;
     client.sendCommand({ action: "black_screen", enabled }, targetDeviceId);
   }
 
   function sendForcePortrait(enabled: boolean) {
+    if (guardViewOnly()) return;
     client.sendCommand({ action: "force_portrait", enabled }, targetDeviceId);
   }
 
   function sendDesktopEscape() {
+    if (guardViewOnly()) return;
+    if (!canKeyboard) {
+      onShowToast?.("warn", "被控端当前会话未开放键盘输入权限");
+      return;
+    }
     client.sendCommand(
       {
         action: "key_event",
@@ -2208,6 +2850,11 @@ export function RemoteViewport({
   }
 
   function sendDesktopRightClick() {
+    if (guardViewOnly()) return;
+    if (!canMouse) {
+      onShowToast?.("warn", "被控端当前会话未开放鼠标控制权限");
+      return;
+    }
     const pt =
       touchInputMode === "trackpad"
         ? virtualCursorRef.current
@@ -2230,6 +2877,10 @@ export function RemoteViewport({
   }
 
   function handleToggleDesktopAudio() {
+    if (!canAudio && audioMuted) {
+      onShowToast?.("warn", "被控端当前会话未开放系统声音权限");
+      return;
+    }
     const nextMuted = !audioMuted;
     setAudioMuted(nextMuted);
     const videoEl = videoRef.current;
@@ -2252,6 +2903,7 @@ export function RemoteViewport({
   }
 
   function handleTogglePrivacyScreen() {
+    if (guardViewOnly()) return;
     const nextEnabled = !device?.privacyScreenActive;
     client.sendCommand(
       { action: "privacy_screen", enabled: nextEnabled },
@@ -2265,7 +2917,74 @@ export function RemoteViewport({
     );
   }
 
+  function handleToggleBlockInput() {
+    if (guardViewOnly()) return;
+    const nextEnabled = !device?.blockInputActive;
+    client.sendCommand(
+      { action: "block_input", enabled: nextEnabled },
+      targetDeviceId,
+    );
+    onShowToast?.(
+      "info",
+      nextEnabled
+        ? "已请求锁定远端电脑物理键鼠输入"
+        : "已请求解除远端电脑物理键鼠锁定",
+    );
+  }
+
+  function handleToggleWhiteboard() {
+    if (guardViewOnly()) return;
+    setWhiteboardActive((prev) => {
+      const next = !prev;
+      if (next) {
+        exitPointerLockSafe();
+        setActivePanel("none");
+        onShowToast?.("info", "已开启白板批注（在画面直接绘制，笔迹 8 秒后自动淡出）");
+      }
+      return next;
+    });
+  }
+
+  function handleOpenTerminal() {
+    if (!canTerminal) {
+      onShowToast?.("warn", "被控端当前会话未开放远程终端权限");
+      return;
+    }
+    exitPointerLockSafe();
+    setWhiteboardActive(false);
+    setActivePanel((p) => (p === "terminal" ? "none" : "terminal"));
+  }
+
+  function handleOpenChat() {
+    exitPointerLockSafe();
+    setActivePanel((p) => (p === "chat" ? "none" : "chat"));
+  }
+
+  const handleCommitWhiteboardStroke = useCallback(
+    (stroke: WhiteboardStroke) => {
+      client.sendCommand(
+        { action: "whiteboard", op: "stroke", stroke },
+        targetDeviceId,
+      );
+    },
+    [client, targetDeviceId],
+  );
+
+  const handleClearWhiteboard = useCallback(() => {
+    client.sendCommand({ action: "whiteboard", op: "clear" }, targetDeviceId);
+  }, [client, targetDeviceId]);
+
+  const handleMarkChatRead = useCallback(() => {
+    client.markChatRead();
+  }, [client]);
+
+  const handleSendChatMessage = useCallback(
+    (text: string) => client.sendChatMessage(text),
+    [client],
+  );
+
   function handleDesktopPowerAction(operation: DesktopPowerOperation) {
+    if (guardViewOnly()) return;
     if (operation === "lock") {
       setPendingPowerOp(null);
       client.sendCommand({ action: "power", operation: "lock" }, targetDeviceId);
@@ -2276,6 +2995,7 @@ export function RemoteViewport({
   }
 
   function handleConfirmDesktopPower() {
+    if (guardViewOnly()) return;
     if (!pendingPowerOp) return;
     const op = pendingPowerOp;
     setPendingPowerOp(null);
@@ -2407,6 +3127,7 @@ export function RemoteViewport({
   useEffect(() => {
     if (!desktopBridge) return;
     return desktopBridge.onCommand((command) => {
+      if (!isActiveTabRef.current) return;
       switch (command) {
         case "toggle-black-screen":
           desktopCommandHandlersRef.current.toggleBlackScreen();
@@ -2425,16 +3146,19 @@ export function RemoteViewport({
   }, [desktopBridge]);
 
   function handleWakeWithBlackScreen() {
+    if (guardViewOnly()) return;
     client.sendCommand({ action: "wake" }, targetDeviceId);
     client.sendCommand({ action: "black_screen", enabled: true }, targetDeviceId);
   }
 
   function handleSwipeUnlock() {
+    if (guardViewOnly()) return;
     client.sendCommand({ action: "unlock" }, targetDeviceId);
     setActivePanel("none");
   }
 
   function handleSubmitPin() {
+    if (guardViewOnly()) return;
     if (!pinValue) return;
     client.sendCommand({ action: "unlock", pin: pinValue }, targetDeviceId);
     setPinValue("");
@@ -2442,6 +3166,11 @@ export function RemoteViewport({
   }
 
   function handleSendText() {
+    if (guardViewOnly()) return;
+    if (isDesktopTarget && !canKeyboard) {
+      onShowToast?.("warn", "被控端当前会话未开放键盘输入权限");
+      return;
+    }
     if (!inputText) return;
     client.sendCommand(
       { action: "text", text: inputText, submit: submitAfterText },
@@ -2451,6 +3180,11 @@ export function RemoteViewport({
   }
 
   function handlePushClipboard() {
+    if (guardViewOnly()) return;
+    if (isDesktopTarget && !canClipboard) {
+      onShowToast?.("warn", "被控端当前会话未开放剪贴板同步权限");
+      return;
+    }
     if (!inputText) return;
     client.sendCommand({ action: "clipboard_set", text: inputText }, targetDeviceId);
   }
@@ -2634,6 +3368,10 @@ export function RemoteViewport({
     e.stopPropagation();
     dragCounterRef.current = 0;
     setIsDraggingFile(false);
+    if (!canFileTransfer) {
+      onShowToast?.("warn", "被控端当前会话未开放文件传输权限");
+      return;
+    }
     const file = e.dataTransfer.files?.[0];
     if (!file) return;
     const dropTargetDir =
@@ -2767,7 +3505,39 @@ export function RemoteViewport({
     DESKTOP_QUALITY_PRESETS[clientState.qualityPreset] ??
     DESKTOP_QUALITY_PRESETS.auto;
   const isPrivacyActive = Boolean(device?.privacyScreenActive);
+  const isBlockInputActive = Boolean(device?.blockInputActive);
   const isAudioLive = !audioMuted && clientState.hasRemoteAudio;
+  const isFloatingChrome = chromeMode === "floating";
+  const showDesktopTopBar = desktopApp && !isFloatingChrome;
+  const overlayPosClass = hasTabBar ? "absolute" : "fixed";
+  const activeSurfaceCursor =
+    isDesktopTarget &&
+    isStreamingReady &&
+    !viewOnly &&
+    !pointerLocked &&
+    !whiteboardActive
+      ? mapRemoteCursorToCss(
+          clientState.remoteCursorShape,
+          clientState.remoteCursorVisible,
+        )
+      : undefined;
+
+  const dpr =
+    typeof window !== "undefined" && window.devicePixelRatio > 0
+      ? window.devicePixelRatio
+      : 1;
+  const rawOriginalW =
+    mediaSize.width ||
+    clientState.screenWidth ||
+    (isDesktopTarget ? 1920 : 1080);
+  const rawOriginalH =
+    mediaSize.height ||
+    clientState.screenHeight ||
+    (isDesktopTarget ? 1080 : 2400);
+  const originalCssW = Math.max(1, Math.round(rawOriginalW / dpr));
+  const originalCssH = Math.max(1, Math.round(rawOriginalH / dpr));
+  const mediaObjectFitClass =
+    viewStyle === "adaptive" ? "object-contain" : "object-fill";
 
   return (
     <div
@@ -2775,52 +3545,236 @@ export function RemoteViewport({
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
-      className={`fixed inset-0 z-40 h-[100dvh] w-screen overflow-hidden bg-black text-white select-none ${
-        desktopApp ? "flex flex-col" : ""
-      }`}
+      className={`${
+        hasTabBar
+          ? "relative flex h-full w-full flex-col"
+          : `fixed inset-0 z-40 h-[100dvh] w-screen ${showDesktopTopBar ? "flex flex-col" : ""}`
+      } overflow-hidden bg-black text-white select-none`}
     >
-      {/* Native Desktop Top HUD Bar (shown ONLY in Electron Desktop App) */}
-      {desktopApp && (
+      {/* Native Desktop Top HUD Bar (shown in Electron Desktop App when chromeMode === "standard") */}
+      {showDesktopTopBar && (
         <header
-          className={`desktop-drag-region relative z-50 flex h-10 shrink-0 items-center justify-between gap-2 border-b border-[#232732] bg-[#111318] ${
-            macDesktop ? "pl-[76px] pr-2.5" : "px-3"
+          className={`${
+            hasTabBar ? "" : "desktop-drag-region"
+          } relative z-50 flex h-10 shrink-0 items-center justify-between gap-2 border-b border-[#232732] bg-[#111318] ${
+            macDesktop && !hasTabBar ? "pl-[76px] pr-2.5" : "px-3"
           }`}
         >
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <span className="hidden truncate text-xs font-medium text-zinc-300 sm:inline">
               {device?.name || "远端设备"}
             </span>
+            {viewOnly && (
+              <button
+                type="button"
+                onClick={handleToggleViewOnly}
+                title="当前为只读观察模式，点击解除锁定"
+                className="desktop-no-drag inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-amber-400/50 bg-amber-500/20 px-2 text-[11px] font-semibold text-amber-200 transition hover:bg-amber-500/30"
+              >
+                <Eye className="h-3 w-3" />
+                <span>只读观察</span>
+              </button>
+            )}
+            {isDesktopTarget && isBlockInputActive && (
+              <button
+                type="button"
+                onClick={handleToggleBlockInput}
+                title="远端物理键鼠已锁定，点击解除"
+                className="desktop-no-drag inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-amber-400/50 bg-amber-500/20 px-2 text-[11px] font-semibold text-amber-200 transition hover:bg-amber-500/30"
+              >
+                <Lock className="h-3 w-3" />
+                <span>键鼠已锁</span>
+              </button>
+            )}
+            {restrictedPermLabels.length > 0 && (
+              <span
+                title={`被控端已限制以下权限：${restrictedPermLabels.join("、")}`}
+                className="hidden h-6 shrink-0 items-center gap-1 rounded-full border border-amber-400/40 bg-amber-500/15 px-2 text-[10px] font-medium text-amber-200 md:inline-flex"
+              >
+                <ShieldAlert className="h-3 w-3 shrink-0" />
+                <span>受限: {restrictedPermLabels.join("/")}</span>
+              </span>
+            )}
           </div>
 
           <div className="desktop-no-drag flex shrink-0 items-center gap-1.5">
             <div className="flex items-center gap-1">
+              {/* Collapse to Edge-Snapping Floating Toolbar */}
+              <button
+                type="button"
+                onClick={() => handleSetChromeMode("floating")}
+                title="折叠悬浮条（沉浸模式，画面 100% 铺满）"
+                aria-label="折叠悬浮条"
+                className="desktop-no-drag inline-flex h-7 items-center gap-1 rounded-md border border-[#2C313D] bg-white/8 px-2 text-[11px] font-medium text-zinc-300 transition hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+              >
+                <PanelTopClose className="h-3.5 w-3.5 text-sky-400" />
+                <span className="hidden lg:inline">折叠悬浮条</span>
+              </button>
+
+              {/* View Style Cycle Pill: 适应 / 1:1 / 拉伸 */}
+              <button
+                type="button"
+                onClick={handleCycleViewStyle}
+                title={`画面比例：${getViewStyleLabel(viewStyle)}（点击切换 适应 / 1:1 / 拉伸）`}
+                aria-label={`切换画面比例，当前：${getViewStyleLabel(viewStyle)}`}
+                className={`desktop-no-drag inline-flex h-7 items-center gap-1 rounded-md border px-2 font-mono text-[11px] font-medium transition ${
+                  viewStyle !== "adaptive"
+                    ? "border-[#2563EB] bg-[#2563EB] text-white"
+                    : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                }`}
+              >
+                <Maximize2 className="h-3 w-3" />
+                <span>{getViewStyleLabel(viewStyle)}</span>
+              </button>
+
+              {/* View-Only Toggle */}
+              <button
+                type="button"
+                onClick={handleToggleViewOnly}
+                title={viewOnly ? "解除只读观察锁定" : "只读观察（禁止发送键鼠输入）"}
+                aria-label={viewOnly ? "解除只读观察" : "开启只读观察"}
+                aria-pressed={viewOnly}
+                className={`desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border transition ${
+                  viewOnly
+                    ? "border-amber-400/60 bg-amber-500/25 text-amber-200 hover:bg-amber-500/35"
+                    : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                }`}
+              >
+                <Eye className="h-3.5 w-3.5" />
+              </button>
+
+              {/* Local Session Recording */}
+              <button
+                type="button"
+                onClick={handleToggleRecording}
+                title={isRecording ? "停止并保存本地录屏" : "开始本地录屏"}
+                aria-label={isRecording ? "停止本地录屏" : "开始本地录屏"}
+                aria-pressed={isRecording}
+                className={`desktop-no-drag inline-flex h-7 items-center justify-center gap-1 rounded-md border transition ${
+                  isRecording
+                    ? "border-rose-500 bg-rose-600 px-2 font-mono text-[11px] font-semibold text-white hover:bg-rose-500"
+                    : "w-7 border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                }`}
+              >
+                {isRecording ? (
+                  <>
+                    <Square className="h-2.5 w-2.5 fill-current" />
+                    <span>REC {formatRecordingDuration(recordingDurationSec)}</span>
+                  </>
+                ) : (
+                  <Circle className="h-3.5 w-3.5 fill-rose-500 text-rose-500" />
+                )}
+              </button>
+
               {isDesktopTarget && (
-                <button
-                  type="button"
-                  onClick={handleToggleDesktopAudio}
-                  title={
-                    audioMuted
-                      ? "开启远端电脑系统声音"
-                      : "静音远端电脑声音"
-                  }
-                  aria-label={
-                    audioMuted ? "开启远端电脑系统声音" : "静音远端电脑声音"
-                  }
-                  aria-pressed={!audioMuted}
-                  className={`desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border transition ${
-                    !audioMuted
-                      ? isAudioLive
-                        ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-300"
-                        : "border-[#2563EB] bg-[#2563EB] text-white"
-                      : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
-                  }`}
-                >
-                  {audioMuted ? (
-                    <VolumeX className="h-3.5 w-3.5" />
-                  ) : (
-                    <Volume2 className="h-3.5 w-3.5" />
-                  )}
-                </button>
+                <>
+                  <button
+                    type="button"
+                    disabled={!isStreamingReady || viewOnly || !canMouse}
+                    onClick={handleTogglePointerLock}
+                    title={
+                      pointerLocked
+                        ? "退出相对鼠标模式 (Esc / Cmd/Ctrl+G)"
+                        : "相对鼠标锁定模式 (Cmd/Ctrl+G，适合 3D / 游戏视角)"
+                    }
+                    aria-label="切换相对鼠标模式"
+                    aria-pressed={pointerLocked}
+                    className={`desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border transition disabled:opacity-40 ${
+                      pointerLocked
+                        ? "border-[#2563EB] bg-[#2563EB] text-white"
+                        : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                    }`}
+                  >
+                    <Crosshair className="h-3.5 w-3.5" />
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={!canTerminal}
+                    onClick={handleOpenTerminal}
+                    title={
+                      canTerminal
+                        ? "打开远端交互式终端"
+                        : "被控端未开放远程终端权限"
+                    }
+                    aria-label="打开远程终端"
+                    aria-pressed={activePanel === "terminal"}
+                    className={`desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                      activePanel === "terminal"
+                        ? "border-[#2563EB] bg-[#2563EB] text-white"
+                        : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                    }`}
+                  >
+                    <Terminal className="h-3.5 w-3.5" />
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={!isStreamingReady || viewOnly}
+                    onClick={handleToggleWhiteboard}
+                    title={
+                      whiteboardActive ? "退出白板批注" : "开启远端白板批注"
+                    }
+                    aria-label="切换白板批注"
+                    aria-pressed={whiteboardActive}
+                    className={`desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border transition disabled:opacity-40 ${
+                      whiteboardActive
+                        ? "border-[#2563EB] bg-[#2563EB] text-white"
+                        : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                    }`}
+                  >
+                    <PenTool className="h-3.5 w-3.5" />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleOpenChat}
+                    title="打开会话消息"
+                    aria-label="打开会话消息"
+                    aria-pressed={activePanel === "chat"}
+                    className={`desktop-no-drag relative flex h-7 w-7 items-center justify-center rounded-md border transition ${
+                      activePanel === "chat"
+                        ? "border-[#2563EB] bg-[#2563EB] text-white"
+                        : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                    }`}
+                  >
+                    <MessageSquare className="h-3.5 w-3.5" />
+                    {clientState.unreadChatCount > 0 && (
+                      <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 font-mono text-[9px] font-bold leading-none text-white">
+                        {clientState.unreadChatCount > 99
+                          ? "99+"
+                          : clientState.unreadChatCount}
+                      </span>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleToggleDesktopAudio}
+                    title={
+                      audioMuted
+                        ? "开启远端电脑系统声音"
+                        : "静音远端电脑声音"
+                    }
+                    aria-label={
+                      audioMuted ? "开启远端电脑系统声音" : "静音远端电脑声音"
+                    }
+                    aria-pressed={!audioMuted}
+                    className={`desktop-no-drag flex h-7 w-7 items-center justify-center rounded-md border transition ${
+                      !audioMuted
+                        ? isAudioLive
+                          ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-300"
+                          : "border-[#2563EB] bg-[#2563EB] text-white"
+                        : "border-[#2C313D] bg-white/8 text-zinc-300 hover:border-[#3F4656] hover:bg-white/15 hover:text-white"
+                    }`}
+                  >
+                    {audioMuted ? (
+                      <VolumeX className="h-3.5 w-3.5" />
+                    ) : (
+                      <Volume2 className="h-3.5 w-3.5" />
+                    )}
+                  </button>
+                </>
               )}
 
               <button
@@ -2920,14 +3874,19 @@ export function RemoteViewport({
         onContextMenu={handleContextMenu}
         onAuxClick={handleAuxClick}
         onWheel={isDesktopTarget ? undefined : handleWheel}
-        className={`relative w-full overflow-hidden touch-none ${
-          desktopApp ? "min-h-0 flex-1" : "h-full"
-        }`}
+        style={activeSurfaceCursor ? { cursor: activeSurfaceCursor } : undefined}
+        className={`relative w-full ${
+          viewStyle === "original"
+            ? `overflow-auto ${viewOnly ? "cursor-grab active:cursor-grabbing" : "touch-none"}`
+            : "overflow-hidden touch-none"
+        } ${showDesktopTopBar || hasTabBar ? "min-h-0 flex-1" : "h-full"}`}
       >
         <div
           ref={mediaStageRef}
           style={
-            isDesktopTarget && (viewZoom > 1 || viewPan.x !== 0 || viewPan.y !== 0)
+            viewStyle !== "original" &&
+            isDesktopTarget &&
+            (viewZoom > 1 || viewPan.x !== 0 || viewPan.y !== 0)
               ? {
                   transform: `translate3d(${viewPan.x}px, ${viewPan.y}px, 0) scale(${viewZoom})`,
                   transformOrigin: "center center",
@@ -2935,51 +3894,68 @@ export function RemoteViewport({
                 }
               : undefined
           }
-          className="pointer-events-none absolute inset-0 h-full w-full"
+          className={
+            viewStyle === "original"
+              ? "pointer-events-none flex min-h-full min-w-full items-center justify-center"
+              : "pointer-events-none absolute inset-0 h-full w-full"
+          }
         >
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted={!isDesktopTarget || audioMuted}
-            disablePictureInPicture
-            disableRemotePlayback
-            style={{ willChange: "transform" }}
-            onLoadedMetadata={(e) => {
-              const el = e.currentTarget;
-              if (el.videoWidth > 0 && el.videoHeight > 0) {
-                markVideoFrameReady();
-              }
-            }}
-            onLoadedData={(e) => {
-              const el = e.currentTarget;
-              if (el.videoWidth > 0 && el.videoHeight > 0) {
-                markVideoFrameReady();
-              }
-            }}
-            onPlaying={(e) => {
-              const el = e.currentTarget;
-              if (el.videoWidth > 0 && el.videoHeight > 0) {
-                markVideoFrameReady();
-              }
-            }}
-            onResize={(e) => {
-              const el = e.currentTarget;
-              if (el.videoWidth > 0 && el.videoHeight > 0) {
-                markVideoFrameReady();
-              }
-            }}
-            className={`pointer-events-none absolute inset-0 h-full w-full object-contain ${
-              isWebRtcVisible ? "opacity-100" : "opacity-0"
-            }`}
-          />
+          <div
+            style={
+              viewStyle === "original"
+                ? { width: originalCssW, height: originalCssH }
+                : undefined
+            }
+            className={
+              viewStyle === "original"
+                ? "pointer-events-none relative shrink-0"
+                : "pointer-events-none absolute inset-0 h-full w-full"
+            }
+          >
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted={!isDesktopTarget || audioMuted}
+              disablePictureInPicture
+              disableRemotePlayback
+              style={{ willChange: "transform" }}
+              onLoadedMetadata={(e) => {
+                const el = e.currentTarget;
+                if (el.videoWidth > 0 && el.videoHeight > 0) {
+                  markVideoFrameReady();
+                }
+              }}
+              onLoadedData={(e) => {
+                const el = e.currentTarget;
+                if (el.videoWidth > 0 && el.videoHeight > 0) {
+                  markVideoFrameReady();
+                }
+              }}
+              onPlaying={(e) => {
+                const el = e.currentTarget;
+                if (el.videoWidth > 0 && el.videoHeight > 0) {
+                  markVideoFrameReady();
+                }
+              }}
+              onResize={(e) => {
+                const el = e.currentTarget;
+                if (el.videoWidth > 0 && el.videoHeight > 0) {
+                  markVideoFrameReady();
+                }
+              }}
+              className={`pointer-events-none absolute inset-0 h-full w-full ${mediaObjectFitClass} ${
+                isWebRtcVisible ? "opacity-100" : "opacity-0"
+              }`}
+            />
 
-          <canvas
-            ref={canvasRef}
-            className={`pointer-events-none absolute inset-0 h-full w-full object-contain ${
-              !isWebRtcVisible && hasCanvasFrame ? "opacity-100" : "opacity-0"
-            }`}
-          />
+            <canvas
+              ref={canvasRef}
+              className={`pointer-events-none absolute inset-0 h-full w-full ${mediaObjectFitClass} ${
+                !isWebRtcVisible && hasCanvasFrame ? "opacity-100" : "opacity-0"
+              }`}
+            />
+          </div>
         </div>
 
         {ripples.map((ripple) => (
@@ -3008,6 +3984,29 @@ export function RemoteViewport({
           </div>
         )}
 
+        {/* Whiteboard Annotation Layer (Desktop targets) */}
+        {isDesktopTarget && isStreamingReady && (
+          <WhiteboardLayer
+            active={whiteboardActive}
+            topOffsetPx={showDesktopTopBar ? 12 : 52}
+            mapClientToNormalized={mapClientToNormalized}
+            getSurfaceContentBox={getSurfaceContentBox}
+            onCommitStroke={handleCommitWhiteboardStroke}
+            onClearAll={handleClearWhiteboard}
+            onClose={() => setWhiteboardActive(false)}
+          />
+        )}
+
+        {/* Relative Mouse Lock Mode Floating Pill */}
+        {pointerLocked && (
+          <div className="pointer-events-none absolute inset-x-0 top-3 z-40 flex justify-center px-3">
+            <span className="inline-flex items-center gap-1.5 rounded-full border border-[#2563EB]/70 bg-[#111318] px-3 py-1 text-[11px] font-medium text-blue-200 shadow-[0_8px_24px_rgba(0,0,0,0.75)]">
+              <Crosshair className="h-3.5 w-3.5 text-[#60A5FA]" />
+              <span>相对鼠标已锁定 · 按 Esc 退出</span>
+            </span>
+          </div>
+        )}
+
         {mouseNavHint && (
           <div className="pointer-events-none absolute inset-x-0 bottom-5 z-20 flex justify-center">
             <span className="animate-sheet-up inline-flex items-center gap-1.5 rounded-md border border-[#2C313D] bg-[#111318] px-2.5 py-1 text-[11px] font-medium text-zinc-100 shadow-[0_8px_24px_rgba(0,0,0,0.65)]">
@@ -3028,8 +4027,8 @@ export function RemoteViewport({
 
       {/* Drag & Drop File Transfer Overlay */}
       {isDraggingFile && (
-        <div className="pointer-events-none fixed inset-0 z-[55] flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm">
-          <div className="flex w-full max-w-md flex-col items-center rounded-2xl border-2 border-dashed border-[#60A5FA] bg-[#111318]/95 px-6 py-8 text-center shadow-[0_24px_48px_rgba(0,0,0,0.75)]">
+        <div className={`pointer-events-none ${overlayPosClass} inset-0 z-[55] flex items-center justify-center bg-black/75 p-6`}>
+          <div className="flex w-full max-w-md flex-col items-center rounded-2xl border-2 border-dashed border-[#60A5FA] bg-[#111318] px-6 py-8 text-center shadow-[0_24px_48px_rgba(0,0,0,0.75)]">
             <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-[#2563EB]/20 text-[#60A5FA]">
               <FileUp className="h-6 w-6" />
             </div>
@@ -3053,12 +4052,12 @@ export function RemoteViewport({
         </div>
       )}
 
-      {/* Desktop Floating Zoom Control Badge (shown when zoomed > 1.05x) */}
-      {isDesktopTarget && isStreamingReady && viewZoom > 1.05 && (
+      {/* Desktop Floating Zoom Control Badge (shown when zoomed > 1.05x in adaptive mode) */}
+      {isDesktopTarget && isStreamingReady && viewStyle === "adaptive" && viewZoom > 1.05 && (
         <div
-          className="pointer-events-none fixed left-3 top-0 z-50 flex items-center gap-1.5"
+          className={`pointer-events-none ${overlayPosClass} left-3 top-0 z-50 flex items-center gap-1.5`}
           style={{
-            paddingTop: desktopApp
+            paddingTop: showDesktopTopBar
               ? "3.25rem"
               : "max(0.75rem, env(safe-area-inset-top))",
           }}
@@ -3108,46 +4107,96 @@ export function RemoteViewport({
         </div>
       )}
 
-      {/* Web/Mobile Quick Audio Toggle Pill for Desktop Targets */}
-      {isDesktopTarget && isStreamingReady && !desktopApp && viewZoom <= 1.05 && (
-        <div
-          className="pointer-events-none fixed left-3 top-0 z-50"
-          style={{ paddingTop: "max(0.75rem, env(safe-area-inset-top))" }}
-        >
-          <button
-            type="button"
-            onClick={handleToggleDesktopAudio}
-            aria-label={audioMuted ? "开启远端电脑声音" : "静音远端电脑声音"}
-            aria-pressed={!audioMuted}
-            className={`pointer-events-auto inline-flex h-8 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-medium shadow-[0_8px_24px_rgba(0,0,0,0.55)] transition ${
-              !audioMuted
-                ? isAudioLive
-                  ? "border-emerald-500/50 bg-[#111318] text-emerald-300"
-                  : "border-[#2563EB] bg-[#2563EB] text-white"
-                : "border-[#2C313D] bg-[#111318] text-zinc-300 hover:border-[#3F4656]"
-            }`}
+      {/* Web/Mobile Top-Left Quick Status Pills (View-Only Unlock, Live REC Stop, Restricted Perms, Unread Chat, Desktop Audio) */}
+      {!showDesktopTopBar &&
+        !isFloatingChrome &&
+        (viewOnly ||
+          isRecording ||
+          restrictedPermLabels.length > 0 ||
+          (isDesktopTarget && clientState.unreadChatCount > 0) ||
+          (isDesktopTarget && isStreamingReady && viewZoom <= 1.05)) && (
+          <div
+            className={`pointer-events-none ${overlayPosClass} left-3 top-0 z-50 flex flex-wrap items-center gap-1.5`}
+            style={{ paddingTop: hasTabBar ? "0.75rem" : "max(0.75rem, env(safe-area-inset-top))" }}
           >
-            {audioMuted ? (
-              <VolumeX className="h-3.5 w-3.5" />
-            ) : (
-              <Volume2 className="h-3.5 w-3.5" />
+            {viewOnly && (
+              <button
+                type="button"
+                onClick={handleToggleViewOnly}
+                title="点击解除只读观察锁定"
+                className="pointer-events-auto inline-flex h-8 items-center gap-1.5 rounded-full border border-amber-400/60 bg-[#111318] px-3 text-[11px] font-semibold text-amber-200 shadow-[0_8px_24px_rgba(0,0,0,0.6)] transition hover:border-amber-300"
+              >
+                <Eye className="h-3.5 w-3.5 text-amber-300" />
+                <span>只读观察</span>
+              </button>
             )}
-            <span className="hidden sm:inline">
-              {audioMuted ? "静音" : isAudioLive ? "声音开启" : "监听中"}
-            </span>
-          </button>
-        </div>
-      )}
+            {restrictedPermLabels.length > 0 && (
+              <span className="pointer-events-auto inline-flex h-8 items-center gap-1 rounded-full border border-amber-400/45 bg-[#111318] px-2.5 text-[11px] font-medium text-amber-200 shadow-[0_8px_24px_rgba(0,0,0,0.55)]">
+                <ShieldAlert className="h-3.5 w-3.5 text-amber-300" />
+                <span>受限: {restrictedPermLabels.join("/")}</span>
+              </span>
+            )}
+            {isDesktopTarget && clientState.unreadChatCount > 0 && (
+              <button
+                type="button"
+                onClick={handleOpenChat}
+                className="pointer-events-auto inline-flex h-8 items-center gap-1.5 rounded-full border border-[#2563EB] bg-[#2563EB] px-3 text-[11px] font-semibold text-white shadow-[0_8px_24px_rgba(0,0,0,0.6)] transition hover:bg-[#1D4ED8]"
+              >
+                <MessageSquare className="h-3.5 w-3.5" />
+                <span>
+                  {clientState.unreadChatCount} 条新消息
+                </span>
+              </button>
+            )}
+            {isRecording && (
+              <button
+                type="button"
+                onClick={handleToggleRecording}
+                title="点击停止并保存本地录屏"
+                className="pointer-events-auto inline-flex h-8 items-center gap-1.5 rounded-full border border-rose-500 bg-rose-600 px-3 font-mono text-[11px] font-semibold text-white shadow-[0_8px_24px_rgba(0,0,0,0.6)] transition hover:bg-rose-500"
+              >
+                <Square className="h-2.5 w-2.5 fill-current" />
+                <span>REC {formatRecordingDuration(recordingDurationSec)}</span>
+              </button>
+            )}
+            {isDesktopTarget && isStreamingReady && viewZoom <= 1.05 && (
+              <button
+                type="button"
+                onClick={handleToggleDesktopAudio}
+                aria-label={audioMuted ? "开启远端电脑声音" : "静音远端电脑声音"}
+                aria-pressed={!audioMuted}
+                className={`pointer-events-auto inline-flex h-8 items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-medium shadow-[0_8px_24px_rgba(0,0,0,0.55)] transition ${
+                  !audioMuted
+                    ? isAudioLive
+                      ? "border-emerald-500/50 bg-[#111318] text-emerald-300"
+                      : "border-[#2563EB] bg-[#2563EB] text-white"
+                    : "border-[#2C313D] bg-[#111318] text-zinc-300 hover:border-[#3F4656]"
+                }`}
+              >
+                {audioMuted ? (
+                  <VolumeX className="h-3.5 w-3.5" />
+                ) : (
+                  <Volume2 className="h-3.5 w-3.5" />
+                )}
+                <span className="hidden sm:inline">
+                  {audioMuted ? "静音" : isAudioLive ? "声音开启" : "监听中"}
+                </span>
+              </button>
+            )}
+          </div>
+        )}
 
       {/* Compact Background Transfer Progress Pill (when transfer runs while sheet is closed) */}
       {(isFileTransferActive || clientState.fileDownload.active || apkFetchState.active) &&
         activePanel !== "files" && (
         <div
-          className="pointer-events-none fixed inset-x-0 top-0 z-50 flex justify-center px-3 sm:justify-start"
+          className={`pointer-events-none ${overlayPosClass} inset-x-0 top-0 z-50 flex justify-center px-3 sm:justify-start`}
           style={{
-            paddingTop: desktopApp
+            paddingTop: showDesktopTopBar
               ? "3.25rem"
-              : "max(3.5rem, calc(env(safe-area-inset-top) + 2.8rem))",
+              : hasTabBar
+                ? "3rem"
+                : "max(3.5rem, calc(env(safe-area-inset-top) + 2.8rem))",
           }}
         >
           <button
@@ -3177,8 +4226,8 @@ export function RemoteViewport({
         </div>
       )}
 
-      {/* Crisp Solid-Ink Top Telemetry Capsule (Web / iOS PWA mode; Desktop renders inline in HUD bar) */}
-      {!desktopApp && (
+      {/* Crisp Solid-Ink Top Telemetry Capsule (Web / iOS PWA mode when chromeMode === "standard") */}
+      {!desktopApp && !isFloatingChrome && (
         <TelemetryCapsule
           client={client}
           socketStatus={clientState.socketStatus}
@@ -3189,13 +4238,86 @@ export function RemoteViewport({
           device={device}
           dockExpanded={dockExpanded}
           onToggleDock={handleToggleDock}
+          embedded={hasTabBar}
+        />
+      )}
+
+      {/* Collapsible Edge-Snapping Floating Toolbar (Immersive Mode) */}
+      {isFloatingChrome && (
+        <FloatingEdgeToolbar
+          client={client}
+          socketStatus={clientState.socketStatus}
+          sessionStatus={clientState.sessionStatus}
+          activeTransport={clientState.activeTransport}
+          isStreamingReady={isStreamingReady}
+          isDesktopTarget={isDesktopTarget}
+          desktopApp={desktopApp}
+          embedded={hasTabBar}
+          viewStyle={viewStyle}
+          viewOnly={viewOnly}
+          isRecording={isRecording}
+          recordingDurationSec={recordingDurationSec}
+          audioMuted={audioMuted}
+          isAudioLive={isAudioLive}
+          isPrivacyOrBlackScreenActive={
+            isDesktopTarget ? isPrivacyActive : Boolean(device?.blackScreenActive)
+          }
+          isBlockInputActive={isBlockInputActive}
+          isWhiteboardActive={whiteboardActive}
+          terminalDisabled={!canTerminal}
+          unreadChatCount={clientState.unreadChatCount}
+          isAlwaysOnTop={isAlwaysOnTop}
+          onExpandStandardChrome={() => handleSetChromeMode("standard")}
+          onCycleViewStyle={handleCycleViewStyle}
+          onToggleViewOnly={handleToggleViewOnly}
+          onToggleRecording={handleToggleRecording}
+          onToggleAudio={isDesktopTarget ? handleToggleDesktopAudio : undefined}
+          onOpenShortcuts={() =>
+            setActivePanel((p) =>
+              isDesktopTarget
+                ? p === "shortcuts"
+                  ? "none"
+                  : "shortcuts"
+                : p === "text"
+                  ? "none"
+                  : "text",
+            )
+          }
+          onOpenFiles={() => {
+            if (isDesktopTarget && !canFileTransfer) {
+              onShowToast?.("warn", "被控端当前会话未开放文件管理权限");
+              return;
+            }
+            setActivePanel((p) => (p === "files" ? "none" : "files"));
+          }}
+          onOpenTerminal={isDesktopTarget ? handleOpenTerminal : undefined}
+          onToggleBlockInput={isDesktopTarget ? handleToggleBlockInput : undefined}
+          onToggleWhiteboard={isDesktopTarget ? handleToggleWhiteboard : undefined}
+          onOpenChat={isDesktopTarget ? handleOpenChat : undefined}
+          onTogglePrivacyOrBlackScreen={() => {
+            if (isDesktopTarget) {
+              handleTogglePrivacyScreen();
+            } else {
+              sendBlackScreen(!device?.blackScreenActive);
+            }
+          }}
+          onToggleAlwaysOnTop={
+            desktopApp && onToggleAlwaysOnTop
+              ? () => void onToggleAlwaysOnTop()
+              : undefined
+          }
+          onOpenMore={() => {
+            setPendingPowerOp(null);
+            setActivePanel((p) => (p === "more" ? "none" : "more"));
+          }}
+          onExit={onExit}
         />
       )}
 
       {/* Screen-Off Notice Banner (when physical Android phone genuinely entered Display.STATE_OFF) */}
       {!isDesktopTarget && isStreamingReady && !showOverlay && device?.screenOn === false && (
-        <div className="pointer-events-none fixed inset-0 z-30 flex items-center justify-center px-5">
-          <div className="pointer-events-auto w-full max-w-sm rounded-xl border border-[#2C313D] bg-[#111318]/92 p-5 text-center shadow-[0_24px_48px_rgba(0,0,0,0.75)] backdrop-blur-md">
+        <div className={`pointer-events-none ${overlayPosClass} inset-0 z-30 flex items-center justify-center px-5`}>
+          <div className="pointer-events-auto w-full max-w-sm rounded-xl border border-[#2C313D] bg-[#111318] p-5 text-center shadow-[0_24px_48px_rgba(0,0,0,0.75)]">
             <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg bg-indigo-500/20 text-indigo-300">
               <Moon className="h-5 w-5" />
             </div>
@@ -3225,89 +4347,148 @@ export function RemoteViewport({
         </div>
       )}
 
-      {/* Connecting / Error Overlay */}
+      {/* Connecting / Pending Approval / Error Overlay */}
       {showOverlay && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/80 px-5">
-          <div className="w-full max-w-sm rounded-xl border border-[#282D38] bg-[#111318] p-6 text-center shadow-[0_24px_48px_rgba(0,0,0,0.65)]">
-            <div className="mx-auto mb-3.5 flex h-11 w-11 items-center justify-center rounded-lg bg-white/8 text-zinc-200">
-              <RefreshCw
-                className={`h-5 w-5 ${
-                  clientState.sessionStatus !== "error" &&
-                  clientState.sessionStatus !== "ended" &&
-                  clientState.socketStatus !== "error"
-                    ? "animate-spin text-[#60A5FA]"
-                    : "text-zinc-300"
-                }`}
-              />
-            </div>
-
-            <h3 className="text-base font-semibold text-white">{overlayTitle}</h3>
-            <p className="mt-1.5 text-xs leading-relaxed text-zinc-400">
-              {clientState.errorMessage ||
-                (!isDesktopTarget && device?.locked
-                  ? "手机处于锁屏状态，如黑屏可点击下方强制唤醒。"
-                  : clientState.desiredTransport === "ws-jpeg" ||
-                      clientState.activeTransport === "ws-jpeg"
-                    ? "正在拉取实时帧画面，请稍候。"
-                    : "若 WebRTC 超过 7.5 秒未连通将自动切换至 WS 帧流。")}
-            </p>
-
-            <div className="mt-5 space-y-2.5">
-              <div className={`grid gap-2.5 ${isDesktopTarget ? "grid-cols-1" : "grid-cols-2"}`}>
-                <button
-                  type="button"
-                  onClick={handleRetryOverlay}
-                  className="btn-primary flex h-10 items-center justify-center gap-1.5 rounded-lg text-xs font-medium"
-                >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                  立即重试
-                </button>
-
-                {!isDesktopTarget && (
-                  <button
-                    type="button"
-                    onClick={sendWake}
-                    className="btn-shell flex h-10 items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-amber-300"
-                  >
-                    <Zap className="h-3.5 w-3.5" />
-                    强制唤醒
-                  </button>
-                )}
+        <div className={`${overlayPosClass} inset-0 z-40 flex items-center justify-center bg-black/80 px-5`}>
+          {clientState.pendingApprovalMessage ? (
+            <div className="w-full max-w-sm rounded-xl border border-[#2563EB]/60 bg-[#111318] p-6 text-center shadow-[0_24px_48px_rgba(0,0,0,0.75)]">
+              <div className="mx-auto mb-3.5 flex h-11 w-11 items-center justify-center rounded-lg border border-[#2563EB]/40 bg-[#2563EB]/15 text-[#60A5FA]">
+                <Loader2 className="h-5 w-5 animate-spin" />
               </div>
 
-              <button
-                type="button"
-                onClick={onExit}
-                className="btn-shell flex h-9 w-full items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-zinc-300"
-              >
-                <LogOut className="h-3.5 w-3.5" />
-                {clientState.authType === "code" ? "断开并返回" : "返回设备列表"}
-              </button>
+              <h3 className="text-base font-semibold text-white">
+                等待被控电脑确认接入...
+              </h3>
+              <p className="mt-1.5 text-xs leading-relaxed text-zinc-400">
+                {clientState.pendingApprovalMessage !== "等待被控电脑确认接入..."
+                  ? clientState.pendingApprovalMessage
+                  : "目标电脑已开启来访弹窗审批，请等待对方点击「允许接入」。"}
+              </p>
+
+              <div className="mt-5">
+                <button
+                  type="button"
+                  onClick={onExit}
+                  className="btn-shell flex h-9 w-full items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-zinc-200 hover:text-white"
+                >
+                  <X className="h-3.5 w-3.5" />
+                  取消连接
+                </button>
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="w-full max-w-sm rounded-xl border border-[#282D38] bg-[#111318] p-6 text-center shadow-[0_24px_48px_rgba(0,0,0,0.65)]">
+              <div className="mx-auto mb-3.5 flex h-11 w-11 items-center justify-center rounded-lg bg-white/8 text-zinc-200">
+                <RefreshCw
+                  className={`h-5 w-5 ${
+                    clientState.sessionStatus !== "error" &&
+                    clientState.sessionStatus !== "ended" &&
+                    clientState.socketStatus !== "error"
+                      ? "animate-spin text-[#60A5FA]"
+                      : "text-zinc-300"
+                  }`}
+                />
+              </div>
+
+              <h3 className="text-base font-semibold text-white">{overlayTitle}</h3>
+              <p className="mt-1.5 text-xs leading-relaxed text-zinc-400">
+                {clientState.errorMessage ||
+                  (!isDesktopTarget && device?.locked
+                    ? "手机处于锁屏状态，如黑屏可点击下方强制唤醒。"
+                    : clientState.desiredTransport === "ws-jpeg" ||
+                        clientState.activeTransport === "ws-jpeg"
+                      ? "正在拉取实时帧画面，请稍候。"
+                      : "若 WebRTC 超过 7.5 秒未连通将自动切换至 WS 帧流。")}
+              </p>
+
+              <div className="mt-5 space-y-2.5">
+                <div className={`grid gap-2.5 ${isDesktopTarget ? "grid-cols-1" : "grid-cols-2"}`}>
+                  <button
+                    type="button"
+                    onClick={handleRetryOverlay}
+                    className="btn-primary flex h-10 items-center justify-center gap-1.5 rounded-lg text-xs font-medium"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    立即重试
+                  </button>
+
+                  {!isDesktopTarget && (
+                    <button
+                      type="button"
+                      onClick={sendWake}
+                      className="btn-shell flex h-10 items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-amber-300"
+                    >
+                      <Zap className="h-3.5 w-3.5" />
+                      强制唤醒
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={onExit}
+                  className="btn-shell flex h-9 w-full items-center justify-center gap-1.5 rounded-lg text-xs font-medium text-zinc-300"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  {clientState.authType === "code" ? "断开并返回" : "返回设备列表"}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* Solid-Ink Bottom Control Bar */}
-      {dockExpanded && (
+      {/* Solid-Ink Bottom Control Bar (hidden when chromeMode === "floating") */}
+      {dockExpanded && !isFloatingChrome && (
         <div
-          className="fixed inset-x-0 bottom-0 z-50 px-3"
+          className={`${overlayPosClass} inset-x-0 bottom-0 z-50 px-3`}
           style={{ paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))" }}
         >
           <div className="animate-sheet-up mx-auto max-w-lg rounded-xl border border-[#2C313D] bg-[#111318] p-3 shadow-[0_20px_48px_rgba(0,0,0,0.75)]">
-            <div className="mb-2.5 flex items-center justify-between px-1">
+            <div className="mb-2.5 flex items-center justify-between gap-2 px-1">
               <div className="flex min-w-0 items-center gap-2">
                 <span className="truncate text-xs font-semibold text-white">
                   {device?.name || "远端设备"}
                 </span>
                 {clientState.dataChannelOpen && (
-                  <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
+                  <span className="shrink-0 rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
                     DC 直通
                   </span>
                 )}
               </div>
 
               <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => handleSetChromeMode("floating")}
+                  title="折叠为四边悬浮条（沉浸模式）"
+                  className="inline-flex h-7 items-center gap-1 rounded-md border border-[#2C313D] bg-white/8 px-2 text-[11px] font-medium text-zinc-200 transition hover:bg-white/15"
+                >
+                  <PanelTopClose className="h-3 w-3 text-sky-400" />
+                  <span className="hidden sm:inline">悬浮条</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleToggleRecording}
+                  title={isRecording ? "停止并保存本地录屏" : "一键开始本地录屏"}
+                  className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition ${
+                    isRecording
+                      ? "border-rose-500 bg-rose-600 font-mono text-white hover:bg-rose-500"
+                      : "border-[#2C313D] bg-white/8 text-zinc-200 hover:bg-white/15"
+                  }`}
+                >
+                  {isRecording ? (
+                    <>
+                      <Square className="h-2.5 w-2.5 fill-current" />
+                      <span>{formatRecordingDuration(recordingDurationSec)}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Circle className="h-3 w-3 fill-rose-500 text-rose-500" />
+                      <span className="hidden sm:inline">录屏</span>
+                    </>
+                  )}
+                </button>
                 {isDesktopTarget ? (
                   <button
                     type="button"
@@ -3473,9 +4654,14 @@ export function RemoteViewport({
                     icon={<FolderOpen className="h-4 w-4 text-emerald-400" />}
                     label="文件管理"
                     active={activePanel === "files"}
-                    onClick={() =>
-                      setActivePanel((p) => (p === "files" ? "none" : "files"))
-                    }
+                    disabled={!canFileTransfer}
+                    onClick={() => {
+                      if (!canFileTransfer) {
+                        onShowToast?.("warn", "被控端当前会话未开放文件管理权限");
+                        return;
+                      }
+                      setActivePanel((p) => (p === "files" ? "none" : "files"));
+                    }}
                   />
                   <DockButton
                     icon={<Gauge className="h-4 w-4 text-amber-400" />}
@@ -3493,6 +4679,37 @@ export function RemoteViewport({
                       setPendingPowerOp(null);
                       setActivePanel((p) => (p === "more" ? "none" : "more"));
                     }}
+                  />
+                </div>
+
+                <div className="mt-1.5 grid grid-cols-4 gap-1.5">
+                  <DockButton
+                    icon={<Terminal className="h-4 w-4 text-sky-400" />}
+                    label="终端"
+                    active={activePanel === "terminal"}
+                    disabled={!canTerminal}
+                    onClick={handleOpenTerminal}
+                  />
+                  <DockButton
+                    icon={<Crosshair className="h-4 w-4 text-blue-400" />}
+                    label={pointerLocked ? "已锁鼠标" : "相对鼠标"}
+                    active={pointerLocked}
+                    disabled={!isStreamingReady || viewOnly || !canMouse}
+                    onClick={handleTogglePointerLock}
+                  />
+                  <DockButton
+                    icon={<PenTool className="h-4 w-4 text-amber-300" />}
+                    label={whiteboardActive ? "批注中" : "白板批注"}
+                    active={whiteboardActive}
+                    disabled={!isStreamingReady || viewOnly}
+                    onClick={handleToggleWhiteboard}
+                  />
+                  <DockButton
+                    icon={<MessageSquare className="h-4 w-4 text-emerald-300" />}
+                    label="会话消息"
+                    active={activePanel === "chat"}
+                    badge={clientState.unreadChatCount}
+                    onClick={handleOpenChat}
                   />
                 </div>
               </>
@@ -3559,8 +4776,8 @@ export function RemoteViewport({
       )}
 
       {/* Unlock / PIN Pad Sheet */}
-      {activePanel === "unlock" && (
-        <DarkSheet title="解锁设备" onClose={() => setActivePanel("none")}>
+      {isActiveTab && activePanel === "unlock" && (
+        <DarkSheet title="解锁设备" active={isActiveTab} onClose={() => setActivePanel("none")}>
           <button
             type="button"
             onClick={handleSwipeUnlock}
@@ -3616,9 +4833,17 @@ export function RemoteViewport({
       )}
 
       {/* Text Input & Clipboard Sync Sheet */}
-      {activePanel === "text" && (
-        <DarkSheet title="文字输入与剪贴板" onClose={() => setActivePanel("none")}>
+      {isActiveTab && activePanel === "text" && (
+        <DarkSheet title="文字输入与剪贴板" active={isActiveTab} onClose={() => setActivePanel("none")}>
           <div className="space-y-3">
+            {isDesktopTarget && (
+              <KeymapModeControl
+                localOs={localOs}
+                targetOs={targetDesktopOs}
+                mode={keymapMode}
+                onChange={handleChangeKeymapMode}
+              />
+            )}
             <textarea
               autoFocus
               rows={3}
@@ -3747,18 +4972,59 @@ export function RemoteViewport({
       )}
 
       {/* Pro Desktop Combo Shortcut Pad */}
-      {isDesktopTarget && activePanel === "shortcuts" && (
-        <DesktopShortcutBar
-          targetPlatform={device?.osPlatform}
-          onSendKeyEvent={(cmd) => client.sendCommand(cmd, targetDeviceId)}
-          onClose={() => setActivePanel("none")}
-        />
+      {isActiveTab && isDesktopTarget && activePanel === "shortcuts" && (
+        <>
+          <div
+            className={`pointer-events-none ${overlayPosClass} inset-x-0 top-0 z-[58] flex justify-center px-3`}
+            style={{
+              paddingTop: showDesktopTopBar
+                ? "3.25rem"
+                : hasTabBar
+                  ? "0.75rem"
+                  : "max(0.75rem, env(safe-area-inset-top))",
+            }}
+          >
+            <div className="pointer-events-auto inline-flex items-center gap-1 rounded-full border border-[#2C313D] bg-[#111318] p-1 text-[11px] shadow-[0_8px_24px_rgba(0,0,0,0.75)]">
+              <button
+                type="button"
+                onClick={() => handleChangeKeymapMode("smart")}
+                className={`rounded-full px-2.5 py-0.5 font-medium transition ${
+                  keymapMode === "smart"
+                    ? "bg-[#2563EB] text-white"
+                    : "text-zinc-300 hover:text-white"
+                }`}
+              >
+                智能跨系统键位
+              </button>
+              <button
+                type="button"
+                onClick={() => handleChangeKeymapMode("raw")}
+                className={`rounded-full px-2.5 py-0.5 font-medium transition ${
+                  keymapMode === "raw"
+                    ? "bg-[#2563EB] text-white"
+                    : "text-zinc-300 hover:text-white"
+                }`}
+              >
+                原生键位
+              </button>
+            </div>
+          </div>
+          <DesktopShortcutBar
+            targetPlatform={device?.osPlatform}
+            onSendKeyEvent={(cmd) => {
+              if (guardViewOnly()) return;
+              client.sendCommand(cmd, targetDeviceId);
+            }}
+            onClose={() => setActivePanel("none")}
+          />
+        </>
       )}
 
       {/* Pro Desktop Video Quality / Refresh Rate / Codec / Audio Drawer */}
-      {isDesktopTarget && activePanel === "quality" && (
+      {isActiveTab && isDesktopTarget && activePanel === "quality" && (
         <DarkSheet
           title="桌面画质、刷新率与编码器"
+          active={isActiveTab}
           onClose={() => setActivePanel("none")}
         >
           <DesktopQualitySheetContent
@@ -3770,6 +5036,10 @@ export function RemoteViewport({
             audioMuted={audioMuted}
             audioVolume={audioVolume}
             hasRemoteAudio={clientState.hasRemoteAudio}
+            localOs={localOs}
+            targetDesktopOs={targetDesktopOs}
+            keymapMode={keymapMode}
+            onChangeKeymapMode={handleChangeKeymapMode}
             onToggleAudio={handleToggleDesktopAudio}
             onChangeVolume={setAudioVolume}
           />
@@ -3777,10 +5047,11 @@ export function RemoteViewport({
       )}
 
       {/* P2P File Transfer / Remote File Browser Sheet */}
-      {activePanel === "files" && (
+      {isActiveTab && activePanel === "files" && (
         <DarkSheet
           title={isDesktopTarget ? "远端电脑双向文件管理" : "P2P 文件直传与远程升级"}
           wide={isDesktopTarget}
+          active={isActiveTab}
           onClose={() => setActivePanel("none")}
         >
           {isDesktopTarget ? (
@@ -3813,16 +5084,137 @@ export function RemoteViewport({
         </DarkSheet>
       )}
 
+      {/* Remote Interactive Terminal Sheet (Desktop Targets) */}
+      {isActiveTab && isDesktopTarget && activePanel === "terminal" && (
+        <RemoteTerminalSheet
+          client={client}
+          terminalReady={clientState.terminalReady}
+          deviceName={device?.name || device?.model || "远端电脑"}
+          disabled={!canTerminal}
+          onShowToast={onShowToast}
+          onClose={() => setActivePanel("none")}
+        />
+      )}
+
+      {/* Session Collaboration Chat Drawer (Desktop Targets) */}
+      {isActiveTab && isDesktopTarget && activePanel === "chat" && (
+        <SessionChatDrawer
+          messages={clientState.chatMessages}
+          deviceName={device?.name || device?.model || "远端电脑"}
+          disabled={!clientState.sessionId}
+          onSendMessage={handleSendChatMessage}
+          onMarkRead={handleMarkChatRead}
+          onClose={() => setActivePanel("none")}
+        />
+      )}
+
       {/* Quality & Hardware Controls Sheet */}
-      {activePanel === "more" && (
+      {isActiveTab && activePanel === "more" && (
         <DarkSheet
           title={isDesktopTarget ? "电源、显示器与桌面控制" : "画质与硬件控制"}
+          active={isActiveTab}
           onClose={() => {
             setPendingPowerOp(null);
             setActivePanel("none");
           }}
         >
           <div className="space-y-4">
+            {/* View Style (Adaptive / 1:1 / Stretch) + View-Only + Local Recording + Immersive Bar */}
+            <div className="space-y-2.5 rounded-lg border border-[#262A34] bg-[#0A0C10] p-3">
+              <div>
+                <p className="mb-1.5 text-[11px] font-medium text-zinc-400">
+                  画面缩放模式
+                </p>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(
+                    [
+                      { id: "adaptive", label: "适应屏幕" },
+                      { id: "original", label: "1:1 原尺寸" },
+                      { id: "stretch", label: "拉伸铺满" },
+                    ] as Array<{ id: ViewportViewStyle; label: string }>
+                  ).map((item) => {
+                    const active = viewStyle === item.id;
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => handleChangeViewStyle(item.id)}
+                        className={`h-8 rounded-md border text-[11px] font-medium transition ${
+                          active
+                            ? "border-[#2563EB] bg-[#2563EB] text-white"
+                            : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+                        }`}
+                      >
+                        {item.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-1.5">
+                <button
+                  type="button"
+                  onClick={handleToggleViewOnly}
+                  className={`inline-flex h-8 items-center justify-center gap-1 rounded-md border px-2 text-[11px] font-medium transition ${
+                    viewOnly
+                      ? "border-amber-400/60 bg-amber-500/20 text-amber-200 hover:bg-amber-500/30"
+                      : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+                  }`}
+                >
+                  <Eye className="h-3.5 w-3.5" />
+                  <span>{viewOnly ? "只读中" : "只读观察"}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleToggleRecording}
+                  className={`inline-flex h-8 items-center justify-center gap-1 rounded-md border px-2 text-[11px] font-medium transition ${
+                    isRecording
+                      ? "border-rose-500 bg-rose-600 font-mono text-white hover:bg-rose-500"
+                      : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+                  }`}
+                >
+                  {isRecording ? (
+                    <>
+                      <Square className="h-2.5 w-2.5 fill-current" />
+                      <span>{formatRecordingDuration(recordingDurationSec)}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Circle className="h-3 w-3 fill-rose-500 text-rose-500" />
+                      <span>本地录屏</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next: ViewportChromeMode = isFloatingChrome
+                      ? "standard"
+                      : "floating";
+                    handleSetChromeMode(next);
+                    setActivePanel("none");
+                  }}
+                  className={`inline-flex h-8 items-center justify-center gap-1 rounded-md border px-2 text-[11px] font-medium transition ${
+                    isFloatingChrome
+                      ? "border-[#2563EB] bg-[#2563EB] text-white"
+                      : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+                  }`}
+                >
+                  <PanelTopClose className="h-3.5 w-3.5" />
+                  <span>{isFloatingChrome ? "完整栏" : "悬浮条"}</span>
+                </button>
+              </div>
+            </div>
+
+            {isDesktopTarget && (
+              <KeymapModeControl
+                localOs={localOs}
+                targetOs={targetDesktopOs}
+                mode={keymapMode}
+                onChange={handleChangeKeymapMode}
+              />
+            )}
             {isDesktopTarget ? (
               <div className="grid grid-cols-2 gap-2">
                 <button
@@ -4032,6 +5424,33 @@ export function RemoteViewport({
                     </span>
                   </button>
 
+                  {/* Block Local Physical Input Toggle Row (Feature 10) */}
+                  <button
+                    type="button"
+                    onClick={handleToggleBlockInput}
+                    className={`flex h-10 w-full items-center justify-between rounded-lg border px-3 text-xs font-medium transition ${
+                      isBlockInputActive
+                        ? "border-amber-400/70 bg-amber-500/20 text-amber-100 hover:bg-amber-500/30"
+                        : "border-[#2C313D] bg-[#191D26] text-zinc-100 hover:bg-[#232836]"
+                    }`}
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <Lock className="h-4 w-4" />
+                      <span>
+                        {isBlockInputActive ? "解除远端键鼠锁定" : "锁定远端键鼠"}
+                      </span>
+                    </span>
+                    <span
+                      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                        isBlockInputActive
+                          ? "bg-amber-400/25 text-amber-100"
+                          : "bg-white/10 text-zinc-400"
+                      }`}
+                    >
+                      {isBlockInputActive ? "已锁定" : "未锁定"}
+                    </span>
+                  </button>
+
                   {/* Remote Power Grid */}
                   <div className="grid grid-cols-4 gap-1.5">
                     <DockButton
@@ -4196,6 +5615,7 @@ interface TelemetryCapsuleProps {
   dockExpanded: boolean;
   onToggleDock: () => void;
   inline?: boolean;
+  embedded?: boolean;
 }
 
 const TelemetryCapsule = memo(function TelemetryCapsule({
@@ -4209,6 +5629,7 @@ const TelemetryCapsule = memo(function TelemetryCapsule({
   dockExpanded,
   onToggleDock,
   inline = false,
+  embedded = false,
 }: TelemetryCapsuleProps) {
   const telemetry = useSyncExternalStore(
     client.subscribeTelemetry,
@@ -4316,8 +5737,8 @@ const TelemetryCapsule = memo(function TelemetryCapsule({
 
   return (
     <div
-      className="pointer-events-none fixed inset-x-0 top-0 z-50 flex justify-center px-3 sm:justify-end"
-      style={{ paddingTop: "max(0.75rem, env(safe-area-inset-top))" }}
+      className={`pointer-events-none ${embedded ? "absolute" : "fixed"} inset-x-0 top-0 z-50 flex justify-center px-3 sm:justify-end`}
+      style={{ paddingTop: embedded ? "0.75rem" : "max(0.75rem, env(safe-area-inset-top))" }}
     >
       {capsuleButton}
     </div>
@@ -4515,18 +5936,23 @@ function DockButton({
   icon,
   label,
   active = false,
+  disabled = false,
+  badge = 0,
   onClick,
 }: {
   icon: React.ReactNode;
   label: string;
   active?: boolean;
+  disabled?: boolean;
+  badge?: number;
   onClick: () => void;
 }) {
   return (
     <button
       type="button"
+      disabled={disabled}
       onClick={onClick}
-      className={`flex h-13 flex-col items-center justify-center gap-1 rounded-lg border text-[11px] font-medium transition ${
+      className={`relative flex h-13 flex-col items-center justify-center gap-1 rounded-lg border text-[11px] font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
         active
           ? "border-[#2563EB] bg-[#2563EB] text-white"
           : "border-[#282D38] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
@@ -4534,6 +5960,11 @@ function DockButton({
     >
       {icon}
       <span className="leading-none">{label}</span>
+      {badge > 0 && (
+        <span className="absolute right-1.5 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 font-mono text-[9px] font-bold leading-none text-white">
+          {badge > 99 ? "99+" : badge}
+        </span>
+      )}
     </button>
   );
 }
@@ -4962,15 +6393,18 @@ const FileTransferSheetContent = memo(function FileTransferSheetContent({
 function DarkSheet({
   title,
   wide = false,
+  active = true,
   onClose,
   children,
 }: {
   title: string;
   wide?: boolean;
+  active?: boolean;
   onClose: () => void;
   children: React.ReactNode;
 }) {
   useEffect(() => {
+    if (!active) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
@@ -4979,7 +6413,7 @@ function DarkSheet({
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [active, onClose]);
 
   return (
     <div
@@ -5021,6 +6455,10 @@ const DesktopQualitySheetContent = memo(function DesktopQualitySheetContent({
   audioMuted,
   audioVolume,
   hasRemoteAudio,
+  localOs,
+  targetDesktopOs,
+  keymapMode,
+  onChangeKeymapMode,
   onToggleAudio,
   onChangeVolume,
 }: {
@@ -5032,6 +6470,10 @@ const DesktopQualitySheetContent = memo(function DesktopQualitySheetContent({
   audioMuted: boolean;
   audioVolume: number;
   hasRemoteAudio: boolean;
+  localOs: DesktopOsPlatform;
+  targetDesktopOs: DesktopOsPlatform | undefined;
+  keymapMode: KeyboardMappingMode;
+  onChangeKeymapMode: (mode: KeyboardMappingMode) => void;
   onToggleAudio: () => void;
   onChangeVolume: (vol: number) => void;
 }) {
@@ -5259,6 +6701,14 @@ const DesktopQualitySheetContent = memo(function DesktopQualitySheetContent({
         />
       </div>
 
+      {/* Cross-OS Smart Keyboard Mapping */}
+      <KeymapModeControl
+        localOs={localOs}
+        targetOs={targetDesktopOs}
+        mode={keymapMode}
+        onChange={onChangeKeymapMode}
+      />
+
       {/* Transport Switch + Live WebRTC Diagnostics */}
       <div>
         <p className="mb-2 text-xs font-medium text-zinc-400">传输通道</p>
@@ -5294,3 +6744,67 @@ const DesktopQualitySheetContent = memo(function DesktopQualitySheetContent({
     </div>
   );
 });
+
+function KeymapModeControl({
+  localOs,
+  targetOs,
+  mode,
+  onChange,
+}: {
+  localOs: DesktopOsPlatform;
+  targetOs: DesktopOsPlatform | undefined;
+  mode: KeyboardMappingMode;
+  onChange: (mode: KeyboardMappingMode) => void;
+}) {
+  const crossOs = isCrossOsDesktopPair(localOs, targetOs);
+  const pairBadge = targetOs
+    ? `${formatDesktopOsShortLabel(localOs)} → ${formatDesktopOsShortLabel(targetOs)}`
+    : `${formatDesktopOsShortLabel(localOs)} → 远端桌面`;
+
+  return (
+    <div className="rounded-lg border border-[#262A34] bg-[#0A0C10] p-2.5">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-300">
+          <Keyboard className="h-3.5 w-3.5 text-sky-400" />
+          跨系统键盘映射
+        </span>
+        <span className="rounded border border-[#262A34] bg-[#14171F] px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">
+          {pairBadge}
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-1.5">
+        <button
+          type="button"
+          onClick={() => onChange("smart")}
+          className={`h-8 rounded-md border text-[11px] font-medium transition ${
+            mode === "smart"
+              ? "border-[#2563EB] bg-[#2563EB] text-white"
+              : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+          }`}
+        >
+          智能跨系统键位
+        </button>
+        <button
+          type="button"
+          onClick={() => onChange("raw")}
+          className={`h-8 rounded-md border text-[11px] font-medium transition ${
+            mode === "raw"
+              ? "border-[#2563EB] bg-[#2563EB] text-white"
+              : "border-[#2C313D] bg-[#191D26] text-zinc-200 hover:bg-[#232836]"
+          }`}
+        >
+          原生键位
+        </button>
+      </div>
+      <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-500">
+        {mode === "smart"
+          ? crossOs
+            ? localOs === "darwin"
+              ? "已生效：⌘C/V/Z 等自动映射为 Ctrl，独立 Ctrl+C（终端中断）保持原样。"
+              : "已生效：Ctrl+C/V/Z/Space 等自动映射为 macOS ⌘ 快捷键。"
+            : "当前本机与远端为同类系统，按键直通透传；跨系统控机时将自动启用。"
+          : "所有修饰键与按键按物理原样透传至远端系统。"}
+      </p>
+    </div>
+  );
+}

@@ -1,6 +1,52 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
 
 export type HostPlatform = "darwin" | "win32" | "linux";
+export type HostAccessMode = "auto" | "confirm";
+
+export type HostCursorShape =
+  | "default"
+  | "pointer"
+  | "text"
+  | "crosshair"
+  | "move"
+  | "ew-resize"
+  | "ns-resize"
+  | "nwse-resize"
+  | "nesw-resize"
+  | "grab"
+  | "grabbing"
+  | "not-allowed"
+  | "wait"
+  | "none";
+
+export interface HostSessionPermissions {
+  keyboard?: boolean;
+  mouse?: boolean;
+  clipboard?: boolean;
+  fileTransfer?: boolean;
+  audio?: boolean;
+  terminal?: boolean;
+}
+
+export interface HostChatMessagePayload {
+  id: string;
+  sender: "controller" | "host";
+  senderName?: string;
+  text: string;
+  ts: number;
+}
+
+export type HostTerminalEventPayload =
+  | { type: "term_ready"; termId: string; shell: string; cwd: string }
+  | { type: "term_data"; termId: string; data: string }
+  | { type: "term_exit"; termId: string; exitCode: number }
+  | { type: "term_error"; termId: string; error: string };
+
+export interface HostSessionApprovalResult {
+  approved: boolean;
+  permissions: HostSessionPermissions;
+  reason?: string;
+}
 
 export interface HostWorkerDisplayInfo {
   id: string;
@@ -33,6 +79,10 @@ export interface HostWorkerConfig {
   permissions: HostWorkerPermissions;
   audioCaptureEnabled: boolean;
   privacyScreenActive: boolean;
+  accessMode: HostAccessMode;
+  blockInputActive: boolean;
+  lanIp: string;
+  macAddresses: string[];
 }
 
 export type HostWorkerCommand =
@@ -45,6 +95,10 @@ export type HostWorkerCommand =
     }
   | { type: "clipboard-push"; text: string }
   | { type: "privacy-state-changed"; active: boolean }
+  | { type: "block-input-changed"; active: boolean }
+  | { type: "cursor-update"; shape: HostCursorShape; visible: boolean }
+  | { type: "terminal-event"; event: HostTerminalEventPayload }
+  | { type: "chat-send"; message: HostChatMessagePayload }
   | { type: "disconnect-session"; reason?: string }
   | { type: "stop" };
 
@@ -57,6 +111,7 @@ export interface HostWorkerStateReport {
   activeDisplayId?: string;
   lastError?: string | null;
   privacyScreenActive?: boolean;
+  blockInputActive?: boolean;
   audioEnabled?: boolean;
 }
 
@@ -101,9 +156,32 @@ export interface VeloDeckHostWorkerBridge {
   setPrivacyScreen(
     enabled: boolean,
   ): Promise<{ ok: boolean; active: boolean; message?: string }>;
+  setBlockInput(
+    enabled: boolean,
+  ): Promise<{ ok: boolean; active: boolean; message?: string }>;
   executePower(
     operation: string,
   ): Promise<{ ok: boolean; message?: string }>;
+  sendWol(
+    macAddress: string,
+    broadcastIp?: string,
+  ): Promise<{ ok: boolean; error?: string }>;
+  whiteboardCommand(
+    op: "stroke" | "clear",
+    stroke?: unknown,
+    displayId?: string,
+  ): Promise<{ ok: boolean; message?: string }>;
+  terminalCommand(
+    sessionId: string,
+    cmd: Record<string, unknown>,
+  ): Promise<{ ok: boolean; error?: string }>;
+  terminalCloseAll(sessionId: string): void;
+  requestSessionApproval(sessionId: string): Promise<HostSessionApprovalResult>;
+  cancelSessionApproval(sessionId: string): void;
+  incomingChatMessage(
+    sessionId: string,
+    message: HostChatMessagePayload,
+  ): void;
   fileTransferText(sessionId: string, text: string): Promise<string | null>;
   fileTransferBinary(sessionId: string, chunk: Uint8Array): Promise<string | null>;
   fileTransferAbort(sessionId: string): void;
@@ -174,10 +252,67 @@ const workerBridge: VeloDeckHostWorkerBridge = Object.freeze({
     return ipcRenderer.invoke("velodeck-host:privacy-screen", Boolean(enabled));
   },
 
+  setBlockInput(
+    enabled: boolean,
+  ): Promise<{ ok: boolean; active: boolean; message?: string }> {
+    return ipcRenderer.invoke("velodeck-host:block-input", Boolean(enabled));
+  },
+
   executePower(
     operation: string,
   ): Promise<{ ok: boolean; message?: string }> {
     return ipcRenderer.invoke("velodeck-host:power", operation);
+  },
+
+  sendWol(
+    macAddress: string,
+    broadcastIp?: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    return ipcRenderer.invoke("velodeck-host:wol", {
+      macAddress,
+      broadcastIp: broadcastIp ?? "",
+    });
+  },
+
+  whiteboardCommand(
+    op: "stroke" | "clear",
+    stroke?: unknown,
+    displayId?: string,
+  ): Promise<{ ok: boolean; message?: string }> {
+    return ipcRenderer.invoke("velodeck-host:whiteboard", {
+      op,
+      stroke,
+      displayId: displayId ?? "",
+    });
+  },
+
+  terminalCommand(
+    sessionId: string,
+    cmd: Record<string, unknown>,
+  ): Promise<{ ok: boolean; error?: string }> {
+    return ipcRenderer.invoke("velodeck-host:terminal-cmd", {
+      sessionId,
+      cmd,
+    });
+  },
+
+  terminalCloseAll(sessionId: string): void {
+    ipcRenderer.send("velodeck-host:terminal-close-all", sessionId);
+  },
+
+  requestSessionApproval(sessionId: string): Promise<HostSessionApprovalResult> {
+    return ipcRenderer.invoke("velodeck-host:request-approval", sessionId);
+  },
+
+  cancelSessionApproval(sessionId: string): void {
+    ipcRenderer.send("velodeck-host:cancel-approval", sessionId);
+  },
+
+  incomingChatMessage(
+    sessionId: string,
+    message: HostChatMessagePayload,
+  ): void {
+    ipcRenderer.send("velodeck-host:chat-incoming", { sessionId, message });
   },
 
   fileTransferText(sessionId: string, text: string): Promise<string | null> {

@@ -6,6 +6,45 @@ export type MouseButton = "left" | "right" | "middle";
 export type VideoCodecPreference = "auto" | "h264" | "hevc" | "av1" | "vp9";
 export type DesktopPowerOperation = "lock" | "sleep" | "restart" | "shutdown";
 
+export type CursorShape =
+  | "default"
+  | "pointer"
+  | "text"
+  | "crosshair"
+  | "move"
+  | "ew-resize"
+  | "ns-resize"
+  | "nwse-resize"
+  | "nesw-resize"
+  | "grab"
+  | "grabbing"
+  | "not-allowed"
+  | "wait"
+  | "none";
+
+export type AccessApprovalMode = "auto" | "confirm";
+
+export interface SessionPermissions {
+  keyboard?: boolean;
+  mouse?: boolean;
+  clipboard?: boolean;
+  fileTransfer?: boolean;
+  audio?: boolean;
+  terminal?: boolean;
+}
+
+export interface WhiteboardPoint {
+  x: number;
+  y: number;
+}
+
+export interface WhiteboardStroke {
+  id: string;
+  color: string;
+  width: number;
+  points: WhiteboardPoint[];
+}
+
 export interface DisplayInfo {
   id: string;
   name: string;
@@ -56,6 +95,13 @@ export interface DeviceCapabilities {
   fileManager?: boolean;
   powerControl?: boolean;
   highRefresh?: boolean;
+  remoteTerminal?: boolean;
+  relativeMouse?: boolean;
+  cursorSync?: boolean;
+  blockInput?: boolean;
+  wolRelay?: boolean;
+  whiteboard?: boolean;
+  chat?: boolean;
 }
 
 export interface DeviceSummary {
@@ -78,6 +124,10 @@ export interface DeviceSummary {
   forcePortraitActive?: boolean;
   privacyScreenActive?: boolean;
   audioEnabled?: boolean;
+  blockInputActive?: boolean;
+  accessMode?: AccessApprovalMode;
+  macAddresses?: string[];
+  lanIp?: string;
   directUrl?: string;
   deviceType?: DeviceType;
   osPlatform?: DevicePlatform;
@@ -159,7 +209,11 @@ export type ControlCommand =
   | { action: "select_display"; displayId: string }
   | { action: "privacy_screen"; enabled: boolean }
   | { action: "audio_toggle"; enabled: boolean }
-  | { action: "power"; operation: DesktopPowerOperation };
+  | { action: "power"; operation: DesktopPowerOperation }
+  | { action: "mouse_move_relative"; dx: number; dy: number }
+  | { action: "block_input"; enabled: boolean }
+  | { action: "wol"; macAddress: string; broadcastIp?: string }
+  | { action: "whiteboard"; op: "stroke" | "clear"; stroke?: WhiteboardStroke };
 
 export interface AgentRegisterMessage {
   type: "agent.register";
@@ -187,6 +241,10 @@ export interface AgentRegisterMessage {
   forcePortraitActive?: boolean;
   privacyScreenActive?: boolean;
   audioEnabled?: boolean;
+  blockInputActive?: boolean;
+  accessMode?: AccessApprovalMode;
+  macAddresses?: string[];
+  lanIp?: string;
   directUrl?: string;
   deviceType?: DeviceType;
   osPlatform?: DevicePlatform;
@@ -218,6 +276,10 @@ export interface AgentTelemetryMessage {
   forcePortraitActive?: boolean;
   privacyScreenActive?: boolean;
   audioEnabled?: boolean;
+  blockInputActive?: boolean;
+  accessMode?: AccessApprovalMode;
+  macAddresses?: string[];
+  lanIp?: string;
   deviceType?: DeviceType;
   osPlatform?: DevicePlatform;
   displays?: DisplayInfo[];
@@ -329,6 +391,39 @@ export interface ClipboardSyncMessage {
   text: string;
 }
 
+export interface CursorUpdateMessage {
+  type: "cursor.update";
+  sessionId: string;
+  deviceId: string;
+  shape: CursorShape;
+  visible?: boolean;
+}
+
+export interface ChatMessage {
+  type: "chat.msg";
+  sessionId: string;
+  deviceId: string;
+  id: string;
+  sender: "controller" | "host";
+  senderName?: string;
+  text: string;
+  ts: number;
+}
+
+export interface SessionPendingMessage {
+  type: "session.pending";
+  sessionId: string;
+  deviceId: string;
+  message?: string;
+}
+
+export interface SessionPermissionsMessage {
+  type: "session.permissions";
+  sessionId: string;
+  deviceId: string;
+  permissions: SessionPermissions;
+}
+
 export interface PingMessage {
   type: "ping";
   ts: number;
@@ -370,6 +465,10 @@ export type WireMessage =
   | ControlCmdMessage
   | ControlAckMessage
   | ClipboardSyncMessage
+  | CursorUpdateMessage
+  | ChatMessage
+  | SessionPendingMessage
+  | SessionPermissionsMessage
   | PingMessage
   | PongMessage
   | ErrorMessage;

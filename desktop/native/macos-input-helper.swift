@@ -10,6 +10,16 @@ import AppKit
 //   --request-screen         Triggers macOS Screen Recording prompt, prints permission JSON, exits 0
 //   (default)                Persistent NDJSON daemon reading commands from stdin
 
+private let VELODECK_EVENT_MAGIC: Int64 = 0x56444C4B
+private let stdoutLock = NSLock()
+
+private func writeStdoutLine(_ line: String) {
+    stdoutLock.lock()
+    defer { stdoutLock.unlock() }
+    print(line)
+    fflush(stdout)
+}
+
 private struct ButtonState {
     var leftDown = false
     var rightDown = false
@@ -20,9 +30,260 @@ private struct ButtonState {
 private func printPermissionsJson(accessibility: Bool, screenCapture: Bool) {
     let accStr = accessibility ? "true" : "false"
     let scrStr = screenCapture ? "true" : "false"
-    print("{\"accessibility\":\(accStr),\"screenCapture\":\(scrStr)}")
-    fflush(stdout)
+    writeStdoutLine("{\"accessibility\":\(accStr),\"screenCapture\":\(scrStr)}")
 }
+
+private func activeDisplaysUnionBounds() -> CGRect {
+    var displayCount: UInt32 = 0
+    CGGetActiveDisplayList(0, nil, &displayCount)
+    if displayCount == 0 {
+        return CGDisplayBounds(CGMainDisplayID())
+    }
+    var displays = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
+    let err = CGGetActiveDisplayList(displayCount, &displays, &displayCount)
+    if err != .success || displayCount == 0 {
+        return CGDisplayBounds(CGMainDisplayID())
+    }
+    var unionRect = CGDisplayBounds(displays[0])
+    for i in 1..<Int(displayCount) {
+        unionRect = unionRect.union(CGDisplayBounds(displays[i]))
+    }
+    return unionRect
+}
+
+private final class CursorShapeClassifier {
+    private struct Entry {
+        let cursor: NSCursor
+        let tiff: Data?
+        let hotSpot: NSPoint
+        let shape: String
+    }
+
+    private lazy var entries: [Entry] = {
+        let pairs: [(NSCursor, String)] = [
+            (NSCursor.arrow, "default"),
+            (NSCursor.iBeam, "text"),
+            (NSCursor.iBeamCursorForVerticalLayout, "text"),
+            (NSCursor.pointingHand, "pointer"),
+            (NSCursor.crosshair, "crosshair"),
+            (NSCursor.openHand, "grab"),
+            (NSCursor.closedHand, "grabbing"),
+            (NSCursor.resizeLeftRight, "ew-resize"),
+            (NSCursor.resizeLeft, "ew-resize"),
+            (NSCursor.resizeRight, "ew-resize"),
+            (NSCursor.resizeUpDown, "ns-resize"),
+            (NSCursor.resizeUp, "ns-resize"),
+            (NSCursor.resizeDown, "ns-resize"),
+            (NSCursor.operationNotAllowed, "not-allowed"),
+        ]
+        return pairs.map { (cur, shape) in
+            Entry(
+                cursor: cur,
+                tiff: cur.image.tiffRepresentation,
+                hotSpot: cur.hotSpot,
+                shape: shape
+            )
+        }
+    }()
+
+    func queryCurrentShape() -> String {
+        guard let current = NSCursor.currentSystem else {
+            return "default"
+        }
+        let currentTiff = current.image.tiffRepresentation
+        for entry in entries {
+            if current == entry.cursor {
+                return entry.shape
+            }
+            if let curTiff = currentTiff, let refTiff = entry.tiff, curTiff == refTiff {
+                return entry.shape
+            }
+        }
+        return "default"
+    }
+}
+
+private let cursorClassifier = CursorShapeClassifier()
+
+private func inputBlockTapCallback(
+    proxy: CGEventTapProxy,
+    type: CGEventType,
+    event: CGEvent,
+    userInfo: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    guard let raw = userInfo else {
+        return Unmanaged.passUnretained(event)
+    }
+    let blocker = Unmanaged<InputBlocker>.fromOpaque(raw).takeUnretainedValue()
+
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        blocker.reenableIfActive()
+        return Unmanaged.passUnretained(event)
+    }
+
+    if !blocker.isEnabled {
+        return Unmanaged.passUnretained(event)
+    }
+
+    // Always allow events injected by VeloDeck itself
+    if event.getIntegerValueField(.eventSourceUserData) == VELODECK_EVENT_MAGIC {
+        return Unmanaged.passUnretained(event)
+    }
+
+    // Emergency local unlock: Option+Ctrl+Esc or Option+Cmd+Esc
+    if type == .keyDown {
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        let flags = event.flags
+        if keyCode == 53 &&
+            flags.contains(.maskAlternate) &&
+            (flags.contains(.maskControl) || flags.contains(.maskCommand)) {
+            blocker.disableFromEmergencyUnlock()
+            return Unmanaged.passUnretained(event)
+        }
+    }
+
+    // Block all other local physical mouse/keyboard events while enabled
+    return nil
+}
+
+private final class InputBlocker {
+    private let lock = NSLock()
+    private var enabled = false
+    private var machPort: CFMachPort?
+    private var runLoop: CFRunLoop?
+    private var runLoopSource: CFRunLoopSource?
+    private var tapThread: Thread?
+
+    var isEnabled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return enabled
+    }
+
+    func reenableIfActive() {
+        lock.lock()
+        let active = enabled
+        let port = machPort
+        lock.unlock()
+        if active, let port = port {
+            CGEvent.tapEnable(tap: port, enable: true)
+        }
+    }
+
+    func disableFromEmergencyUnlock() {
+        _ = setEnabled(false)
+        writeStdoutLine("{\"event\":\"block_input_unlocked\"}")
+    }
+
+    @discardableResult
+    func setEnabled(_ target: Bool) -> Bool {
+        if !target {
+            lock.lock()
+            enabled = false
+            let port = machPort
+            let rl = runLoop
+            lock.unlock()
+            if let port = port {
+                CGEvent.tapEnable(tap: port, enable: false)
+            }
+            if let rl = rl {
+                CFRunLoopStop(rl)
+            }
+            return true
+        }
+
+        lock.lock()
+        if enabled && machPort != nil {
+            lock.unlock()
+            return true
+        }
+        lock.unlock()
+
+        let readySem = DispatchSemaphore(value: 0)
+        var created = false
+
+        let thread = Thread { [weak self] in
+            guard let self = self else {
+                readySem.signal()
+                return
+            }
+
+            let mask: CGEventMask =
+                (1 << CGEventType.leftMouseDown.rawValue) |
+                (1 << CGEventType.leftMouseUp.rawValue) |
+                (1 << CGEventType.rightMouseDown.rawValue) |
+                (1 << CGEventType.rightMouseUp.rawValue) |
+                (1 << CGEventType.mouseMoved.rawValue) |
+                (1 << CGEventType.leftMouseDragged.rawValue) |
+                (1 << CGEventType.rightMouseDragged.rawValue) |
+                (1 << CGEventType.otherMouseDown.rawValue) |
+                (1 << CGEventType.otherMouseUp.rawValue) |
+                (1 << CGEventType.otherMouseDragged.rawValue) |
+                (1 << CGEventType.scrollWheel.rawValue) |
+                (1 << CGEventType.keyDown.rawValue) |
+                (1 << CGEventType.keyUp.rawValue) |
+                (1 << CGEventType.flagsChanged.rawValue)
+
+            guard let tap = CGEvent.tapCreate(
+                tap: .cgSessionEventTap,
+                place: .headInsertEventTap,
+                options: .defaultTap,
+                eventsOfInterest: mask,
+                callback: inputBlockTapCallback,
+                userInfo: Unmanaged.passUnretained(self).toOpaque()
+            ) else {
+                readySem.signal()
+                return
+            }
+
+            let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+            let rl = CFRunLoopGetCurrent()
+            if let source = source, let rl = rl {
+                CFRunLoopAddSource(rl, source, .commonModes)
+            }
+            CGEvent.tapEnable(tap: tap, enable: true)
+
+            self.lock.lock()
+            self.machPort = tap
+            self.runLoop = rl
+            self.runLoopSource = source
+            self.enabled = true
+            self.lock.unlock()
+
+            created = true
+            readySem.signal()
+
+            CFRunLoopRun()
+
+            // Cleanup after run loop stops
+            CGEvent.tapEnable(tap: tap, enable: false)
+            if let source = source, let rl = rl {
+                CFRunLoopRemoveSource(rl, source, .commonModes)
+            }
+            CFMachPortInvalidate(tap)
+
+            self.lock.lock()
+            if self.machPort === tap {
+                self.machPort = nil
+                self.runLoop = nil
+                self.runLoopSource = nil
+                self.tapThread = nil
+                self.enabled = false
+            }
+            self.lock.unlock()
+        }
+
+        lock.lock()
+        tapThread = thread
+        lock.unlock()
+        thread.start()
+
+        _ = readySem.wait(timeout: .now() + 2.0)
+        return created
+    }
+}
+
+private let inputBlocker = InputBlocker()
 
 private func makeEventSource() -> CGEventSource? {
     guard let src = CGEventSource(stateID: .hidSystemState) else {
@@ -299,7 +560,9 @@ private func postMouseEvent(
     type: CGEventType,
     point: CGPoint,
     button: CGMouseButton,
-    clickCount: Int64? = nil
+    clickCount: Int64? = nil,
+    deltaX: Int64? = nil,
+    deltaY: Int64? = nil
 ) {
     guard let ev = CGEvent(
         mouseEventSource: source,
@@ -312,6 +575,13 @@ private func postMouseEvent(
     if let count = clickCount {
         ev.setIntegerValueField(.mouseEventClickState, value: max(1, min(3, count)))
     }
+    if let dx = deltaX {
+        ev.setIntegerValueField(.mouseEventDeltaX, value: dx)
+    }
+    if let dy = deltaY {
+        ev.setIntegerValueField(.mouseEventDeltaY, value: dy)
+    }
+    ev.setIntegerValueField(.eventSourceUserData, value: VELODECK_EVENT_MAGIC)
     ev.post(tap: .cghidEventTap)
 }
 
@@ -334,6 +604,7 @@ private func postKey(
         }
     }
     ev.flags = effectiveFlags
+    ev.setIntegerValueField(.eventSourceUserData, value: VELODECK_EVENT_MAGIC)
     ev.post(tap: .cghidEventTap)
 }
 
@@ -360,6 +631,7 @@ private func injectUnicodeText(source: CGEventSource?, text: String) {
                     down.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: ptr)
                 }
             }
+            down.setIntegerValueField(.eventSourceUserData, value: VELODECK_EVENT_MAGIC)
             down.post(tap: .cghidEventTap)
         }
         if let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
@@ -369,6 +641,7 @@ private func injectUnicodeText(source: CGEventSource?, text: String) {
                     up.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: ptr)
                 }
             }
+            up.setIntegerValueField(.eventSourceUserData, value: VELODECK_EVENT_MAGIC)
             up.post(tap: .cghidEventTap)
         }
         index = end
@@ -380,8 +653,18 @@ private func handleCommand(_ dict: [String: Any], state: inout ButtonState, sour
 
     switch action {
     case "ping":
-        print("{\"ok\":true,\"pong\":true}")
-        fflush(stdout)
+        writeStdoutLine("{\"ok\":true,\"pong\":true}")
+
+    case "query_cursor":
+        let shape = cursorClassifier.queryCurrentShape()
+        writeStdoutLine("{\"ok\":true,\"cursor\":\"\(shape)\"}")
+
+    case "block_input":
+        let enabled = (dict["enabled"] as? Bool) == true
+        let ok = inputBlocker.setEnabled(enabled)
+        if enabled && !ok {
+            writeStdoutLine("{\"event\":\"block_input_unlocked\"}")
+        }
 
     case "mouse_move":
         let pt = CGPoint(x: readDouble(dict, "x"), y: readDouble(dict, "y"))
@@ -394,6 +677,55 @@ private func handleCommand(_ dict: [String: Any], state: inout ButtonState, sour
             postMouseEvent(source: source, type: .otherMouseDragged, point: pt, button: .center)
         } else {
             postMouseEvent(source: source, type: .mouseMoved, point: pt, button: .left)
+        }
+
+    case "mouse_move_relative":
+        let dx = max(-2000, min(2000, Int(round(readDouble(dict, "dx")))))
+        let dy = max(-2000, min(2000, Int(round(readDouble(dict, "dy")))))
+        let currentLoc = CGEvent(source: nil)?.location ?? state.lastPoint
+        let union = activeDisplaysUnionBounds()
+        let maxX = max(union.minX, union.maxX - 1.0)
+        let maxY = max(union.minY, union.maxY - 1.0)
+        let nextX = min(max(currentLoc.x + Double(dx), union.minX), maxX)
+        let nextY = min(max(currentLoc.y + Double(dy), union.minY), maxY)
+        let nextPt = CGPoint(x: nextX, y: nextY)
+        state.lastPoint = nextPt
+        if state.leftDown {
+            postMouseEvent(
+                source: source,
+                type: .leftMouseDragged,
+                point: nextPt,
+                button: .left,
+                deltaX: Int64(dx),
+                deltaY: Int64(dy)
+            )
+        } else if state.rightDown {
+            postMouseEvent(
+                source: source,
+                type: .rightMouseDragged,
+                point: nextPt,
+                button: .right,
+                deltaX: Int64(dx),
+                deltaY: Int64(dy)
+            )
+        } else if state.middleDown {
+            postMouseEvent(
+                source: source,
+                type: .otherMouseDragged,
+                point: nextPt,
+                button: .center,
+                deltaX: Int64(dx),
+                deltaY: Int64(dy)
+            )
+        } else {
+            postMouseEvent(
+                source: source,
+                type: .mouseMoved,
+                point: nextPt,
+                button: .left,
+                deltaX: Int64(dx),
+                deltaY: Int64(dy)
+            )
         }
 
     case "mouse_down":
@@ -450,6 +782,7 @@ private func handleCommand(_ dict: [String: Any], state: inout ButtonState, sour
             wheel2: Int32(-clampedDx),
             wheel3: 0
         ) {
+            ev.setIntegerValueField(.eventSourceUserData, value: VELODECK_EVENT_MAGIC)
             ev.post(tap: .cghidEventTap)
         }
 
@@ -509,6 +842,7 @@ private func handleCommand(_ dict: [String: Any], state: inout ButtonState, sour
         postKey(source: source, keyCode: 0x0C, keyDown: false, flags: flags)
 
     case "release_all":
+        inputBlocker.setEnabled(false)
         if state.leftDown {
             state.leftDown = false
             postMouseEvent(source: source, type: .leftMouseUp, point: state.lastPoint, button: .left, clickCount: 1)
@@ -566,3 +900,5 @@ while let line = readLine(strippingNewline: true) {
     }
     handleCommand(dict, state: &buttonState, source: eventSource)
 }
+
+inputBlocker.setEnabled(false)

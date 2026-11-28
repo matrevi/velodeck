@@ -4,14 +4,18 @@ import {
   isWireMessage,
   normalizeControlCode,
   peekMediaFrameSessionId,
+  type AccessApprovalMode,
   type AgentRegisterMessage,
   type AgentRegisteredMessage,
   type AgentTelemetryMessage,
+  type ChatMessage,
   type ClipboardSyncMessage,
   type ControlAckMessage,
   type ControlCmdMessage,
   type ControllerAuthMessage,
   type ControllerAuthedMessage,
+  type CursorShape,
+  type CursorUpdateMessage,
   type DesktopPowerOperation,
   type DeviceCapabilities,
   type DevicePlatform,
@@ -27,12 +31,16 @@ import {
   type RtcIceMessage,
   type RtcOfferMessage,
   type SessionEndMessage,
+  type SessionPendingMessage,
+  type SessionPermissions,
+  type SessionPermissionsMessage,
   type SessionReadyMessage,
   type SessionRequestMessage,
   type StreamQuality,
   type TransportMode,
   type UserProfile,
   type VideoCodecPreference,
+  type WhiteboardStroke,
   type WireMessage,
 } from "@velodeck/protocol";
 import { AuditLogger, type AuditEvent } from "./audit.js";
@@ -59,6 +67,7 @@ import { buildIceServers } from "./turn.js";
 const MAX_CONTROLLER_BUFFERED_BYTES = 64 * 1024;
 const MAX_OUTBOUND_BUFFERED_BYTES = 2 * 1024 * 1024; // 2 MB guard against stalled peers OOMing container
 const PENDING_SESSION_TIMEOUT_MS = 30_000;
+const APPROVAL_PENDING_SESSION_TIMEOUT_MS = 90_000;
 const REPLACE_TERMINATE_GRACE_MS = 2_000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const HOUR_WINDOW_MS = 3_600_000;
@@ -68,6 +77,9 @@ const MAX_TRACKED_MAP_ENTRIES = 10_000;
 const MAX_PRE_AUTH_TEXT_BYTES = 8 * 1024;
 const MAX_POST_AUTH_TEXT_BYTES = 64 * 1024;
 const MAX_CLIPBOARD_TEXT_BYTES = 64 * 1024;
+const MAX_CHAT_TEXT_BYTES = 4096;
+const MAX_MAC_ADDRESSES = 8;
+const MAX_WHITEBOARD_STROKE_POINTS = 256;
 const MAX_SESSIONS_PER_DEVICE = 2;
 const MAX_SESSIONS_PER_CONTROLLER = 5;
 const MAX_OUT_OF_BAND_PER_CONTROLLER = 10;
@@ -82,6 +94,7 @@ const LOCKOUT_QUIET_RESET_MS = 30 * 60_000;
 const SESSION_ID_REGEX = /^[a-zA-Z0-9_-]{8,64}$/;
 const CONTROL_CODE_REGEX = /^\d{9}$/;
 const IPV4_REGEX = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+const MAC_ADDRESS_REGEX = /^[0-9a-fA-F]{2}([:\-][0-9a-fA-F]{2}){5}$/;
 
 export interface HubStats {
   devicesOnline: number;
@@ -135,6 +148,7 @@ interface SessionRecord {
   controllerConn: ClientConn;
   createdAt: number;
   ready: boolean;
+  approvalPending?: boolean;
 }
 
 interface OutOfBandEntry {
@@ -354,6 +368,160 @@ function isRfc1918OrCgnatIpv4(ip: string): boolean {
   return false;
 }
 
+const VALID_CURSOR_SHAPES = new Set<CursorShape>([
+  "default",
+  "pointer",
+  "text",
+  "crosshair",
+  "move",
+  "ew-resize",
+  "ns-resize",
+  "nwse-resize",
+  "nesw-resize",
+  "grab",
+  "grabbing",
+  "not-allowed",
+  "wait",
+  "none",
+]);
+
+function sanitizeAccessMode(value: unknown): AccessApprovalMode | undefined {
+  if (value === "auto" || value === "confirm") {
+    return value;
+  }
+  return undefined;
+}
+
+function normalizeMacAddress(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!MAC_ADDRESS_REGEX.test(trimmed)) {
+    return undefined;
+  }
+  return trimmed.replace(/-/g, ":").toUpperCase();
+}
+
+function sanitizeMacAddresses(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const macs: string[] = [];
+  const seen = new Set<string>();
+  const maxScan = Math.min(value.length, 32);
+  for (let i = 0; i < maxScan; i += 1) {
+    if (macs.length >= MAX_MAC_ADDRESSES) {
+      break;
+    }
+    const normalized = normalizeMacAddress(value[i]);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    macs.push(normalized);
+  }
+  return macs.length > 0 ? macs : undefined;
+}
+
+function sanitizeLanIp(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > 15) {
+    return undefined;
+  }
+  if (!isRfc1918OrCgnatIpv4(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+function isValidWolBroadcastIp(value: unknown): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  if (value === "255.255.255.255") {
+    return true;
+  }
+  return isRfc1918OrCgnatIpv4(value);
+}
+
+function isValidCursorShape(value: unknown): value is CursorShape {
+  return typeof value === "string" && VALID_CURSOR_SHAPES.has(value as CursorShape);
+}
+
+function isValidWhiteboardStroke(value: unknown): value is WhiteboardStroke {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const stroke = value as Record<string, unknown>;
+  if (
+    typeof stroke.id !== "string" ||
+    stroke.id.trim().length === 0 ||
+    stroke.id.length > 64 ||
+    /[\x00-\x1f\x7f]/.test(stroke.id)
+  ) {
+    return false;
+  }
+  if (
+    typeof stroke.color !== "string" ||
+    stroke.color.trim().length === 0 ||
+    stroke.color.length > 24 ||
+    /[\x00-\x1f\x7f]/.test(stroke.color)
+  ) {
+    return false;
+  }
+  if (!isFiniteNumber(stroke.width) || stroke.width < 1 || stroke.width > 32) {
+    return false;
+  }
+  if (
+    !Array.isArray(stroke.points) ||
+    stroke.points.length === 0 ||
+    stroke.points.length > MAX_WHITEBOARD_STROKE_POINTS
+  ) {
+    return false;
+  }
+  for (let i = 0; i < stroke.points.length; i += 1) {
+    const pt = stroke.points[i];
+    if (typeof pt !== "object" || pt === null || Array.isArray(pt)) {
+      return false;
+    }
+    const rawPt = pt as Record<string, unknown>;
+    if (!isFiniteNumber(rawPt.x) || !isFiniteNumber(rawPt.y)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sanitizeSessionPermissions(value: unknown): SessionPermissions | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const keys: Array<keyof SessionPermissions> = [
+    "keyboard",
+    "mouse",
+    "clipboard",
+    "fileTransfer",
+    "audio",
+    "terminal",
+  ];
+  const out: SessionPermissions = {};
+  for (const key of keys) {
+    const entry = raw[key];
+    if (entry !== undefined) {
+      if (typeof entry !== "boolean") {
+        return null;
+      }
+      out[key] = entry;
+    }
+  }
+  return out;
+}
+
 export function validateDirectUrl(raw: unknown): string | undefined {
   if (typeof raw !== "string") {
     return undefined;
@@ -509,6 +677,27 @@ function cloneCapabilities(cap: DeviceCapabilities): DeviceCapabilities {
   if (cap.highRefresh !== undefined) {
     copy.highRefresh = Boolean(cap.highRefresh);
   }
+  if (cap.remoteTerminal !== undefined) {
+    copy.remoteTerminal = Boolean(cap.remoteTerminal);
+  }
+  if (cap.relativeMouse !== undefined) {
+    copy.relativeMouse = Boolean(cap.relativeMouse);
+  }
+  if (cap.cursorSync !== undefined) {
+    copy.cursorSync = Boolean(cap.cursorSync);
+  }
+  if (cap.blockInput !== undefined) {
+    copy.blockInput = Boolean(cap.blockInput);
+  }
+  if (cap.wolRelay !== undefined) {
+    copy.wolRelay = Boolean(cap.wolRelay);
+  }
+  if (cap.whiteboard !== undefined) {
+    copy.whiteboard = Boolean(cap.whiteboard);
+  }
+  if (cap.chat !== undefined) {
+    copy.chat = Boolean(cap.chat);
+  }
   return copy;
 }
 
@@ -546,6 +735,13 @@ function mergeCapabilities(
   if (typeof patch.fileManager === "boolean") merged.fileManager = patch.fileManager;
   if (typeof patch.powerControl === "boolean") merged.powerControl = patch.powerControl;
   if (typeof patch.highRefresh === "boolean") merged.highRefresh = patch.highRefresh;
+  if (typeof patch.remoteTerminal === "boolean") merged.remoteTerminal = patch.remoteTerminal;
+  if (typeof patch.relativeMouse === "boolean") merged.relativeMouse = patch.relativeMouse;
+  if (typeof patch.cursorSync === "boolean") merged.cursorSync = patch.cursorSync;
+  if (typeof patch.blockInput === "boolean") merged.blockInput = patch.blockInput;
+  if (typeof patch.wolRelay === "boolean") merged.wolRelay = patch.wolRelay;
+  if (typeof patch.whiteboard === "boolean") merged.whiteboard = patch.whiteboard;
+  if (typeof patch.chat === "boolean") merged.chat = patch.chat;
   return merged;
 }
 
@@ -1139,10 +1335,13 @@ export class VeloDeckHub {
         }
       }
 
-      // Prune unacknowledged session.request entries older than 30s so dead handshakes cannot exhaust session quotas.
-      const pendingSessionCutoff = now - PENDING_SESSION_TIMEOUT_MS;
+      // Prune unacknowledged session.request entries older than 30s (or 90s while awaiting local host approval)
+      // so dead handshakes cannot exhaust session quotas.
       for (const [sessionId, session] of Array.from(this.sessions.entries())) {
-        if (!session.ready && session.createdAt < pendingSessionCutoff) {
+        const timeoutMs = session.approvalPending
+          ? APPROVAL_PENDING_SESSION_TIMEOUT_MS
+          : PENDING_SESSION_TIMEOUT_MS;
+        if (!session.ready && session.createdAt < now - timeoutMs) {
           this.sessions.delete(sessionId);
           const endMsg: SessionEndMessage = {
             type: "session.end",
@@ -1404,6 +1603,18 @@ export class VeloDeckHub {
         return;
       case "session.ready":
         this.handleSessionReady(conn, parsed);
+        return;
+      case "session.pending":
+        this.handleSessionPending(conn, parsed);
+        return;
+      case "session.permissions":
+        this.handleSessionPermissions(conn, parsed);
+        return;
+      case "cursor.update":
+        this.handleCursorUpdate(conn, parsed);
+        return;
+      case "chat.msg":
+        this.handleChatMessage(conn, parsed);
         return;
       case "rtc.offer":
       case "rtc.answer":
@@ -1988,6 +2199,32 @@ export class VeloDeckHub {
     if (audioEnabled !== undefined) {
       summary.audioEnabled = audioEnabled;
     }
+    const blockInputActive =
+      typeof msg.blockInputActive === "boolean"
+        ? msg.blockInputActive
+        : prev?.blockInputActive;
+    if (blockInputActive !== undefined) {
+      summary.blockInputActive = blockInputActive;
+    }
+    const accessMode =
+      sanitizeAccessMode(msg.accessMode) ?? sanitizeAccessMode(prev?.accessMode);
+    if (accessMode !== undefined) {
+      summary.accessMode = accessMode;
+    }
+    const macAddresses =
+      msg.macAddresses !== undefined
+        ? sanitizeMacAddresses(msg.macAddresses)
+        : sanitizeMacAddresses(prev?.macAddresses);
+    if (macAddresses !== undefined) {
+      summary.macAddresses = macAddresses;
+    }
+    const lanIp =
+      msg.lanIp !== undefined
+        ? sanitizeLanIp(msg.lanIp)
+        : sanitizeLanIp(prev?.lanIp);
+    if (lanIp !== undefined) {
+      summary.lanIp = lanIp;
+    }
     // Validate directUrl strictly (ws:// or wss:// with RFC1918/CGNAT private IPv4 only)
     const validatedIncomingUrl =
       msg.directUrl !== undefined ? validateDirectUrl(msg.directUrl) : undefined;
@@ -2068,6 +2305,25 @@ export class VeloDeckHub {
     }
     if (typeof msg.audioEnabled === "boolean") {
       s.audioEnabled = msg.audioEnabled;
+    }
+    if (typeof msg.blockInputActive === "boolean") {
+      s.blockInputActive = msg.blockInputActive;
+    }
+    const telemetryAccessMode = sanitizeAccessMode(msg.accessMode);
+    if (telemetryAccessMode !== undefined) {
+      s.accessMode = telemetryAccessMode;
+    }
+    if (msg.macAddresses !== undefined) {
+      const sanitizedMacs = sanitizeMacAddresses(msg.macAddresses);
+      if (sanitizedMacs !== undefined) {
+        s.macAddresses = sanitizedMacs;
+      }
+    }
+    if (msg.lanIp !== undefined) {
+      const sanitizedLanIp = sanitizeLanIp(msg.lanIp);
+      if (sanitizedLanIp !== undefined) {
+        s.lanIp = sanitizedLanIp;
+      }
     }
     const telemetryDeviceType = sanitizeDeviceType(msg.deviceType);
     if (telemetryDeviceType !== undefined) {
@@ -2677,7 +2933,8 @@ export class VeloDeckHub {
       cmd.action === "black_screen" ||
       cmd.action === "force_portrait" ||
       cmd.action === "privacy_screen" ||
-      cmd.action === "audio_toggle"
+      cmd.action === "audio_toggle" ||
+      cmd.action === "block_input"
     ) {
       if (typeof cmd.enabled !== "boolean") {
         this.sendError(conn.ws, "INVALID_MESSAGE", "Invalid boolean enabled flag", {
@@ -2820,7 +3077,58 @@ export class VeloDeckHub {
       }
     }
 
-    // Allow sessionless wake / unlock / black_screen / force_portrait commands from an authorized controller
+    if (cmd.action === "mouse_move_relative") {
+      if (!isFiniteNumber(cmd.dx) || !isFiniteNumber(cmd.dy)) {
+        this.sendError(
+          conn.ws,
+          "INVALID_MESSAGE",
+          "mouse_move_relative requires finite dx and dy",
+          {
+            sessionId: msg.sessionId,
+            deviceId: msg.deviceId,
+          },
+        );
+        return;
+      }
+    }
+
+    if (cmd.action === "whiteboard") {
+      const validClear = cmd.op === "clear" && cmd.stroke === undefined;
+      const validStroke = cmd.op === "stroke" && isValidWhiteboardStroke(cmd.stroke);
+      if (!validClear && !validStroke) {
+        this.sendError(
+          conn.ws,
+          "INVALID_MESSAGE",
+          "whiteboard requires op 'clear' or 'stroke' with valid stroke (<= 256 points, color <= 24 chars, width 1..32)",
+          {
+            sessionId: msg.sessionId,
+            deviceId: msg.deviceId,
+          },
+        );
+        return;
+      }
+    }
+
+    if (cmd.action === "wol") {
+      const macValid =
+        typeof cmd.macAddress === "string" && MAC_ADDRESS_REGEX.test(cmd.macAddress);
+      const broadcastValid =
+        cmd.broadcastIp === undefined || isValidWolBroadcastIp(cmd.broadcastIp);
+      if (!macValid || !broadcastValid) {
+        this.sendError(
+          conn.ws,
+          "INVALID_MESSAGE",
+          "wol requires a valid MAC address and optional RFC1918/CGNAT or 255.255.255.255 broadcastIp",
+          {
+            sessionId: msg.sessionId,
+            deviceId: msg.deviceId,
+          },
+        );
+        return;
+      }
+    }
+
+    // Allow sessionless wake / unlock / black_screen / force_portrait / wol commands from an authorized controller
     if (!isNonEmptyString(msg.sessionId)) {
       if (conn.role !== "controller") {
         this.sendError(conn.ws, "UNAUTHORIZED", "Controller authentication required", {
@@ -2833,7 +3141,8 @@ export class VeloDeckHub {
         action !== "wake" &&
         action !== "unlock" &&
         action !== "black_screen" &&
-        action !== "force_portrait"
+        action !== "force_portrait" &&
+        action !== "wol"
       ) {
         this.sendError(
           conn.ws,
@@ -2895,6 +3204,9 @@ export class VeloDeckHub {
           break;
         case "force_portrait":
           sessionlessAuditEvent = "control.force_portrait";
+          break;
+        case "wol":
+          sessionlessAuditEvent = "control.wol";
           break;
       }
       this.audit.log({
@@ -2963,6 +3275,14 @@ export class VeloDeckHub {
       case "power":
         inSessionAuditEvent = "control.power";
         inSessionAuditDetail = cmd.operation;
+        break;
+      case "block_input":
+        inSessionAuditEvent = "control.block_input";
+        inSessionAuditDetail = cmd.enabled ? "on" : "off";
+        break;
+      case "wol":
+        inSessionAuditEvent = "control.wol";
+        inSessionAuditDetail = normalizeMacAddress(cmd.macAddress);
         break;
       default:
         break;
@@ -3091,6 +3411,243 @@ export class VeloDeckHub {
       sessionId: msg.sessionId,
       deviceId: msg.deviceId,
     });
+  }
+
+  private handleCursorUpdate(conn: ClientConn, msg: CursorUpdateMessage): void {
+    const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
+    if (!session) {
+      this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
+        sessionId: typeof msg.sessionId === "string" ? msg.sessionId : undefined,
+        deviceId: typeof msg.deviceId === "string" ? msg.deviceId : undefined,
+      });
+      return;
+    }
+    if (!this.isSessionAgent(conn, session)) {
+      this.sendError(conn.ws, "UNAUTHORIZED", "Only the target agent may send cursor.update", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+    if (msg.deviceId !== session.deviceId) {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "deviceId does not match session", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+    if (
+      !isValidCursorShape(msg.shape) ||
+      (msg.visible !== undefined && typeof msg.visible !== "boolean")
+    ) {
+      this.sendError(
+        conn.ws,
+        "INVALID_MESSAGE",
+        "cursor.update requires a valid cursor shape and optional boolean visible",
+        {
+          sessionId: msg.sessionId,
+          deviceId: msg.deviceId,
+        },
+      );
+      return;
+    }
+    const forwarded: CursorUpdateMessage = {
+      type: "cursor.update",
+      sessionId: session.sessionId,
+      deviceId: session.deviceId,
+      shape: msg.shape,
+      ...(typeof msg.visible === "boolean" ? { visible: msg.visible } : {}),
+    };
+    this.sendJson(session.controllerConn.ws, forwarded);
+  }
+
+  private handleChatMessage(conn: ClientConn, msg: ChatMessage): void {
+    const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
+    if (!session) {
+      this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
+        sessionId: typeof msg.sessionId === "string" ? msg.sessionId : undefined,
+        deviceId: typeof msg.deviceId === "string" ? msg.deviceId : undefined,
+      });
+      return;
+    }
+
+    const fromController = session.controllerConn === conn;
+    const fromAgent = this.isSessionAgent(conn, session);
+    if (!fromController && !fromAgent) {
+      this.sendError(conn.ws, "UNAUTHORIZED", "Not authorized for this session", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+
+    if (msg.deviceId !== session.deviceId) {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "deviceId does not match session", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+
+    if (
+      typeof msg.text !== "string" ||
+      msg.text.trim().length === 0 ||
+      Buffer.byteLength(msg.text, "utf8") > MAX_CHAT_TEXT_BYTES
+    ) {
+      this.sendError(
+        conn.ws,
+        "INVALID_MESSAGE",
+        "Chat message text must be non-empty and at most 4096 bytes",
+        {
+          sessionId: msg.sessionId,
+          deviceId: msg.deviceId,
+        },
+      );
+      return;
+    }
+
+    const cleanId = sanitizeLabel(msg.id, "", 64);
+    if (!cleanId) {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "Chat message id must be a non-empty string", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+
+    if (msg.senderName !== undefined && typeof msg.senderName !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "Chat senderName must be a string", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+    const cleanSenderName =
+      typeof msg.senderName === "string" ? sanitizeLabel(msg.senderName, "", 64) : "";
+
+    // Enforce sender strictly from authenticated connection role so neither peer can spoof sender.
+    const enforcedSender: ChatMessage["sender"] = conn.role === "agent" ? "host" : "controller";
+    const ts =
+      typeof msg.ts === "number" && Number.isFinite(msg.ts) && msg.ts > 0 ? msg.ts : Date.now();
+
+    const forwarded: ChatMessage = {
+      type: "chat.msg",
+      sessionId: session.sessionId,
+      deviceId: session.deviceId,
+      id: cleanId,
+      sender: enforcedSender,
+      ...(cleanSenderName ? { senderName: cleanSenderName } : {}),
+      text: msg.text,
+      ts,
+    };
+
+    if (fromController) {
+      const agentConn = this.getAgentForSession(session);
+      if (!agentConn) {
+        this.sendError(conn.ws, "DEVICE_OFFLINE", "Target device is offline", {
+          sessionId: msg.sessionId,
+          deviceId: session.deviceId,
+        });
+        return;
+      }
+      this.sendJson(agentConn.ws, forwarded);
+      return;
+    }
+
+    this.sendJson(session.controllerConn.ws, forwarded);
+  }
+
+  private handleSessionPending(conn: ClientConn, msg: SessionPendingMessage): void {
+    const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
+    if (!session) {
+      this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
+        sessionId: typeof msg.sessionId === "string" ? msg.sessionId : undefined,
+        deviceId: typeof msg.deviceId === "string" ? msg.deviceId : undefined,
+      });
+      return;
+    }
+    if (!this.isSessionAgent(conn, session)) {
+      this.sendError(conn.ws, "UNAUTHORIZED", "Only the target agent may send session.pending", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+    if (msg.deviceId !== session.deviceId) {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "deviceId does not match session", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+    if (msg.message !== undefined && typeof msg.message !== "string") {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "session.pending message must be a string", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+
+    session.approvalPending = true;
+    const cleanMessage =
+      typeof msg.message === "string" ? sanitizeLabel(msg.message, "", 256) : "";
+    const forwarded: SessionPendingMessage = {
+      type: "session.pending",
+      sessionId: session.sessionId,
+      deviceId: session.deviceId,
+      ...(cleanMessage ? { message: cleanMessage } : {}),
+    };
+    this.sendJson(session.controllerConn.ws, forwarded);
+  }
+
+  private handleSessionPermissions(conn: ClientConn, msg: SessionPermissionsMessage): void {
+    const session = isNonEmptyString(msg.sessionId) ? this.sessions.get(msg.sessionId) : undefined;
+    if (!session) {
+      this.sendError(conn.ws, "SESSION_NOT_FOUND", "Active session not found", {
+        sessionId: typeof msg.sessionId === "string" ? msg.sessionId : undefined,
+        deviceId: typeof msg.deviceId === "string" ? msg.deviceId : undefined,
+      });
+      return;
+    }
+    if (!this.isSessionAgent(conn, session)) {
+      this.sendError(
+        conn.ws,
+        "UNAUTHORIZED",
+        "Only the target agent may send session.permissions",
+        {
+          sessionId: msg.sessionId,
+          deviceId: msg.deviceId,
+        },
+      );
+      return;
+    }
+    if (msg.deviceId !== session.deviceId) {
+      this.sendError(conn.ws, "INVALID_MESSAGE", "deviceId does not match session", {
+        sessionId: msg.sessionId,
+        deviceId: msg.deviceId,
+      });
+      return;
+    }
+    const permissions = sanitizeSessionPermissions(msg.permissions);
+    if (!permissions) {
+      this.sendError(
+        conn.ws,
+        "INVALID_MESSAGE",
+        "session.permissions requires a valid permissions object with boolean fields",
+        {
+          sessionId: msg.sessionId,
+          deviceId: msg.deviceId,
+        },
+      );
+      return;
+    }
+    const forwarded: SessionPermissionsMessage = {
+      type: "session.permissions",
+      sessionId: session.sessionId,
+      deviceId: session.deviceId,
+      permissions,
+    };
+    this.sendJson(session.controllerConn.ws, forwarded);
   }
 
   private handleSessionEnd(conn: ClientConn, msg: SessionEndMessage): void {

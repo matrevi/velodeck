@@ -4,13 +4,19 @@ import {
   decodeMediaFrame,
   isWireMessage,
   normalizeControlCode,
+  type ChatMessage,
   type ClipboardSyncMessage,
   type ControlAckMessage,
   type ControlCommand,
+  type CursorShape,
+  type CursorUpdateMessage,
   type DeviceSummary,
   type ErrorMessage,
   type IceServerConfig,
   type MediaFrame,
+  type SessionPendingMessage,
+  type SessionPermissions,
+  type SessionPermissionsMessage,
   type SessionReadyMessage,
   type StreamQuality,
   type TransportMode,
@@ -168,6 +174,12 @@ export interface RemoteFsDownloadResult {
   sha256: string;
 }
 
+export type TerminalEvent =
+  | { type: "term_ready"; termId: string; shell: string; cwd: string }
+  | { type: "term_data"; termId: string; data: string }
+  | { type: "term_exit"; termId: string; exitCode: number }
+  | { type: "term_error"; termId: string; error: string };
+
 export interface RemoteClientState {
   profile: ConnectionProfile | null;
   authType: AuthType | null;
@@ -194,6 +206,13 @@ export interface RemoteClientState {
   desktopQuality: StreamQuality | null;
   dataChannelOpen: boolean;
   fileChannelOpen: boolean;
+  terminalReady: boolean;
+  remoteCursorShape: CursorShape;
+  remoteCursorVisible: boolean;
+  chatMessages: ChatMessage[];
+  unreadChatCount: number;
+  pendingApprovalMessage: string | null;
+  sessionPermissions: SessionPermissions | null;
   fileTransfer: FileTransferState | null;
   fileDownload: RemoteFsDownloadState;
   mediaStream: MediaStream | null;
@@ -224,6 +243,7 @@ type TelemetryListener = (telemetry: RemoteTelemetrySnapshot) => void;
 type FrameListener = (frame: MediaFrame) => void;
 type AckListener = (ack: ControlAckMessage) => void;
 type ClipboardListener = (msg: ClipboardSyncMessage) => void;
+type TerminalListener = (ev: TerminalEvent) => void;
 
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const HEARTBEAT_WATCHDOG_CHECK_MS = 5_000;
@@ -258,6 +278,24 @@ const FILE_PROGRESS_THROTTLE_MS = 120;
 const FS_RPC_TIMEOUT_MS = 10_000;
 const FS_DOWNLOAD_IDLE_TIMEOUT_MS = 30_000;
 const FS_DOWNLOAD_MAX_BYTES = 256 * 1024 * 1024;
+const MAX_CHAT_MESSAGES = 100;
+const MAX_CHAT_TEXT_LENGTH = 1000;
+const VALID_CURSOR_SHAPES = new Set<CursorShape>([
+  "default",
+  "pointer",
+  "text",
+  "crosshair",
+  "move",
+  "ew-resize",
+  "ns-resize",
+  "nwse-resize",
+  "nesw-resize",
+  "grab",
+  "grabbing",
+  "not-allowed",
+  "wait",
+  "none",
+]);
 
 const EMPTY_FILE_DOWNLOAD_STATE: RemoteFsDownloadState = {
   active: false,
@@ -329,6 +367,13 @@ function createTransferId(): string {
     return `ft-${crypto.randomUUID()}`;
   }
   return `ft-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function createChatMessageId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `chat-${crypto.randomUUID()}`;
+  }
+  return `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 async function toUint8Array(
@@ -405,13 +450,18 @@ function getRequestWsUrl(req: ConnectRequest): string {
 
 /**
  * Strict DataChannel message allowlist guard (P1-10):
- * Only `control.ack` and `clipboard.sync` matching the active sessionId are allowed
- * from the WebRTC peer DataChannel. All signaling/auth/status messages are rejected.
+ * Only `control.ack`, `clipboard.sync`, `cursor.update`, and `chat.msg` matching
+ * the active sessionId are allowed from WebRTC peer DataChannels.
+ * All signaling/auth/status/session control messages are rejected.
  */
 export function isAllowedDataChannelMessage(
   value: unknown,
   expectedSessionId: string | null,
-): value is ControlAckMessage | ClipboardSyncMessage {
+): value is
+  | ControlAckMessage
+  | ClipboardSyncMessage
+  | CursorUpdateMessage
+  | ChatMessage {
   if (!expectedSessionId || !isWireMessage(value)) {
     return false;
   }
@@ -431,6 +481,31 @@ export function isAllowedDataChannelMessage(
       candidate.sessionId === expectedSessionId &&
       typeof candidate.deviceId === "string" &&
       typeof candidate.text === "string"
+    );
+  }
+  if (value.type === "cursor.update") {
+    const candidate = value as Partial<CursorUpdateMessage>;
+    return (
+      typeof candidate.sessionId === "string" &&
+      candidate.sessionId === expectedSessionId &&
+      typeof candidate.deviceId === "string" &&
+      typeof candidate.shape === "string" &&
+      VALID_CURSOR_SHAPES.has(candidate.shape as CursorShape) &&
+      (candidate.visible === undefined || typeof candidate.visible === "boolean")
+    );
+  }
+  if (value.type === "chat.msg") {
+    const candidate = value as Partial<ChatMessage>;
+    return (
+      typeof candidate.sessionId === "string" &&
+      candidate.sessionId === expectedSessionId &&
+      typeof candidate.deviceId === "string" &&
+      typeof candidate.id === "string" &&
+      candidate.id.length > 0 &&
+      (candidate.sender === "controller" || candidate.sender === "host") &&
+      typeof candidate.text === "string" &&
+      typeof candidate.ts === "number" &&
+      Number.isFinite(candidate.ts)
     );
   }
   return false;
@@ -560,6 +635,7 @@ export class RemoteClient {
   private readonly frameListeners = new Set<FrameListener>();
   private readonly ackListeners = new Set<AckListener>();
   private readonly clipboardListeners = new Set<ClipboardListener>();
+  private readonly terminalListeners = new Set<TerminalListener>();
 
   private activeRequest: ConnectRequest | null = null;
   private ws: WebSocket | null = null;
@@ -581,6 +657,8 @@ export class RemoteClient {
   private dataChannel: RTCDataChannel | null = null;
   private pointerDataChannel: RTCDataChannel | null = null;
   private fileDataChannel: RTCDataChannel | null = null;
+  private terminalDataChannel: RTCDataChannel | null = null;
+  private termSeq = 0;
   private activeTouchViaWs = false;
   private activeTouchFirstMovePending = false;
   private activeFileTransfer: ActiveFileTransfer | null = null;
@@ -675,6 +753,13 @@ export class RemoteClient {
     desktopQuality: null,
     dataChannelOpen: false,
     fileChannelOpen: false,
+    terminalReady: false,
+    remoteCursorShape: "default",
+    remoteCursorVisible: true,
+    chatMessages: [],
+    unreadChatCount: 0,
+    pendingApprovalMessage: null,
+    sessionPermissions: null,
     fileTransfer: null,
     fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE },
     mediaStream: null,
@@ -739,6 +824,162 @@ export class RemoteClient {
     return () => {
       this.clipboardListeners.delete(listener);
     };
+  }
+
+  onTerminalEvent(listener: TerminalListener): () => void {
+    this.terminalListeners.add(listener);
+    return () => {
+      this.terminalListeners.delete(listener);
+    };
+  }
+
+  openTerminal(cols = 100, rows = 30): string {
+    const termId = `term-${Date.now().toString(36)}-${++this.termSeq}`;
+    const safeCols = Math.max(20, Math.min(300, Math.round(cols || 100)));
+    const safeRows = Math.max(5, Math.min(120, Math.round(rows || 30)));
+    const termDc = this.terminalDataChannel;
+    if (termDc && termDc.readyState === "open") {
+      try {
+        termDc.send(
+          JSON.stringify({
+            type: "term_open",
+            termId,
+            cols: safeCols,
+            rows: safeRows,
+          }),
+        );
+      } catch {
+        // Ignore send failure; UI will reflect disconnected terminal state
+      }
+    }
+    return termId;
+  }
+
+  sendTerminalInput(termId: string, data: string): boolean {
+    const termDc = this.terminalDataChannel;
+    if (!termId || !termDc || termDc.readyState !== "open") {
+      return false;
+    }
+    try {
+      termDc.send(
+        JSON.stringify({
+          type: "term_data",
+          termId,
+          data,
+        }),
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  resizeTerminal(termId: string, cols: number, rows: number): boolean {
+    const termDc = this.terminalDataChannel;
+    if (!termId || !termDc || termDc.readyState !== "open") {
+      return false;
+    }
+    const safeCols = Math.max(20, Math.min(300, Math.round(cols || 100)));
+    const safeRows = Math.max(5, Math.min(120, Math.round(rows || 30)));
+    try {
+      termDc.send(
+        JSON.stringify({
+          type: "term_resize",
+          termId,
+          cols: safeCols,
+          rows: safeRows,
+        }),
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  closeTerminal(termId: string): void {
+    const termDc = this.terminalDataChannel;
+    if (!termId || !termDc || termDc.readyState !== "open") {
+      return;
+    }
+    try {
+      termDc.send(
+        JSON.stringify({
+          type: "term_close",
+          termId,
+        }),
+      );
+    } catch {
+      // Ignore send errors on closing channel
+    }
+  }
+
+  sendChatMessage(text: string): boolean {
+    const trimmed = text.trim().slice(0, MAX_CHAT_TEXT_LENGTH);
+    if (!trimmed || !this.state.sessionId || !this.state.activeDeviceId) {
+      return false;
+    }
+    const msg: ChatMessage = {
+      type: "chat.msg",
+      sessionId: this.state.sessionId,
+      deviceId: this.state.activeDeviceId,
+      id: createChatMessageId(),
+      sender: "controller",
+      senderName:
+        this.state.user?.displayName ||
+        this.state.user?.username ||
+        getClientDisplayName(),
+      text: trimmed,
+      ts: Date.now(),
+    };
+
+    let sent = false;
+    if (this.dataChannel && this.dataChannel.readyState === "open") {
+      try {
+        this.dataChannel.send(JSON.stringify(msg));
+        sent = true;
+      } catch {
+        sent = false;
+      }
+    }
+    if (!sent) {
+      sent = this.sendJson(msg);
+    }
+    if (!sent) {
+      return false;
+    }
+
+    const nextMessages = [...this.state.chatMessages, msg].slice(-MAX_CHAT_MESSAGES);
+    this.setState({ chatMessages: nextMessages });
+    return true;
+  }
+
+  markChatRead(): void {
+    if (this.state.unreadChatCount !== 0) {
+      this.setState({ unreadChatCount: 0 });
+    }
+  }
+
+  sendWolRelay(
+    relayDeviceId: string,
+    macAddress: string,
+    broadcastIp?: string,
+  ): boolean {
+    const cleanRelayId = relayDeviceId.trim();
+    const cleanMac = macAddress.trim();
+    if (!cleanRelayId || !cleanMac) {
+      return false;
+    }
+    const cleanBroadcast = broadcastIp?.trim() || undefined;
+    const command: ControlCommand = cleanBroadcast
+      ? { action: "wol", macAddress: cleanMac, broadcastIp: cleanBroadcast }
+      : { action: "wol", macAddress: cleanMac };
+    return this.sendJson({
+      type: "control.cmd",
+      sessionId: "",
+      deviceId: cleanRelayId,
+      seq: ++this.cmdSeq,
+      command,
+    });
   }
 
   connect(profile: ConnectionProfile): void {
@@ -823,6 +1064,13 @@ export class RemoteClient {
       desktopQuality: null,
       dataChannelOpen: false,
       fileChannelOpen: false,
+      terminalReady: false,
+      remoteCursorShape: "default",
+      remoteCursorVisible: true,
+      chatMessages: [],
+      unreadChatCount: 0,
+      pendingApprovalMessage: null,
+      sessionPermissions: null,
       fileTransfer: null,
       fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE },
       mediaStream: null,
@@ -862,6 +1110,8 @@ export class RemoteClient {
       webrtcTelemetry: null,
       dataChannelOpen: false,
       fileChannelOpen: false,
+      terminalReady: false,
+      pendingApprovalMessage: null,
       mediaStream: null,
       hasRemoteAudio: false,
     });
@@ -906,6 +1156,13 @@ export class RemoteClient {
       desktopQuality: null,
       dataChannelOpen: false,
       fileChannelOpen: false,
+      terminalReady: false,
+      remoteCursorShape: "default",
+      remoteCursorVisible: true,
+      chatMessages: [],
+      unreadChatCount: 0,
+      pendingApprovalMessage: null,
+      sessionPermissions: null,
       fileTransfer: null,
       fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE },
       mediaStream: null,
@@ -993,6 +1250,13 @@ export class RemoteClient {
       hasRemoteAudio: false,
       dataChannelOpen: false,
       fileChannelOpen: false,
+      terminalReady: false,
+      remoteCursorShape: "default",
+      remoteCursorVisible: true,
+      chatMessages: [],
+      unreadChatCount: 0,
+      pendingApprovalMessage: null,
+      sessionPermissions: null,
       fileTransfer: null,
       fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE },
       errorCode: null,
@@ -1051,6 +1315,13 @@ export class RemoteClient {
       hasRemoteAudio: false,
       dataChannelOpen: false,
       fileChannelOpen: false,
+      terminalReady: false,
+      remoteCursorShape: "default",
+      remoteCursorVisible: true,
+      chatMessages: [],
+      unreadChatCount: 0,
+      pendingApprovalMessage: null,
+      sessionPermissions: null,
       fileTransfer: null,
       fileDownload: { ...EMPTY_FILE_DOWNLOAD_STATE },
       remoteClipboard: "",
@@ -1186,8 +1457,10 @@ export class RemoteClient {
     const isTouchMove = command.action === "touch_move";
     const isTouchUp = command.action === "touch_up";
     const isMouseMove = command.action === "mouse_move";
+    const isMouseMoveRelative = command.action === "mouse_move_relative";
     const isMouseWheel = command.action === "mouse_wheel";
-    const isPointerChannelCommand = isTouchMove || isMouseMove || isMouseWheel;
+    const isPointerChannelCommand =
+      isTouchMove || isMouseMove || isMouseMoveRelative || isMouseWheel;
 
     if (isTouchDown) {
       this.activeTouchViaWs = false;
@@ -1205,11 +1478,11 @@ export class RemoteClient {
     }
 
     // Route high-frequency unreliable pointer commands (steady-state touch_move, mouse_move,
-    // mouse_wheel) over the partially-reliable, in-order "pointer" DataChannel
+    // mouse_move_relative, mouse_wheel) over the partially-reliable, in-order "pointer" DataChannel
     // (ordered: true, maxRetransmits: 0) to avoid HoL retransmit stalls without backward jumps.
-    // State-critical commands (mouse_down, mouse_up, key_event, select_display, tap, long_press,
-    // text, clipboard_set) ALWAYS bypass this branch and use the reliable "control" DataChannel
-    // (or WebSocket fallback) so clicks and key releases are never dropped.
+    // State-critical commands (mouse_down, mouse_up, key_event, select_display, block_input,
+    // whiteboard, wol, tap, long_press, text, clipboard_set) ALWAYS bypass this branch and use
+    // the reliable "control" DataChannel (or WebSocket fallback) so state changes are never dropped.
     if (
       isPointerChannelCommand &&
       !(isTouchMove && (pinTouchToWs || routeFirstMoveOnControlDc)) &&
@@ -1222,7 +1495,7 @@ export class RemoteClient {
           ? this.pointerDataChannel.bufferedAmount
           : 0;
       if (buffered > POINTER_DC_MAX_BUFFERED_BYTES) {
-        if (isTouchMove || isMouseMove) {
+        if (isTouchMove || isMouseMove || isMouseMoveRelative) {
           return { sent: false, seq, channel: "none" };
         }
       } else {
@@ -2205,6 +2478,8 @@ export class RemoteClient {
       webrtcTelemetry: null,
       dataChannelOpen: false,
       fileChannelOpen: false,
+      terminalReady: false,
+      pendingApprovalMessage: null,
       mediaStream: null,
       hasRemoteAudio: false,
       sessionStatus: this.state.activeDeviceId ? "requesting" : "idle",
@@ -2377,6 +2652,11 @@ export class RemoteClient {
             hasRemoteAudio: false,
             dataChannelOpen: false,
             fileChannelOpen: false,
+            terminalReady: false,
+            pendingApprovalMessage: null,
+            sessionPermissions: null,
+            remoteCursorShape: "default",
+            remoteCursorVisible: true,
             fps: 0,
             errorCode: null,
             errorMessage: null,
@@ -2408,6 +2688,11 @@ export class RemoteClient {
           hasRemoteAudio: false,
           dataChannelOpen: false,
           fileChannelOpen: false,
+          terminalReady: false,
+          pendingApprovalMessage: null,
+          sessionPermissions: null,
+          remoteCursorShape: "default",
+          remoteCursorVisible: true,
           fps: 0,
           errorMessage: parsed.reason
             ? `会话已结束：${parsed.reason}`
@@ -2435,6 +2720,26 @@ export class RemoteClient {
 
       case "clipboard.sync": {
         this.handleClipboardSync(parsed);
+        break;
+      }
+
+      case "cursor.update": {
+        this.handleCursorUpdate(parsed);
+        break;
+      }
+
+      case "chat.msg": {
+        this.handleChatMessage(parsed);
+        break;
+      }
+
+      case "session.pending": {
+        this.handleSessionPending(parsed);
+        break;
+      }
+
+      case "session.permissions": {
+        this.handleSessionPermissions(parsed);
         break;
       }
 
@@ -2476,6 +2781,11 @@ export class RemoteClient {
               hasRemoteAudio: false,
               dataChannelOpen: false,
               fileChannelOpen: false,
+              terminalReady: false,
+              pendingApprovalMessage: null,
+              sessionPermissions: null,
+              remoteCursorShape: "default",
+              remoteCursorVisible: true,
               fps: 0,
               errorCode: parsed.code,
               errorMessage: readable,
@@ -2483,6 +2793,7 @@ export class RemoteClient {
           } else {
             this.setState({
               sessionStatus: "error",
+              pendingApprovalMessage: null,
               errorCode: parsed.code,
               errorMessage: readable,
             });
@@ -2504,6 +2815,11 @@ export class RemoteClient {
             hasRemoteAudio: false,
             dataChannelOpen: false,
             fileChannelOpen: false,
+            terminalReady: false,
+            pendingApprovalMessage: null,
+            sessionPermissions: null,
+            remoteCursorShape: "default",
+            remoteCursorVisible: true,
             fps: 0,
             errorCode: parsed.code,
             errorMessage: readable,
@@ -2544,6 +2860,120 @@ export class RemoteClient {
     }
   }
 
+  private handleCursorUpdate(msg: CursorUpdateMessage): void {
+    if (!this.state.sessionId || msg.sessionId !== this.state.sessionId) {
+      return;
+    }
+    if (!VALID_CURSOR_SHAPES.has(msg.shape)) {
+      return;
+    }
+    const nextVisible = msg.visible !== false;
+    if (
+      this.state.remoteCursorShape === msg.shape &&
+      this.state.remoteCursorVisible === nextVisible
+    ) {
+      return;
+    }
+    this.setState({
+      remoteCursorShape: msg.shape,
+      remoteCursorVisible: nextVisible,
+    });
+  }
+
+  private handleChatMessage(msg: ChatMessage): void {
+    if (!this.state.sessionId || msg.sessionId !== this.state.sessionId) {
+      return;
+    }
+    if (this.state.chatMessages.some((item) => item.id === msg.id)) {
+      return;
+    }
+    const nextMessages = [...this.state.chatMessages, msg].slice(-MAX_CHAT_MESSAGES);
+    const nextUnread =
+      msg.sender === "host"
+        ? this.state.unreadChatCount + 1
+        : this.state.unreadChatCount;
+    this.setState({
+      chatMessages: nextMessages,
+      unreadChatCount: nextUnread,
+    });
+  }
+
+  private handleSessionPending(msg: SessionPendingMessage): void {
+    if (!this.state.sessionId || msg.sessionId !== this.state.sessionId) {
+      return;
+    }
+    // Pause any active WebRTC negotiation fallback timer while waiting for human approval
+    this.clearWebRtcFallbackTimer();
+    this.setState({
+      pendingApprovalMessage:
+        msg.message?.trim() || "等待被控电脑确认接入...",
+      errorCode: null,
+      errorMessage: null,
+    });
+  }
+
+  private handleSessionPermissions(msg: SessionPermissionsMessage): void {
+    if (!this.state.sessionId || msg.sessionId !== this.state.sessionId) {
+      return;
+    }
+    this.setState({
+      sessionPermissions: msg.permissions ? { ...msg.permissions } : null,
+    });
+  }
+
+  private handleTerminalChannelMessage(raw: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!parsed || typeof parsed !== "object") return;
+    const msg = parsed as Record<string, unknown>;
+    const type = typeof msg.type === "string" ? msg.type : "";
+    const termId = typeof msg.termId === "string" ? msg.termId : "";
+
+    let ev: TerminalEvent | null = null;
+    if (type === "term_ready") {
+      ev = {
+        type: "term_ready",
+        termId,
+        shell: typeof msg.shell === "string" ? msg.shell : "",
+        cwd: typeof msg.cwd === "string" ? msg.cwd : "",
+      };
+    } else if (type === "term_data") {
+      if (typeof msg.data !== "string") return;
+      ev = {
+        type: "term_data",
+        termId,
+        data: msg.data,
+      };
+    } else if (type === "term_exit") {
+      ev = {
+        type: "term_exit",
+        termId,
+        exitCode:
+          typeof msg.exitCode === "number" && Number.isFinite(msg.exitCode)
+            ? Math.round(msg.exitCode)
+            : -1,
+      };
+    } else if (type === "term_error") {
+      ev = {
+        type: "term_error",
+        termId,
+        error:
+          typeof msg.error === "string" && msg.error.trim().length > 0
+            ? msg.error.trim()
+            : "远程终端发生异常",
+      };
+    }
+
+    if (!ev) return;
+    for (const listener of this.terminalListeners) {
+      listener(ev);
+    }
+  }
+
   private handleDataChannelMessage(raw: string): void {
     let parsed: unknown;
     try {
@@ -2560,6 +2990,10 @@ export class RemoteClient {
       this.handleControlAck(parsed);
     } else if (parsed.type === "clipboard.sync") {
       this.handleClipboardSync(parsed);
+    } else if (parsed.type === "cursor.update") {
+      this.handleCursorUpdate(parsed);
+    } else if (parsed.type === "chat.msg") {
+      this.handleChatMessage(parsed);
     }
   }
 
@@ -2577,6 +3011,7 @@ export class RemoteClient {
       screenHeight: msg.screenHeight > 0 ? msg.screenHeight : this.state.screenHeight,
       rotation: msg.rotation,
       activeTransport: msg.transport,
+      pendingApprovalMessage: null,
       errorCode: null,
       errorMessage: null,
     };
@@ -2607,6 +3042,7 @@ export class RemoteClient {
       hasRemoteAudio: false,
       dataChannelOpen: false,
       fileChannelOpen: false,
+      terminalReady: false,
     });
     this.startWsJpegFpsTimer();
   }
@@ -2710,8 +3146,37 @@ export class RemoteClient {
         if (this.pc !== pc) return;
         this.stopPointerKeepalive();
       };
+      pointerDc.onmessage = (event) => {
+        if (this.pc !== pc) return;
+        if (typeof event.data === "string") {
+          this.handleDataChannelMessage(event.data);
+        }
+      };
     } catch {
       this.pointerDataChannel = null;
+    }
+
+    if (isDesktopTarget) {
+      try {
+        const termDc = pc.createDataChannel("terminal", { ordered: true });
+        this.terminalDataChannel = termDc;
+        termDc.onopen = () => {
+          if (this.pc !== pc) return;
+          this.setState({ terminalReady: true });
+        };
+        termDc.onclose = () => {
+          if (this.pc !== pc) return;
+          this.setState({ terminalReady: false });
+        };
+        termDc.onmessage = (event) => {
+          if (this.pc !== pc) return;
+          if (typeof event.data === "string") {
+            this.handleTerminalChannelMessage(event.data);
+          }
+        };
+      } catch {
+        this.terminalDataChannel = null;
+      }
     }
 
     try {
@@ -3107,6 +3572,8 @@ export class RemoteClient {
       hasRemoteAudio: false,
       dataChannelOpen: false,
       fileChannelOpen: false,
+      terminalReady: false,
+      pendingApprovalMessage: null,
       fps: 0,
       errorCode: null,
       errorMessage: null,
@@ -3669,6 +4136,18 @@ export class RemoteClient {
     this.failAllPendingFsRequests("WebRTC 连接已断开");
     this.failActiveRemoteDownload("WebRTC 连接已断开");
 
+    if (this.terminalDataChannel) {
+      try {
+        this.terminalDataChannel.onopen = null;
+        this.terminalDataChannel.onclose = null;
+        this.terminalDataChannel.onmessage = null;
+        this.terminalDataChannel.close();
+      } catch {
+        // Ignore
+      }
+      this.terminalDataChannel = null;
+    }
+
     if (this.pointerDataChannel) {
       try {
         this.pointerDataChannel.onopen = null;
@@ -3712,6 +4191,9 @@ export class RemoteClient {
     }
     if (this.state.fileChannelOpen) {
       teardownPatch.fileChannelOpen = false;
+    }
+    if (this.state.terminalReady) {
+      teardownPatch.terminalReady = false;
     }
     if (this.state.hasRemoteAudio) {
       teardownPatch.hasRemoteAudio = false;

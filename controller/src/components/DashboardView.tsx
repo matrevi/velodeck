@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
 import {
+  ArrowRight,
   BatteryCharging,
   Check,
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
   Copy,
   Download,
   KeyRound,
@@ -12,6 +15,8 @@ import {
   Monitor,
   MonitorSmartphone,
   Plus,
+  Power,
+  Radar,
   RefreshCw,
   Server,
   Share,
@@ -29,6 +34,7 @@ import {
   dismissIosPwaBanner,
   getAndroidApkDownloadUrl,
   getAndroidApkFileName,
+  sanitizeControlCodeInput,
   shouldShowIosPwaBanner,
   type SavedAccountSession,
   type ServerInfo,
@@ -38,6 +44,7 @@ import {
   isDesktopApp,
   isMacDesktop,
   type DesktopHostState,
+  type LanPeerInfo,
 } from "../desktop/bridge";
 import { isAllowedDirectUrl } from "../state/profiles";
 import type { RemoteClientState } from "../transport/RemoteClient";
@@ -67,11 +74,38 @@ interface DashboardViewProps {
   onLogoutAllSessions: () => Promise<void>;
   onControlDevice: (device: DeviceSummary) => void;
   onWakeDevice: (device: DeviceSummary) => void;
+  onSendWol?: (device: DeviceSummary) => Promise<void> | void;
+  onSendWolRaw?: (
+    macAddress: string,
+    peerName?: string,
+    lanIp?: string,
+  ) => Promise<void> | void;
+  onDiscoverLanPeers?: () => Promise<LanPeerInfo[]>;
+  onConnectLanPeerCode?: (input: {
+    controlCode: string;
+    controlPassword: string;
+    peerName?: string;
+  }) => void;
   onUnbindDevice: (device: DeviceSummary) => Promise<void>;
   onReconnect: () => void;
   onSwitchToDirectUrl?: (device: DeviceSummary) => void;
   onOpenServerSettings?: () => void;
   onOpenNewWindow?: () => void;
+  openTabDeviceIds?: ReadonlySet<string>;
+  hasTabBar?: boolean;
+}
+
+function formatOsPlatformShort(platform?: string): string {
+  switch (platform) {
+    case "darwin":
+      return "macOS";
+    case "win32":
+      return "Windows";
+    case "linux":
+      return "Linux";
+    default:
+      return platform || "Desktop";
+  }
 }
 
 function formatDesktopOsLabel(device: DeviceSummary): string {
@@ -157,21 +191,36 @@ export function DashboardView({
   onLogoutAllSessions,
   onControlDevice,
   onWakeDevice,
+  onSendWol,
+  onSendWolRaw,
+  onDiscoverLanPeers,
+  onConnectLanPeerCode,
   onUnbindDevice,
   onReconnect,
   onSwitchToDirectUrl,
   onOpenServerSettings,
   onOpenNewWindow,
+  openTabDeviceIds,
+  hasTabBar = false,
 }: DashboardViewProps) {
   const desktopApp = isDesktopApp();
   const macDesktop = isMacDesktop();
   const desktopServerHost = formatServerHostLabel(desktopServerUrl ?? apiBase);
   const [showIosBanner, setShowIosBanner] = useState(false);
   const [wakingDeviceId, setWakingDeviceId] = useState<string | null>(null);
+  const [wolSentKey, setWolSentKey] = useState<string | null>(null);
   const [copiedCodeDeviceId, setCopiedCodeDeviceId] = useState<string | null>(null);
   const [confirmUnbindId, setConfirmUnbindId] = useState<string | null>(null);
   const [unbindingDeviceId, setUnbindingDeviceId] = useState<string | null>(null);
   const [securityModalOpen, setSecurityModalOpen] = useState(false);
+
+  const [lanExpanded, setLanExpanded] = useState(false);
+  const [lanScanning, setLanScanning] = useState(false);
+  const [lanScannedOnce, setLanScannedOnce] = useState(false);
+  const [lanPeers, setLanPeers] = useState<LanPeerInfo[]>([]);
+  const [lanError, setLanError] = useState<string | null>(null);
+  const [lanConnectPeerId, setLanConnectPeerId] = useState<string | null>(null);
+  const [lanConnectPassword, setLanConnectPassword] = useState("");
 
   useEffect(() => {
     setShowIosBanner(shouldShowIosPwaBanner());
@@ -188,6 +237,63 @@ export function DashboardView({
     window.setTimeout(() => {
       setWakingDeviceId((curr) => (curr === device.deviceId ? null : curr));
     }, 900);
+  }
+
+  async function handleWolDeviceClick(device: DeviceSummary) {
+    if (!onSendWol) return;
+    setWolSentKey(device.deviceId);
+    try {
+      await onSendWol(device);
+    } finally {
+      window.setTimeout(() => {
+        setWolSentKey((curr) => (curr === device.deviceId ? null : curr));
+      }, 1400);
+    }
+  }
+
+  async function handleWolPeerClick(peer: LanPeerInfo) {
+    const mac = peer.macAddresses?.[0];
+    if (!mac || !onSendWolRaw) return;
+    const key = `peer:${peer.deviceId}`;
+    setWolSentKey(key);
+    try {
+      await onSendWolRaw(mac, peer.name, peer.lanIp);
+    } finally {
+      window.setTimeout(() => {
+        setWolSentKey((curr) => (curr === key ? null : curr));
+      }, 1400);
+    }
+  }
+
+  async function handleScanLanPeers() {
+    if (!onDiscoverLanPeers || lanScanning) return;
+    setLanExpanded(true);
+    setLanScanning(true);
+    setLanError(null);
+    try {
+      const peers = await onDiscoverLanPeers();
+      setLanPeers(Array.isArray(peers) ? peers : []);
+      setLanScannedOnce(true);
+    } catch (err) {
+      setLanError(err instanceof Error ? err.message : "局域网扫描失败");
+      setLanScannedOnce(true);
+    } finally {
+      setLanScanning(false);
+    }
+  }
+
+  function handleSubmitLanPeerConnect(peer: LanPeerInfo, e: React.FormEvent) {
+    e.preventDefault();
+    const cleanCode = sanitizeControlCodeInput(peer.controlCode ?? "");
+    const pwd = lanConnectPassword.trim();
+    if (cleanCode.length !== 9 || !pwd || !onConnectLanPeerCode) return;
+    onConnectLanPeerCode({
+      controlCode: cleanCode,
+      controlPassword: pwd,
+      peerName: peer.name,
+    });
+    setLanConnectPeerId(null);
+    setLanConnectPassword("");
   }
 
   async function handleCopyControlCode(device: DeviceSummary) {
@@ -230,14 +336,22 @@ export function DashboardView({
   const onlineCount = clientState.devices.filter((d) => d.online).length;
 
   return (
-    <div className="flex min-h-[100dvh] flex-col bg-[#F4F5F7] text-[#111318]">
+    <div
+      className={`flex flex-col bg-[#F4F5F7] text-[#111318] ${
+        hasTabBar ? "min-h-full" : "min-h-[100dvh]"
+      }`}
+    >
       {/* Committed Deep-Ink Hardware Shell Header */}
       <header
-        className={`${desktopApp ? "desktop-drag-region" : "safe-top"} sticky top-0 z-30 border-b border-[#232732] bg-[#111318] text-white`}
+        className={`${
+          hasTabBar ? "" : desktopApp ? "desktop-drag-region" : "safe-top"
+        } sticky top-0 z-30 border-b border-[#232732] bg-[#111318] text-white`}
       >
         <div
           className={`mx-auto flex h-14 max-w-5xl items-center justify-between gap-2.5 ${
-            macDesktop ? "pl-[80px] pr-4 sm:pl-[80px] sm:pr-6" : "px-4 sm:px-6"
+            macDesktop && !hasTabBar
+              ? "pl-[80px] pr-4 sm:pl-[80px] sm:pr-6"
+              : "px-4 sm:px-6"
           }`}
         >
           <div className="flex min-w-0 items-center gap-2.5">
@@ -448,6 +562,208 @@ export function DashboardView({
           />
         )}
 
+        {/* Collapsible LAN Discovery Strip (Desktop App with discoverLanPeers) */}
+        {desktopApp && onDiscoverLanPeers && (
+          <section className="panel overflow-hidden rounded-xl">
+            <div
+              className={`flex flex-wrap items-center justify-between gap-2.5 px-4 py-3 sm:px-5 ${
+                lanExpanded ? "border-b border-[#E2E6EC] bg-[#F8F9FB]" : "bg-white"
+              }`}
+            >
+              <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#E2E6EC] bg-[#F4F5F7] text-[#374151]">
+                  <Radar className="h-4 w-4 text-[#2563EB]" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-sm font-semibold tracking-tight text-[#111318]">
+                      局域网发现
+                    </h2>
+                    {lanScannedOnce && (
+                      <span className="rounded border border-[#E2E6EC] bg-white px-1.5 py-0.5 font-mono text-[11px] font-medium text-[#4B5563]">
+                        {lanPeers.length} 台设备
+                      </span>
+                    )}
+                  </div>
+                  <p className="truncate text-xs text-[#6B7280]">
+                    自动发现同一局域网内的 VeloDeck 桌面端，支持一键控制码连接与 WOL 远程开机
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  disabled={lanScanning}
+                  onClick={() => void handleScanLanPeers()}
+                  className="btn-outline inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs font-medium disabled:opacity-60"
+                >
+                  {lanScanning ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[#2563EB]" />
+                  ) : (
+                    <Wifi className="h-3.5 w-3.5 text-[#2563EB]" />
+                  )}
+                  <span>{lanScanning ? "扫描中..." : "扫描局域网"}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLanExpanded((prev) => !prev)}
+                  aria-expanded={lanExpanded}
+                  aria-label={lanExpanded ? "收起局域网发现" : "展开局域网发现"}
+                  className="btn-outline inline-flex h-8 w-8 items-center justify-center rounded-lg text-[#4B5563]"
+                >
+                  {lanExpanded ? (
+                    <ChevronUp className="h-4 w-4" />
+                  ) : (
+                    <ChevronDown className="h-4 w-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {lanExpanded && (
+              <div className="bg-white">
+                {lanError && (
+                  <div className="border-b border-[#FECACA] bg-[#FEF2F2] px-4 py-2.5 text-xs text-[#991B1B] sm:px-5">
+                    {lanError}
+                  </div>
+                )}
+
+                {lanScanning && lanPeers.length === 0 ? (
+                  <div className="flex items-center justify-center gap-2 px-4 py-7 text-xs text-[#6B7280]">
+                    <Loader2 className="h-4 w-4 animate-spin text-[#2563EB]" />
+                    <span>正在广播探测同网段 VeloDeck 桌面主机...</span>
+                  </div>
+                ) : lanPeers.length === 0 ? (
+                  <div className="px-4 py-6 text-center text-xs text-[#6B7280]">
+                    {lanScannedOnce
+                      ? "暂未在当前局域网发现其他在线 VeloDeck 电脑，请确认对方已打开本机被控。"
+                      : "点击右上角「扫描局域网」探测同网段设备。"}
+                  </div>
+                ) : (
+                  <ul className="divide-y divide-[#ECEFF4]">
+                    {lanPeers.map((peer) => {
+                      const cleanCode = sanitizeControlCodeInput(
+                        peer.controlCode ?? "",
+                      );
+                      const hasCode = cleanCode.length === 9;
+                      const primaryMac = peer.macAddresses?.[0] ?? "";
+                      const isWolSent = wolSentKey === `peer:${peer.deviceId}`;
+                      const isPromptingPwd = lanConnectPeerId === peer.deviceId;
+                      return (
+                        <li
+                          key={peer.deviceId}
+                          className="px-4 py-3 transition-colors hover:bg-[#FAFBFD] sm:px-5"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div className="flex min-w-0 flex-1 items-center gap-3">
+                              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#E2E6EC] bg-[#F8F9FB] text-[#374151]">
+                                <Monitor className="h-4 w-4" />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="truncate text-sm font-semibold text-[#111318]">
+                                    {peer.name || peer.deviceId}
+                                  </span>
+                                  <span className="rounded border border-[#E2E6EC] bg-[#F8F9FB] px-1.5 py-0.5 text-[10px] font-medium text-[#4B5563]">
+                                    {formatOsPlatformShort(peer.osPlatform)}
+                                  </span>
+                                  {peer.lanIp && (
+                                    <span className="font-mono text-xs text-[#2563EB]">
+                                      {peer.lanIp}
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 font-mono text-[11px] text-[#6B7280]">
+                                  {hasCode && (
+                                    <span>控制码 {formatControlCode(cleanCode)}</span>
+                                  )}
+                                  {primaryMac && <span>MAC {primaryMac}</span>}
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="flex shrink-0 items-center gap-2">
+                              {hasCode && onConnectLanPeerCode && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (isPromptingPwd) {
+                                      setLanConnectPeerId(null);
+                                      setLanConnectPassword("");
+                                    } else {
+                                      setLanConnectPeerId(peer.deviceId);
+                                      setLanConnectPassword("");
+                                    }
+                                  }}
+                                  className="btn-primary inline-flex h-8 items-center gap-1 rounded-md px-3 text-xs font-medium"
+                                >
+                                  <KeyRound className="h-3.5 w-3.5" />
+                                  <span>控制码连接</span>
+                                </button>
+                              )}
+                              {primaryMac && onSendWolRaw && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleWolPeerClick(peer)}
+                                  className="btn-outline inline-flex h-8 items-center gap-1 rounded-md px-2.5 text-xs font-medium text-[#B45309] hover:bg-[#FFFBEB]"
+                                  title={`发送 Wake-on-LAN 魔术包至 ${primaryMac}`}
+                                >
+                                  <Power className="h-3.5 w-3.5" />
+                                  <span>{isWolSent ? "已发送" : "WOL"}</span>
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          {isPromptingPwd && hasCode && onConnectLanPeerCode && (
+                            <form
+                              onSubmit={(e) => handleSubmitLanPeerConnect(peer, e)}
+                              className="mt-2.5 flex flex-wrap items-center gap-2 rounded-lg border border-[#BFDBFE] bg-[#EFF6FF] px-3 py-2"
+                            >
+                              <span className="font-mono text-xs font-semibold text-[#1E3A8A]">
+                                {formatControlCode(cleanCode)}
+                              </span>
+                              <input
+                                type="password"
+                                autoFocus
+                                value={lanConnectPassword}
+                                onChange={(e) =>
+                                  setLanConnectPassword(e.target.value)
+                                }
+                                placeholder="输入该电脑的无人值守控制密码..."
+                                className="field h-8 min-w-[180px] flex-1 rounded-md px-2.5 text-xs"
+                              />
+                              <button
+                                type="submit"
+                                disabled={!lanConnectPassword.trim()}
+                                className="btn-primary inline-flex h-8 items-center gap-1 rounded-md px-3 text-xs font-medium disabled:opacity-45"
+                              >
+                                <span>立即连接</span>
+                                <ArrowRight className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setLanConnectPeerId(null);
+                                  setLanConnectPassword("");
+                                }}
+                                className="h-8 rounded-md px-2 text-xs text-[#4B5563] hover:text-[#111318]"
+                              >
+                                取消
+                              </button>
+                            </form>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            )}
+          </section>
+        )}
+
         {/* Unified White Fleet Sheet (Zero nested cards!) */}
         {!hasActiveConnection ? (
           <section className="panel rounded-xl px-6 py-12 text-center">
@@ -569,6 +885,7 @@ export function DashboardView({
                 const canUseDirectUrl =
                   Boolean(device.directUrl) &&
                   isAllowedDirectUrl(device.directUrl ?? "");
+                const isLiveInTab = Boolean(openTabDeviceIds?.has(device.deviceId));
 
                 return (
                   <li
@@ -604,6 +921,12 @@ export function DashboardView({
                           >
                             {device.online ? "在线" : formatLastSeen(device.lastSeen)}
                           </span>
+                          {isLiveInTab && (
+                            <span className="inline-flex shrink-0 items-center gap-1 rounded border border-[#BFDBFE] bg-[#EFF6FF] px-1.5 py-0.5 text-[10px] font-semibold text-[#1D4ED8]">
+                              <span className="h-1.5 w-1.5 rounded-full bg-[#2563EB]" />
+                              在线远控中
+                            </span>
+                          )}
                           {isDesktopDevice && displayCount > 1 && (
                             <span className="shrink-0 rounded border border-[#D8E2F8] bg-[#EFF4FF] px-1.5 py-0.5 font-mono text-[10px] font-medium text-[#1D4ED8]">
                               {displayCount} 块屏幕
@@ -686,12 +1009,20 @@ export function DashboardView({
                               {device.screenWidth}×{device.screenHeight}
                             </span>
                           </div>
-                          <div className="flex items-center gap-3 text-xs text-[#6B7280]">
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#6B7280]">
                             <span>
                               {displayCount > 1
                                 ? `多显示器 (${displayCount} 块)`
                                 : "桌面主机"}
                             </span>
+                            {device.lanIp && (
+                              <span className="font-mono text-[11px]">
+                                {device.lanIp}
+                              </span>
+                            )}
+                            {device.accessMode === "confirm" && (
+                              <span className="text-[#B45309]">弹窗审批</span>
+                            )}
                             {capabilities.p2pFileTransfer && (
                               <span className="text-[#15803D]">P2P 文件</span>
                             )}
@@ -745,11 +1076,11 @@ export function DashboardView({
                       <div className="flex items-center gap-2">
                         <button
                           type="button"
-                          disabled={!device.online}
+                          disabled={!device.online && !isLiveInTab}
                           onClick={() => onControlDevice(device)}
                           className="btn-primary inline-flex h-9 flex-1 items-center justify-center gap-1 rounded-lg px-3.5 text-xs font-medium disabled:cursor-not-allowed md:flex-none"
                         >
-                          <span>进入控制</span>
+                          <span>{isLiveInTab ? "切回远控" : "进入控制"}</span>
                           <ChevronRight className="h-3.5 w-3.5" />
                         </button>
 
@@ -764,6 +1095,25 @@ export function DashboardView({
                             <span>{isWaking ? "已发送" : "唤醒"}</span>
                           </button>
                         )}
+
+                        {isDesktopDevice &&
+                          !device.online &&
+                          (device.macAddresses?.length ?? 0) > 0 &&
+                          onSendWol && (
+                            <button
+                              type="button"
+                              onClick={() => void handleWolDeviceClick(device)}
+                              title={`发送 Wake-on-LAN 魔术包 (${device.macAddresses?.[0]})`}
+                              className="btn-outline inline-flex h-9 items-center justify-center gap-1 rounded-lg border-[#F59E0B]/50 bg-[#FFFBEB] px-3 text-xs font-medium text-[#92400E] hover:bg-[#FEF3C7]"
+                            >
+                              <Power className="h-3.5 w-3.5 text-[#D97706]" />
+                              <span>
+                                {wolSentKey === device.deviceId
+                                  ? "已发送"
+                                  : "WOL 开机"}
+                              </span>
+                            </button>
+                          )}
                       </div>
 
                       <div className="flex items-center justify-end gap-2">

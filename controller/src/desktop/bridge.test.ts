@@ -13,8 +13,11 @@ import {
   normalizeServerBaseUrl,
   saveCachedDesktopServerUrl,
   saveCachedRecentDesktopServers,
+  type DesktopHostChatMessage,
+  type DesktopHostPendingApproval,
   type DesktopHostPermissions,
   type DesktopHostState,
+  type LanPeerInfo,
   type VeloDeckDesktopBridge,
 } from "./bridge";
 
@@ -300,6 +303,33 @@ describe("desktop bridge detection", () => {
       audioCaptureEnabled: true,
       clipboardAutoSync: true,
       privacyScreenActive: false,
+      accessMode: "auto",
+      blockInputActive: false,
+      lanIp: "192.168.1.42",
+      macAddresses: ["AA:BB:CC:DD:EE:FF"],
+      pendingApproval: null,
+      chatMessages: [],
+    };
+
+    const samplePeer: LanPeerInfo = {
+      deviceId: "lan-pc-1",
+      name: "Office iMac",
+      osPlatform: "darwin",
+      lanIp: "192.168.1.88",
+      macAddresses: ["11:22:33:44:55:66"],
+      controlCode: "123456789",
+      lastSeen: 1700000000000,
+    };
+    const samplePending: DesktopHostPendingApproval = {
+      sessionId: "sess-approve-1",
+      requestedAt: 1700000005000,
+    };
+    const sampleChat: DesktopHostChatMessage = {
+      id: "chat-1",
+      sender: "host",
+      senderName: "MacBook Pro",
+      text: "你好，已就绪",
+      ts: 1700000010000,
     };
 
     const unsubSpy = vi.fn();
@@ -348,6 +378,27 @@ describe("desktop bridge detection", () => {
         ...baseHostState,
         privacyScreenActive: enabled,
       })),
+      setHostBlockInput: vi.fn(async (enabled: boolean) => ({
+        ...baseHostState,
+        blockInputActive: enabled,
+      })),
+      discoverLanPeers: vi.fn(async () => [samplePeer]),
+      sendWolPacket: vi.fn(async (_mac: string, _broadcast?: string) => ({
+        ok: true,
+      })),
+      approveHostSession: vi.fn(async (sessionId: string) => ({
+        ...baseHostState,
+        activeSessionId: sessionId,
+        pendingApproval: null,
+      })),
+      rejectHostSession: vi.fn(async () => ({
+        ...baseHostState,
+        pendingApproval: null,
+      })),
+      sendHostChatMessage: vi.fn(async (text: string) => ({
+        ...baseHostState,
+        chatMessages: [{ ...sampleChat, text }],
+      })),
       writeClipboardText: vi.fn(async (_text: string) => true),
       readClipboardText: vi.fn(async () => "copied from host"),
     } as unknown as VeloDeckDesktopBridge;
@@ -382,15 +433,37 @@ describe("desktop bridge detection", () => {
       preventSleep: true,
       audioCaptureEnabled: false,
       clipboardAutoSync: true,
+      accessMode: "confirm",
     });
     expect(updated?.deviceName).toBe("Work Mac");
     expect(updated?.autoLaunch).toBe(true);
     expect(updated?.preventSleep).toBe(true);
     expect(updated?.audioCaptureEnabled).toBe(false);
     expect(updated?.clipboardAutoSync).toBe(true);
+    expect(updated?.accessMode).toBe("confirm");
 
     const privacyOn = await bridge.setHostPrivacyScreen?.(true);
     expect(privacyOn?.privacyScreenActive).toBe(true);
+    const blockedOn = await bridge.setHostBlockInput?.(true);
+    expect(blockedOn?.blockInputActive).toBe(true);
+    expect(await bridge.discoverLanPeers?.()).toEqual([samplePeer]);
+    expect(
+      await bridge.sendWolPacket?.("11:22:33:44:55:66", "192.168.1.255"),
+    ).toEqual({ ok: true });
+    const approved = await bridge.approveHostSession?.(samplePending.sessionId, {
+      mouse: true,
+      keyboard: true,
+      clipboard: true,
+      fileTransfer: false,
+      audio: true,
+      terminal: false,
+    });
+    expect(approved?.activeSessionId).toBe(samplePending.sessionId);
+    expect(approved?.pendingApproval).toBeNull();
+    const rejected = await bridge.rejectHostSession?.(samplePending.sessionId);
+    expect(rejected?.pendingApproval).toBeNull();
+    const chatRes = await bridge.sendHostChatMessage?.("收到");
+    expect(chatRes).toBeDefined();
     expect(await bridge.writeClipboardText?.("hello")).toBe(true);
     expect(await bridge.readClipboardText?.()).toBe("copied from host");
 

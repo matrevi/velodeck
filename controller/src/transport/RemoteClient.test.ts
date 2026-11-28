@@ -128,6 +128,7 @@ class FakeRTCPeerConnection {
   dc: FakeDataChannel | null = null;
   pointerDc: FakeDataChannel | null = null;
   fileDc: FakeDataChannel | null = null;
+  terminalDc: FakeDataChannel | null = null;
   channels = new Map<string, FakeDataChannel>();
   transceiverCalls: Array<{ kind: string; init?: RTCRtpTransceiverInit }> = [];
   offerCalls: Array<RTCOfferOptions | undefined> = [];
@@ -171,6 +172,9 @@ class FakeRTCPeerConnection {
     }
     if (label === "file") {
       this.fileDc = channel;
+    }
+    if (label === "terminal") {
+      this.terminalDc = channel;
     }
     return channel;
   }
@@ -2644,6 +2648,346 @@ describe("RemoteClient Pro Desktop features (FS RPC, chunked download, targetDir
     const done = await uploadPromise;
     expect(done.status).toBe("done");
     expect(done.savedPath).toBe("/Users/alice/Desktop/Work/hello.txt");
+
+    client.disconnect();
+  });
+
+  it("opens terminal DataChannel only for desktop targets and supports open/input/resize/close and events", async () => {
+    const { client, ws, pc } = await setupDesktopSession();
+
+    const termDc = pc.terminalDc;
+    expect(termDc).toBeTruthy();
+    expect(termDc?.options).toEqual({ ordered: true });
+    expect(client.getState().terminalReady).toBe(false);
+
+    termDc!.onopen?.();
+    expect(client.getState().terminalReady).toBe(true);
+
+    const received: Array<Record<string, unknown>> = [];
+    const unsub = client.onTerminalEvent((ev) => {
+      received.push(ev as unknown as Record<string, unknown>);
+    });
+
+    const termId = client.openTerminal(120, 40);
+    expect(termId).toMatch(/^term-/);
+    expect(JSON.parse(termDc!.sent[0]!)).toEqual({
+      type: "term_open",
+      termId,
+      cols: 120,
+      rows: 40,
+    });
+
+    expect(client.sendTerminalInput(termId, "ls -la\n")).toBe(true);
+    expect(JSON.parse(termDc!.sent[1]!)).toEqual({
+      type: "term_data",
+      termId,
+      data: "ls -la\n",
+    });
+
+    expect(client.resizeTerminal(termId, 140, 48)).toBe(true);
+    expect(JSON.parse(termDc!.sent[2]!)).toEqual({
+      type: "term_resize",
+      termId,
+      cols: 140,
+      rows: 48,
+    });
+
+    termDc!.emitMessage({
+      type: "term_ready",
+      termId,
+      shell: "/bin/zsh",
+      cwd: "/Users/alice",
+    });
+    termDc!.emitMessage({
+      type: "term_data",
+      termId,
+      data: "hello world\r\n",
+    });
+    termDc!.emitMessage({
+      type: "term_error",
+      termId,
+      error: "minor warning",
+    });
+    termDc!.emitMessage({
+      type: "term_exit",
+      termId,
+      exitCode: 0,
+    });
+
+    expect(received).toEqual([
+      { type: "term_ready", termId, shell: "/bin/zsh", cwd: "/Users/alice" },
+      { type: "term_data", termId, data: "hello world\r\n" },
+      { type: "term_error", termId, error: "minor warning" },
+      { type: "term_exit", termId, exitCode: 0 },
+    ]);
+
+    client.closeTerminal(termId);
+    expect(JSON.parse(termDc!.sent[3]!)).toEqual({
+      type: "term_close",
+      termId,
+    });
+
+    termDc!.onclose?.();
+    expect(client.getState().terminalReady).toBe(false);
+    unsub();
+
+    // Switching to Android target must NOT create a terminal DataChannel
+    client.startSession("phone-1", { preferredTransport: "webrtc" });
+    const phoneSessId = client.getState().sessionId!;
+    ws.emitJson({
+      type: "session.ready",
+      sessionId: phoneSessId,
+      deviceId: "phone-1",
+      transport: "webrtc",
+      screenWidth: 1080,
+      screenHeight: 2400,
+      rotation: 0,
+    });
+    await Promise.resolve();
+    const phonePc = FakeRTCPeerConnection.instances[1]!;
+    expect(phonePc.terminalDc).toBeNull();
+
+    client.disconnect();
+  });
+
+  it("routes mouse_move_relative over pointer DC, block_input/whiteboard over control DC, and updates cursor state from pointer DC and WS", async () => {
+    const { client, ws, pc } = await setupDesktopSession();
+    const sessId = client.getState().sessionId!;
+
+    pc.pointerDc!.onopen?.();
+    pc.dc!.onopen?.();
+
+    const relRes = client.sendCommand({ action: "mouse_move_relative", dx: 12, dy: -7 });
+    expect(relRes.sent).toBe(true);
+    expect(relRes.channel).toBe("datachannel");
+    expect(pc.pointerDc!.sent).toHaveLength(1);
+    expect(JSON.parse(pc.pointerDc!.sent[0]!).command).toEqual({
+      action: "mouse_move_relative",
+      dx: 12,
+      dy: -7,
+    });
+
+    client.sendCommand({ action: "block_input", enabled: true });
+    client.sendCommand({ action: "whiteboard", op: "clear" });
+    expect(pc.dc!.sent).toHaveLength(2);
+    expect(JSON.parse(pc.dc!.sent[0]!).command).toEqual({
+      action: "block_input",
+      enabled: true,
+    });
+    expect(JSON.parse(pc.dc!.sent[1]!).command).toEqual({
+      action: "whiteboard",
+      op: "clear",
+    });
+
+    // Cursor update over pointer DataChannel
+    pc.pointerDc!.emitMessage({
+      type: "cursor.update",
+      sessionId: sessId,
+      deviceId: "pc-1",
+      shape: "text",
+      visible: true,
+    });
+    expect(client.getState().remoteCursorShape).toBe("text");
+    expect(client.getState().remoteCursorVisible).toBe(true);
+
+    // Mismatched sessionId cursor update over DC must be ignored
+    pc.pointerDc!.emitMessage({
+      type: "cursor.update",
+      sessionId: "wrong-sess",
+      deviceId: "pc-1",
+      shape: "pointer",
+      visible: false,
+    });
+    expect(client.getState().remoteCursorShape).toBe("text");
+    expect(client.getState().remoteCursorVisible).toBe(true);
+
+    // Cursor update over WebSocket
+    ws.emitJson({
+      type: "cursor.update",
+      sessionId: sessId,
+      deviceId: "pc-1",
+      shape: "ew-resize",
+      visible: false,
+    });
+    expect(client.getState().remoteCursorShape).toBe("ew-resize");
+    expect(client.getState().remoteCursorVisible).toBe(false);
+
+    client.disconnect();
+  });
+
+  it("handles chat.msg send/receive over control DC and WS, unread counter, deduplication, and 100-message cap", async () => {
+    const { client, ws, pc } = await setupDesktopSession();
+    const sessId = client.getState().sessionId!;
+    pc.dc!.onopen?.();
+
+    // Send chat from controller over control DC
+    expect(client.sendChatMessage("  你好，远端电脑  ")).toBe(true);
+    expect(client.getState().chatMessages).toHaveLength(1);
+    expect(client.getState().chatMessages[0]?.sender).toBe("controller");
+    expect(client.getState().chatMessages[0]?.text).toBe("你好，远端电脑");
+    expect(client.getState().unreadChatCount).toBe(0);
+    const sentChat = JSON.parse(pc.dc!.sent[0]!) as Record<string, unknown>;
+    expect(sentChat.type).toBe("chat.msg");
+    expect(sentChat.text).toBe("你好，远端电脑");
+
+    // Receive chat from host over control DC
+    pc.dc!.emitMessage({
+      type: "chat.msg",
+      sessionId: sessId,
+      deviceId: "pc-1",
+      id: "host-msg-1",
+      sender: "host",
+      senderName: "Mac Studio",
+      text: "收到，可以操作",
+      ts: 1700000001000,
+    });
+    // Duplicate ID ignored
+    pc.dc!.emitMessage({
+      type: "chat.msg",
+      sessionId: sessId,
+      deviceId: "pc-1",
+      id: "host-msg-1",
+      sender: "host",
+      senderName: "Mac Studio",
+      text: "收到，可以操作",
+      ts: 1700000001000,
+    });
+    expect(client.getState().chatMessages).toHaveLength(2);
+    expect(client.getState().unreadChatCount).toBe(1);
+
+    // Receive chat from host over WS
+    ws.emitJson({
+      type: "chat.msg",
+      sessionId: sessId,
+      deviceId: "pc-1",
+      id: "host-msg-2",
+      sender: "host",
+      text: "第二条消息",
+      ts: 1700000002000,
+    });
+    expect(client.getState().chatMessages).toHaveLength(3);
+    expect(client.getState().unreadChatCount).toBe(2);
+
+    client.markChatRead();
+    expect(client.getState().unreadChatCount).toBe(0);
+
+    // Cap at 100 messages
+    for (let i = 0; i < 110; i++) {
+      ws.emitJson({
+        type: "chat.msg",
+        sessionId: sessId,
+        deviceId: "pc-1",
+        id: `burst-${i}`,
+        sender: "host",
+        text: `msg-${i}`,
+        ts: 1700000003000 + i,
+      });
+    }
+    expect(client.getState().chatMessages).toHaveLength(100);
+    expect(client.getState().chatMessages[99]?.id).toBe("burst-109");
+
+    client.disconnect();
+  });
+
+  it("handles session.pending approval wait without premature timeout, stores session.permissions, and sends sessionless WOL relay over WS", async () => {
+    vi.useFakeTimers();
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+    globalThis.RTCPeerConnection =
+      FakeRTCPeerConnection as unknown as typeof RTCPeerConnection;
+
+    const client = new RemoteClient("ctrl-approval-wol");
+    client.connectWithAccount({
+      wsUrl: "wss://velodeck.example.com/ws",
+      authToken: "jwt-valid",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      preferredTransport: "webrtc",
+    });
+
+    const ws = FakeWebSocket.instances[0]!;
+    ws.emitOpen();
+    ws.emitJson({
+      type: "controller.authed",
+      clientId: "ctrl-approval-wol",
+      serverTime: Date.now(),
+      mode: "relay",
+      authType: "account",
+      user: { userId: "u1", username: "alice", displayName: "Alice" },
+      devices: [makeDesktopDevice("pc-1")],
+      iceServers: [],
+    });
+
+    // Sessionless WOL relay works directly over WS with empty sessionId
+    expect(client.sendWolRelay("pc-1", "AA:BB:CC:DD:EE:FF", "192.168.1.255")).toBe(
+      true,
+    );
+    const wolMsg = parseSentMessages(ws).find(
+      (m) =>
+        m.type === "control.cmd" &&
+        (m.command as { action?: string } | undefined)?.action === "wol",
+    );
+    expect(wolMsg).toMatchObject({
+      type: "control.cmd",
+      sessionId: "",
+      deviceId: "pc-1",
+      command: {
+        action: "wol",
+        macAddress: "AA:BB:CC:DD:EE:FF",
+        broadcastIp: "192.168.1.255",
+      },
+    });
+
+    // Start session and enter human approval pending state
+    client.startSession("pc-1", { preferredTransport: "webrtc" });
+    const sessId = client.getState().sessionId!;
+
+    ws.emitJson({
+      type: "session.pending",
+      sessionId: sessId,
+      deviceId: "pc-1",
+      message: "等待被控端主人点击允许...",
+    });
+    expect(client.getState().pendingApprovalMessage).toBe("等待被控端主人点击允许...");
+
+    // Advancing 20s while waiting for human approval must NOT timeout/fallback the session
+    vi.advanceTimersByTime(20_000);
+    expect(client.getState().sessionId).toBe(sessId);
+    expect(client.getState().pendingApprovalMessage).toBe("等待被控端主人点击允许...");
+    expect(client.getState().sessionStatus).toBe("requesting");
+
+    // Host approves and sends session.permissions + session.ready
+    ws.emitJson({
+      type: "session.permissions",
+      sessionId: sessId,
+      deviceId: "pc-1",
+      permissions: {
+        mouse: true,
+        keyboard: true,
+        clipboard: true,
+        fileTransfer: false,
+        audio: true,
+        terminal: false,
+      },
+    });
+    expect(client.getState().sessionPermissions).toEqual({
+      mouse: true,
+      keyboard: true,
+      clipboard: true,
+      fileTransfer: false,
+      audio: true,
+      terminal: false,
+    });
+
+    ws.emitJson({
+      type: "session.ready",
+      sessionId: sessId,
+      deviceId: "pc-1",
+      transport: "webrtc",
+      screenWidth: 2560,
+      screenHeight: 1440,
+      rotation: 0,
+    });
+    expect(client.getState().pendingApprovalMessage).toBeNull();
+    expect(client.getState().sessionStatus).toBe("negotiating");
 
     client.disconnect();
   });

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 export type WindowPreset = "phone" | "compact" | "dashboard";
+export type HostAccessMode = "auto" | "confirm";
 
 export interface WindowBounds {
   x: number;
@@ -36,6 +37,7 @@ export interface DesktopSettings {
   hostPreventSleep?: boolean;
   hostAudioEnabled?: boolean;
   hostClipboardAutoSync?: boolean;
+  hostAccessMode?: HostAccessMode;
 }
 
 export const PRESET_SIZES: Readonly<
@@ -190,6 +192,13 @@ export function sanitizeHostAuthToken(raw: unknown): string | undefined {
   return trimmed;
 }
 
+export function sanitizeHostAccessMode(raw: unknown): HostAccessMode | undefined {
+  if (raw === "auto" || raw === "confirm") {
+    return raw;
+  }
+  return undefined;
+}
+
 export function defaultHostDeviceName(): string {
   try {
     const host = os.hostname().replace(/\.local$/i, "").trim();
@@ -251,6 +260,10 @@ export function ensureHostSettings(
   }
   if (typeof next.hostClipboardAutoSync !== "boolean") {
     next.hostClipboardAutoSync = true;
+    changed = true;
+  }
+  if (!sanitizeHostAccessMode(next.hostAccessMode)) {
+    next.hostAccessMode = "auto";
     changed = true;
   }
 
@@ -703,6 +716,10 @@ function sanitizeSettings(raw: unknown): DesktopSettings {
   }
   if (typeof obj.hostClipboardAutoSync === "boolean") {
     sanitized.hostClipboardAutoSync = obj.hostClipboardAutoSync;
+  }
+  const hostAccessMode = sanitizeHostAccessMode(obj.hostAccessMode);
+  if (hostAccessMode) {
+    sanitized.hostAccessMode = hostAccessMode;
   }
   return sanitized;
 }
